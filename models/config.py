@@ -33,7 +33,7 @@ projects["M18"] = {
     "management": {
         "model_module" : "model_m18",
         "metrics" : "rmse", # "mae", "rmse"
-        "steps_to_save": 100,
+        "steps_to_save": 200,
         
         'choose_best_loss_model': False,
         
