@@ -168,7 +168,7 @@ class Zeus_Dataset(Dataset):
         vali_points  = self.vali_points[:]
         test_points  = self.test_points[:]
 
-        # Shuffle using a local RNG for reproducibility
+        # Shuffle using a local RNG for reproducibility.
         rng = random.Random(seed)
         rng.shuffle(train_points)
         rng.shuffle(vali_points)
