@@ -53,14 +53,18 @@ class Model_Dom():
             self.scaler = GradScaler(device=self.device)
 
             self.epoch = 0
-            self.packed_losses_metrics = None
+            self.epoch_finished = True
+            
+            self.epoch_losses, self.epoch_metrics = [], []
+            self.packed_losses_metrics = { "epoch_losses": [], "epoch_metrics": [] }
+            
             self.epochs_since_improvement = 0
+            self.vali_metric_old = 1e9
             self.learning_rate = None
 
         # work variables            
         self.recent_losses = []
         self.total_losses = []
-        self.epoch_losses, self.epoch_metrics = [], []
         self.pbar_description = None
         self.step_loss = None
         self.best_loss = 1e9
@@ -171,25 +175,20 @@ class Model_Dom():
     def get_learning_rate(self):
         return self.optimizer.param_groups[0]['lr']
     
-    def save_best_train(self, vali_metric):   # (C,), (C,)        
+    def save_best_train(self, vali_metric):
         if vali_metric is not None:
             wasBestEpoch = False
 
-            weighted_metric = vali_metric * (self.zeus_weights.to(vali_metric.device))
-
-            if torch.mean(weighted_metric) < torch.mean(self.weighted_metric_old):
+            if np.array(vali_metric).mean().item() < self.vali_metric_old:
                 wasBestEpoch = True
-                self.weighted_metric_old = weighted_metric
+                self.vali_metric_old = np.array(vali_metric).item()
                 name = "best_model"
-                logging.info("saving best train_state...model: weighted_metric: {:.3f}, path: {}".format(torch.mean(weighted_metric).item(), name))
+                logging.info("saving best train_state...model: vali_metric: {:.3f}, path: {}".format(torch.mean(vali_metric).item(), name))
                 self.save_state(name=name, model_only=True)
 
             self.epochs_since_improvement = self.epochs_since_improvement + 1 if not wasBestEpoch else 0
-            
-            keep_going = self.epochs_since_improvement < self.pm.epoch_patience
-            logging.info("___Patience {} run out @ model".format(self.pm.epoch_patience))
-            
-            best_metric = torch.mean(self.weighted_metric_old).item()
+            keep_going = self.epochs_since_improvement < self.pm.epoch_patience            
+            best_metric = self.vali_metric_old
         else:
             logging.info("Model has no validation metrics. Going ahead to next epoch...")
             
@@ -209,7 +208,10 @@ class Model_Dom():
        
     def save_state(self, name=None, train_finished=False, best_loss=False, epoch_finished=False):
     
-        if epoch_finished: self.epoch += 1    
+        if (not train_finished) and (epoch_finished): 
+            self.epoch += 1
+            
+        self.epoch_finished = epoch_finished
     
         assert self.trainable, "Non-trainable train object cannot be saved."
         
@@ -246,13 +248,21 @@ class Model_Dom():
             'train_finished' : train_finished,
             'packed_losses_metrics': self.packed_losses_metrics,
             'best_loss' : self.best_loss,
+            'vali_metric_old' : self.vali_metric_old,
             'accum_substeps' : self.accum_substeps,
+            'epoch_finished' : epoch_finished,
             }
         utils.check_dir(self.project_path)
-        temp_path = self.project_path / (name + '.pth.tmp')
-        torch.save(checkpoint, temp_path)
-        shutil.move(temp_path, self.project_path / (name + '.pth'))
+        # # temp_path = self.project_path / (name + '.pth.tmp')
+        path = self.project_path / (name + '.pth')
+        torch.save(checkpoint, path)
+        # shutil.move(temp_path, self.project_path / (name + '.pth'))
     
+        # Suddenl stopped working, ddue to PermissionError. 
+        # temp_path = self.project_path / (name + '.pth.tmp')
+        # torch.save(checkpoint, temp_path)
+        # shutil.move(temp_path, self.project_path / (name + '.pth'))
+
         self.save_train_history()        
         
         return
@@ -445,10 +455,15 @@ class Model_Dom():
 
                     self.best_loss = checkpoint['best_loss']
                     logging.info(f"best_loss loaded {self.best_loss}")
+                    
+                    self.vali_metric_old = checkpoint['vali_metric_old']
+                    logging.info(f"vali_metric_old loaded {self.vali_metric_old}")
 
                     self.accum_substeps = checkpoint['accum_substeps']
                     logging.info(f"accum_substeps loaded {self.accum_substeps}")
                     
+                    self.epoch_finished = checkpoint['epoch_finished']
+                                       
                 #------------------------ Determine epoch ---------------------
                 logging.info(f"Checkpoint '{file_name}' loaded to {self.device}, including model, optimizer, scheduler, scaler, weighted_metric_old, and datase state")
                 checkpoint_loaded = True
@@ -1076,7 +1091,7 @@ class Model_Dom():
     
     def zero_losses_metrics(self):
         self.epoch_losses, self.epoch_metrics = [], []
-        self.packed_losses_metrics = {}
+        self.packed_losses_metrics = { "epoch_losses": [], "epoch_metrics": [] }
         
     #---------------------------- protocol for loss and metrics
     #

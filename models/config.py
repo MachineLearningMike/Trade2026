@@ -33,12 +33,13 @@ projects["M18"] = {
     "management": {
         "model_module" : "model_m18",
         "metrics" : "rmse", # "mae", "rmse"
-        "steps_to_save": 200,
+        "steps_to_save": 500,
+        "skip_validation": False,
+        "epochs" : 30,
+        'epoch_patience' : 30,
         
         'choose_best_loss_model': False,
         
-        
-        "nSubstepsPerStep": 2,
         'initial_steps': 200,
         'half_life' : int(10228 * 80),    # covers  epochs
         'overwrite_saved_lr': False,

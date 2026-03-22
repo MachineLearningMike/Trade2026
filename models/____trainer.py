@@ -156,43 +156,41 @@ class Model_Trainer():
         ran_epochs = False
         best_metric_yet = 1e10
                 
-        for epoch in range(0, 100): #self.pm.epochs):
+        logging.info("============= Starting train ... ==============")
+                
+        for epoch in range(0, self.pm.epochs):
             ran_epochs = True
-                         
-            logging.info("============= Starting train ... ==============")
                         
-            self.run_epoch("train_set", trainable=True)   # (,), (C,)
-            train_losses, train_metrics = self.md.epoch_losses, self.md.epoch_metrics
-
+            train_losses, train_metrics = self.run_epoch("train_set", trainable=True)   # (,), (C,)
+ 
             self.md.get_epoch_display_batch(train_losses, train_metrics)
 
             logging.info("Finished train epoch {}, {}".format(self.md.epoch, (self.md.display)))
     
-            if not self.md.pm.skip_validation:
+            keep_going = True
+            best_metric = None
+    
+            if self.md.pm.skip_validation:
                 logging.info("Validation skipped as configured with 'skip_validation'")
-                continue
             else:
-                logging.info("--------- Starting valid epoch {} @ model ----------".format(self.md.epoch))
-
-                self.run_epoch("vali_set", trainable=False)   # (,), (C,)
-                vali_losses, vali_metrics = self.md.epoch_losses, self.md.epoch_metrics
+                vali_losses, vali_metrics = self.run_epoch("vali_set", trainable=False)   # (,), (C,)
                 
                 self.md.get_epoch_display_batch(vali_losses, vali_metrics)
                 logging.info("Finished vali epoch {}, {}".format(self.md.epoch, self.md.display))
 
                 keep_going, best_metric = self.md.save_best_train(vali_metrics)                
 
-                if not keep_going:
-                    self.md.save_state(train_finished=True)
-                    logging.info("!!! Train finished")
-                
-                self.save_state()
-                
-                best_metric_yet = best_metric
-                if self.bayes is not None:  self.bayes.on_epoch_end()
+            self.md.save_state(epoch_finished=True)           
+            self.save_state()
+            
+            best_metric_yet = best_metric or self.md.vali_metric_old
+            if self.bayes is not None:  self.bayes.on_epoch_end()
                     
-            self.md.epoch += 1
             if not keep_going: break
+            
+        self.md.save_state(train_finished=True)
+        self.save_state()
+        logging.info("!!! Train finished")
 
         return - best_metric_yet
     
@@ -283,12 +281,17 @@ class Model_Trainer():
                
         # self.dataset.set_data_slots(data_slots)
         renewed = self.dataset.refresh_x_set(x_set_label, seed=self.pm.seed, renew_if_new_epoch=True)
-        logging.info("{} {}".format(x_set_label, "renewed" if renewed else "left over from previous run"))
+        # logging.info("{} {}".format(x_set_label, "renewed" if renewed else "left over from previous run"))
 
-        if self.md.packed_losses_metrics is not None:
-            logging.info("--------- Continuing saved epoch... epoch {}".format(self.md.epoch))
-        else:
-            self.md.zero_losses_metrics()
+        task = "training" if trainable else "validation"
+        Doing = "Continuing" if trainable else "Starting"
+        
+        if self.md.epoch_finished:
+            logging.info(f"--------- Starting {task} on new epoch... {self.md.epoch}")
+        else:            
+            logging.info(f"--------- {Doing} {task} on saved epoch... {self.md.epoch}")
+
+        self.md.zero_losses_metrics()
                         
         progress_bar = zeus_tqdm(self.dataset)
         progress_bar.start_prefetch_thread()
@@ -379,7 +382,7 @@ class Model_Trainer():
         
         if trainable is True: 
             self.md.pack_losses_metrics()
-            self.md.save_state(epoch_finished=True)
+            self.md.save_state()
             self.save_state()
         if gpu_executor is not None: gpu_executor.shutdown()
 

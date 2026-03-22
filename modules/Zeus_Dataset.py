@@ -184,19 +184,19 @@ class Zeus_Dataset(Dataset):
 
     def refresh_x_set(self, x_label, seed=None, renew_if_new_epoch=False):
         renewed = False
-        if self.x_set is None or len(self.x_set) <= 0:  # this is a branc-new epoch
+        if self.x_set is None or len(self.x_set) <= 0:  # this is a brandnew epoch
             # No need to copy.copy(), as self.x_sets are re-generated above.
             if renew_if_new_epoch is True:
                 self.train_points, self.vali_points, self.test_points = self.generate_x_points(seed=seed)
 
-                if platform.system() == "Windows": 
+                if platform.system() == "Windows":
                     self.x_set = self.train_points[:] if x_label=='train_set' \
                         else self.vali_points[:] if x_label=='vali_set' \
                         else self.test_points[:] if x_label=='test_set' else None
                 else:
                     self.x_set = self.train_points if x_label=='train_set' \
                         else self.vali_points if x_label=='vali_set' \
-                        else self.test_points if x_label=='test_set' else None            
+                        else self.test_points if x_label=='test_set' else None
                 
                 random.shuffle(self.x_set)
                 renewed = True
@@ -237,32 +237,81 @@ class Zeus_Dataset(Dataset):
         means, volumes = self.binance_dataset.load_daatpoint(dt)
         return means, volumes
         
-    def take_batch(self):        
-        if len(self.x_set) <= 0: return None
+    # def take_batch(self):        
+    #     if len(self.x_set) <= 0: return None
+
+    #     taken = self.x_set[:self.pm.batch_size]
+    #     self.taken = taken
+    #     self.x_set = self.x_set[self.pm.batch_size:]
+    #     assert len(taken) > 0
+
+    #     batch = []
+
+    #     for b in range(len(taken)):
+    #         dt = taken[b]
+
+    #         futures = [
+    #             self._disk_threadPool.submit(
+    #                 # The reason this range of dt exist in the dataset is that taken[b] exists in the training dataset, which is chronically followed by validation dataset.
+    #                     self.load_datapoint, dt
+    #                 ) for idx in range(self.pm.nSubstepsPerStep)
+    #             ]
+
+    #         for fu in futures:
+    #             means, volumes = fu.result()
+    #             if means is not None: #  and volumes is not None:
+    #                 batch.append(means)
+        
+    #     return batch
+    
+    def take_batch(self):
+        if len(self.x_set) <= 0: 
+            return None
 
         taken = self.x_set[:self.pm.batch_size]
         self.taken = taken
         self.x_set = self.x_set[self.pm.batch_size:]
-        # assert len(taken) > 0
 
+        # Use list comprehension with single future per datapoint
+        futures = [
+            self._disk_threadPool.submit(self.load_datapoint, dt) 
+            for dt in taken  # One future per datapoint, not per substep
+        ]
+        
         batch = []
-
-        for b in range(len(taken)):
-            dt = taken[b]
-
-            futures = [
-                self._disk_threadPool.submit(
-                    # The reason this range of dt exist in the dataset is that taken[b] exists in the training dataset, which is chronically followed by validation dataset.
-                        self.load_datapoint, dt
-                    ) for idx in range(self.pm.nSubstepsPerStep)
-                ]
-
-            for fu in futures:
-                means, volumes = fu.result()
-                if means is not None: #  and volumes is not None:
-                    batch.append(means)
+        for fu in futures:
+            means, volumes = fu.result()
+            if means is not None:
+                batch.append(means)
         
         return batch
+    
+    # def load_datapoint_batch(self, dt_list):
+    #     batch_data = []
+        
+    #     # Option 1: Sequential loading within the thread (still parallel across batches)
+    #     for dt in dt_list:
+    #         means, volumes = self.binance_dataset.load_daatpoint(dt)
+    #         if means is not None:
+    #             batch_data.append(means)
+        
+    #     return batch_data
+    
+    # def take_batch(self):
+    #     if len(self.x_set) <= 0: 
+    #         return None
+
+    #     taken = self.x_set[:self.pm.batch_size]
+    #     self.taken = taken
+    #     self.x_set = self.x_set[self.pm.batch_size:]
+
+    #     # Submit a single task for the entire batch
+    #     future = self._disk_threadPool.submit(self.load_datapoint_batch, taken)
+        
+    #     # Wait for the batch to load
+    #     batch = future.result()
+        
+    #     return batch
     
     #-------------------------- play_physical_prediction -----------------------
     
@@ -410,6 +459,7 @@ class Zeus_Dataset(Dataset):
         self._worker_thread.start()
         
         self._disk_threadPool = ThreadPoolExecutor(max_workers=4)
+        # self._disk_threadPool = Pool(processes=4)
         
         return
 
