@@ -291,12 +291,12 @@ class Zeus_Dataset(Dataset):
         return means, marks
     
     def take_singleton_batch(self, dt):
-        _means, _volumes, _norm_marks = self.load_data(dt)
+        _means, _volumes, _norm_marks = self.load_datapoint(dt)
         
         singleton_batch = None
  
         if _means is not None and _norm_marks is not None:
-            means, marks = [means], [_norm_marks]
+            means, marks = [_means], [_norm_marks]
             
             means = torch.from_numpy(np.stack(means, axis=0))
             marks = torch.from_numpy(np.stack(marks, axis=0))

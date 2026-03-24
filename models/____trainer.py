@@ -27,7 +27,6 @@ from modules.Zeus_Dataset import Zeus_Dataset
 kr = KeyReader()
 kr.init_key_listener()
 
-
 class Model_Trainer():
     def __init__(self, pm, bayes=None, trainable=True):
         self.pm = pm
@@ -395,11 +394,59 @@ class Model_Trainer():
         epoch_metrics = self.md.epoch_metrics
 
         return epoch_losses, epoch_metrics  # (,), (C,)
-    
+
+    #------------------------------------------------------------
+
+    def initialize_show(self):
+        """Initialize the plot figure and settings."""
+        import matplotlib.pyplot as plt
+        
+        self._fig = plt.figure(figsize=(10, 6))
+        self._plot_initialized = True
+
+    def show_truth_prediction(self, truth, prediction):
+        """Plot truth vs prediction arrays."""
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import torch
+        
+        if not hasattr(self, '_plot_initialized') or not self._plot_initialized:
+            raise RuntimeError("Call initialize_show() before show_truth_prediction()")
+        
+        # Convert torch tensors to numpy arrays
+        if torch.is_tensor(truth):
+            truth = truth.detach().cpu().numpy()
+        if torch.is_tensor(prediction):
+            prediction = prediction.detach().cpu().numpy()
+        
+        truth = np.array(truth)
+        prediction = np.array(prediction)
+        
+        # Clear previous plot
+        plt.clf()
+        
+        x = np.arange(len(truth))
+        plt.plot(x, truth, 'b-', label='Truth', linewidth=2, marker='o', markersize=4)
+        plt.plot(x, prediction, 'r--', label='Prediction', linewidth=2, marker='s', markersize=4)
+        
+        plt.xlabel('Sample Index')
+        plt.ylabel('Value')
+        plt.title('Truth vs Prediction')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        plt.draw()
+        plt.pause(0.001)  # Small pause to update GUI
+
+    def finalize_show(self):
+        """Finalize and display the final plot."""
+        if self._plot_initialized:
+            plt.show(block=True)
+            self._plot_initialized = False
+
 
     def play_test(self):
-        
-        from modules.utils import show_two_arrays, initialize_for_show_array, finalize_for_show_array
         
         def get_key():
             """
@@ -425,49 +472,34 @@ class Model_Trainer():
             
             return None
         
-        initialize_for_show_array()
+        self.initialize_show()
         
         #----------------------------------------------------------------------
-               
-        # self.dataset.set_data_slots(data_slots)
-        renewed = self.dataset.refresh_x_set('test_set')
-        # logging.info("{} {}".format(x_set_label, "renewed" if renewed else "left over from previous run"))
-
-        logging.info(f"--------- Starting interactive testing...")
-
+        
         self.md.zero_losses_metrics()
-                         
-        step = 1
-        start = time.time()
-        start1 = time.time()
+        self.md.try_load_state()
+        self.try_load_state()        
+        
+        renewed = self.dataset.refresh_x_set('test_set')
+        self.md.zero_losses_metrics()
+        
+        test_set = self.dataset.x_set
+        inclusive_left = test_set[0]
+        inclusive_right = test_set[-1]
         
         dt = inclusive_left
-                
-        old_path = None; key_stroked = True
-        while inclusive_left <= dt and dt <= inclusive_right:            
+        key_stroked = True
+        
+        while inclusive_left <= dt <= inclusive_right:
             
             if key_stroked:
-
-                file_path = self.get_file_path_npz(dt.year, dt.month, dt.day, dt.hour, modulo)
-                if file_path != old_path:
-                    dict_data = load_and_decode(file_path)
-                    old_path = file_path
-
-                variable = self.pm.meteo_variables[var_id]
-                arr_y = dict_data[variable]  # (C, H, W)
-
-            #--------------------------------------------------------------
-            
-            singleton_batch = self.dataset.take_singleton_batch(dt)
-            
-            if singleton_batch is not None:
-                pred, true = self.md.predict(singleton_batch)            
-                pred, true = pred[0], true[0]
-
-                # Display the array
-                show_two_arrays(arr1=arr_y, arr2=None, variable1=variable, variable2="", dt=dt, modulo=modulo)
-
-            #---------------------------------------------------------------
+                singleton_batch = self.dataset.take_singleton_batch(dt)
+                if singleton_batch is not None:
+                    pred, true = self.md.predict(singleton_batch)            
+                    pred, true = pred[0], true[0]
+                    self.show_truth_prediction(true, pred)
+                else:
+                    pass
             
             # Wait for key input
             key = None
@@ -475,25 +507,21 @@ class Model_Trainer():
             while key is None and (time.time() - start_time < 0.5):
                 key = get_key()
                 if key is None:
-                    time.sleep(0.1)  # Small sleep to prevent CPU overuse
+                    # Let the plot update without exposing plt directly
+                    self._process_plot_events()
+                    time.sleep(0.01)
             
             # Process key
-            key_stroked = True
-            
+            key_stroked = True            
+            minute_step = 10
             if key == "up": 
-                var_id += 1
-                var_id = 0 if var_id >= len(self.pm.meteo_variables) else var_id
+                dt = dt + timedelta(minutes=1440)
             elif key == "down": 
-                var_id -= 1
-                var_id = len(self.pm.meteo_variables) - 1 if var_id < 0 else var_id
+                dt = dt - timedelta(minutes=1440)  # Fixed: was 'de'
             elif key == "left": 
-                dt = dt - timedelta(hours=modulo)
+                dt = dt - timedelta(minutes=minute_step)
             elif key == "right": 
-                dt = dt + timedelta(hours=modulo)
-            elif key == 'sep':
-                h = dt.hour
-                dict = Snapshot.get_season_events(dt.year)
-                dt = dict['sep_equinox'].replace(hour=dt.hour, minute=0)
+                dt = dt + timedelta(minutes=minute_step)
             elif key == "quit":
                 print("Quitting...")
                 break
@@ -502,10 +530,21 @@ class Model_Trainer():
                 key_stroked = False
                 continue
 
-        finalize_for_show_array()
-            
+        self.finalize_show()  
 
-  
+    def _process_plot_events(self):
+        """
+        Process pending plot events without exposing plt directly.
+        This method should be implemented by the class that manages the plot.
+        """
+        # If your class has access to the figure, you can do:
+        # import matplotlib.pyplot as plt
+        # plt.pause(0.001)
+        
+        # Or if you store the figure reference in initialize_show:
+        if hasattr(self, '_fig') and self._fig is not None:
+            self._fig.canvas.flush_events()
+            self._fig.canvas.draw_idle()
     
     
 if __name__ == "__main__":
@@ -520,4 +559,6 @@ if __name__ == "__main__":
     project_dir = pm.management_dir + "/" + pm.bayesProject
     
     model_sequence_trainer = Model_Trainer(pm, bayes=None, trainable=True)
-    model_sequence_trainer.train()
+    # model_sequence_trainer.train()
+    
+    model_sequence_trainer.play_test()
