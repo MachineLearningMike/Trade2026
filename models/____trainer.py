@@ -559,6 +559,6 @@ if __name__ == "__main__":
     project_dir = pm.management_dir + "/" + pm.bayesProject
     
     model_sequence_trainer = Model_Trainer(pm, bayes=None, trainable=True)
-    # model_sequence_trainer.train()
+    model_sequence_trainer.train()
     
-    model_sequence_trainer.play_test()
+    # model_sequence_trainer.play_test()

@@ -31,13 +31,8 @@ class Trade26(nn.Module):
         x_enc = values[:, :self.pm.seq_len, :]
         x_mark_enc = marks[:, :self.pm.seq_len, :]
 
-        x_dec = torch.concat([x_enc[:, -self.pm.label_len:, :], torch.zeros_like(values[:, -self.pm.pred_len:, :])], dim=1)
-        x_mark_dec = torch.concat([x_mark_enc[:, -self.pm.label_len:, :], marks[:, -self.pm.pred_len:, :]], dim=1)
-        
-        #------- The above block has a mistake. This block is correct, although the above block is a part of the training that already passsed 24 hours.
-        # x_dec = torch.concat([x_enc[:, -self.pm.label_len:, :], torch.zeros_like(values[:, self.seq_len : self.seq_len + self.pm.pred_len, :])], dim=1)
-        # x_mark_dec = torch.concat([x_mark_enc[:, -self.pm.label_len:, :], marks[:, self.seq_len : self.seq_len + self.pm.pred_len, :]], dim=1)
-
+        x_dec = torch.concat([x_enc[:, -self.pm.label_len:, :], torch.zeros_like(values[:, self.pm.seq_len : self.pm.seq_len + self.pm.pred_len, :])], dim=1)
+        x_mark_dec = torch.concat([x_mark_enc[:, -self.pm.label_len:, :], marks[:, self.pm.seq_len : self.pm.seq_len + self.pm.pred_len, :]], dim=1)
         
         outputs = self.model(x_enc, x_mark_enc, x_dec, x_mark_dec)
         
