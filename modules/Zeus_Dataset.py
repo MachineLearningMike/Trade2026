@@ -141,9 +141,9 @@ class Zeus_Dataset(Dataset):
         vali_points_all = filter_all_points(valid_start_dt, test_start_dt)
         test_points_all = filter_all_points(test_start_dt, test_end_dt_inclusive + timedelta(hours=1))
 
-        random.shuffle(train_points_all)
-        random.shuffle(vali_points_all)
-        random.shuffle(test_points_all)
+        [random.shuffle(train_points_all) for _ in range(10)]
+        vali_points_all = sorted(vali_points_all)
+        test_points_all = sorted(test_points_all)
 
         # Save the split as ISO format datetimes
         if save:
@@ -198,7 +198,7 @@ class Zeus_Dataset(Dataset):
                         else self.vali_points if x_label=='vali_set' \
                         else self.test_points if x_label=='test_set' else None
                 
-                random.shuffle(self.x_set)
+                if x_label == 'train_set': [random.shuffle(self.x_set) for _ in range(10)]
                 renewed = True
         
         self._fetched_batches = 0
@@ -210,7 +210,7 @@ class Zeus_Dataset(Dataset):
         
     def pack_state(self):
         """Pack the current x_set state for checkpointing."""
-        # We assume the take_batch thread has already taken some from self.x_set that's not processed yet.
+        # We assume the take_next_batch thread has already taken some from self.x_set that's not processed yet.
         if self.taken is not None:
             x_set = list(set(self.taken + self.x_set))      # return back to self.x_set
         else:
@@ -231,13 +231,13 @@ class Zeus_Dataset(Dataset):
     def no_more_data(self):
         return len(self.x_set) <= 0
     
-    #-------------------------------- take_batch ---------------------------------
+    #-------------------------------- take_next_batch ---------------------------------
     
     def load_datapoint(self, dt):
-        means, volumes = self.binance_dataset.load_daatpoint(dt)
-        return means, volumes
+        means, volumes, norm_marks = self.binance_dataset.load_datapoint(dt)
+        return means, volumes, norm_marks
         
-    # def take_batch(self):        
+    # def take_next_batch(self):        
     #     if len(self.x_set) <= 0: return None
 
     #     taken = self.x_set[:self.pm.batch_size]
@@ -264,7 +264,7 @@ class Zeus_Dataset(Dataset):
         
     #     return batch
     
-    def take_batch(self):
+    def take_next_batch(self):
         if len(self.x_set) <= 0: 
             return None
 
@@ -278,26 +278,46 @@ class Zeus_Dataset(Dataset):
             for dt in taken  # One future per datapoint, not per substep
         ]
         
-        batch = []
+        means, marks = [], []
         for fu in futures:
-            means, volumes = fu.result()
-            if means is not None:
-                batch.append(means)
+            _means, _volumes, _norm_marks = fu.result()
+            if _means is not None and _norm_marks is not None:
+                means.append(_means)
+                marks.append(_norm_marks)
+
+        means = torch.from_numpy(np.stack(means, axis=0))
+        marks = torch.from_numpy(np.stack(marks, axis=0))
         
-        return batch
+        return means, marks
+    
+    def take_singleton_batch(self, dt):
+        _means, _volumes, _norm_marks = self.load_data(dt)
+        
+        singleton_batch = None
+ 
+        if _means is not None and _norm_marks is not None:
+            means, marks = [means], [_norm_marks]
+            
+            means = torch.from_numpy(np.stack(means, axis=0))
+            marks = torch.from_numpy(np.stack(marks, axis=0))
+    
+            singleton_batch = (means, marks)
+ 
+        return singleton_batch
+        
     
     # def load_datapoint_batch(self, dt_list):
     #     batch_data = []
         
     #     # Option 1: Sequential loading within the thread (still parallel across batches)
     #     for dt in dt_list:
-    #         means, volumes = self.binance_dataset.load_daatpoint(dt)
+    #         means, volumes = self.binance_dataset.load_datapoint(dt)
     #         if means is not None:
     #             batch_data.append(means)
         
     #     return batch_data
     
-    # def take_batch(self):
+    # def take_next_batch(self):
     #     if len(self.x_set) <= 0: 
     #         return None
 
@@ -476,7 +496,7 @@ class Zeus_Dataset(Dataset):
 
             # (B, T1FG, C, H, W), (B, T2FG, C, H, W), (B, 1, C, H, W), (C,)
             # batch_x, batch_y, batch_diff, zeus_weights
-            batch = self.take_batch()
+            batch = self.take_next_batch()
             gc.collect()
 
             with self._lock:
@@ -525,6 +545,6 @@ if __name__ == "__main__":
     pm = params
     dataset = Zeus_Dataset(pm)
 
-    # dataset.split_data_points_by_date_segents(pm.train_start_dt, pm.vali_start_dt, pm.test_start_dt, pm.test_end_dt_inclusive, renew=True, save=True, seed=None)
+    dataset.split_data_points_by_date_segents(pm.train_start_dt, pm.vali_start_dt, pm.test_start_dt, pm.test_end_dt_inclusive, renew=True, save=True, seed=None)
     
-    dataset.load_data()
+    # dataset.load_data()

@@ -32,8 +32,8 @@ else:
 projects["M18"] = {
     "management": {
         "model_module" : "model_m18",
-        "metrics" : "rmse", # "mae", "rmse"
-        "steps_to_save": 500,
+        "metrics" : "mse", # "mae", "rmse"
+        "steps_to_save": 200,
         "skip_validation": False,
         "epochs" : 30,
         'epoch_patience' : 30,
@@ -43,6 +43,7 @@ projects["M18"] = {
         'initial_steps': 200,
         'half_life' : int(10228 * 80),    # covers  epochs
         'overwrite_saved_lr': False,
+        'activate_scheduler': False,
     },
     
     "data": {
@@ -58,6 +59,28 @@ projects["M18"] = {
             {
             }
         ]
+    },
+    
+    "autoformer_config": {
+        'seq_len': 1440,
+        'label_len': 720,
+        'pred_len': 144,
+        'output_attention': True,
+        'moving_avg': 60,
+        'enc_in': 1,        # the number of encoder input channels
+        'dec_in': 1,        # the number of decoder input channels
+        'c_out': 1,         # the number of decoder output channels
+        'embed': 'timeF',   # 
+        'freq': 't',    # 't' for minute
+        'dropout': 0,   
+        'd_model': 32,
+        'factor': 3,
+        'n_heads': 4,
+        'd_ff': 2048,
+        'activation': 'gelu',
+        'e_layers': 4,
+        'd_layers': 4,
+        
     }
 }
 
@@ -69,6 +92,7 @@ config["bayesProject"] = project
 config.update(projects[project]["management"])
 config.update(projects[project]["data"])
 config.update(projects[project]["model"])
+config.update(projects[project]["autoformer_config"])
 
 params = SimpleNamespace(**config)
 

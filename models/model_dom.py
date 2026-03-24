@@ -69,7 +69,7 @@ class Model_Dom():
         self.step_loss = None
         self.best_loss = 1e9
         self.accum_substeps = 0
-        self.ma_loss = 1e9
+        self.loss_mean, self.loss_std = 1e9, 1e9
     
     def _select_optimizer(self):
         optimizer_name = getattr(self.pm, 'optimizer', 'adam').lower()
@@ -169,7 +169,7 @@ class Model_Dom():
     def set_learning_rate(self, lr):
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
-        self.scheduler.base_lrs = [lr for lr in self.scheduler.base_lrs]
+        # self.scheduler.base_lrs = [lr for lr in self.scheduler.base_lrs]
         self.learning_rate = lr
         
     def get_learning_rate(self):
@@ -179,11 +179,11 @@ class Model_Dom():
         if vali_metric is not None:
             wasBestEpoch = False
 
-            if np.array(vali_metric).mean().item() < self.vali_metric_old:
+            if np.array(vali_metric).mean() < self.vali_metric_old:
                 wasBestEpoch = True
-                self.vali_metric_old = np.array(vali_metric).item()
+                self.vali_metric_old = np.array(vali_metric).mean()
                 name = "best_model"
-                logging.info("saving best train_state...model: vali_metric: {:.3f}, path: {}".format(torch.mean(vali_metric).item(), name))
+                logging.info("saving best train_state...model: vali_metric: {:.3f}, path: {}".format(np.array(vali_metric).mean(), name))
                 self.save_state(name=name, model_only=True)
 
             self.epochs_since_improvement = self.epochs_since_improvement + 1 if not wasBestEpoch else 0
@@ -203,10 +203,10 @@ class Model_Dom():
     def save_best_loss_model(self, loss, elapse):
         if loss < 0.4 and loss < (1 - 0.000001) * self.best_loss:    # 0.4: hard-coded.
             self.best_loss = loss
-            logging.info("!!!!!!!!!!!!!!! Saving best-loss model... loss {:.5f}, ma_loss {:.5f} iter {} elapse {} !!!!!!!!!!!!".format(loss, self.ma_loss, self.accum_substeps, elapse))
+            logging.info("!!!!!!!!!!!!!!! Saving best-loss model... loss {:.10f}, loss_mean {:.10f} loss_std {:.10f} iter {} elapse {} !!!!!!!!!!!!".format(loss, self.loss_mean, self.loss_std, self.accum_substeps, elapse))
             self.save_state(best_loss=True)
        
-    def save_state(self, name=None, train_finished=False, best_loss=False, epoch_finished=False):
+    def save_state(self, name=None, train_finished=False, best_loss=False, epoch_finished=False, model_only=False):
     
         if (not train_finished) and (epoch_finished): 
             self.epoch += 1
@@ -220,7 +220,7 @@ class Model_Dom():
         elif name is None: 
             name = "train_state"  # + '-' + self.get_train_id_string()
         else:
-            assert name == "train_state"
+            assert name == "train_state" or name == "best_model"
         
         def get_complete_state_dict(model):
             """Get state dict including ALL buffers, not just registered ones"""
@@ -235,23 +235,30 @@ class Model_Dom():
             
             return state_dict
         
-        checkpoint = {
-            # 'model' : self.model,
-            'model': self.model.state_dict(), #get_complete_state_dict(self.model), # self.model.state_dict(), # get_complete_state_dict(self.model),
-            'learning_rate': self.learning_rate,
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
-            'scaler':   self.scaler.state_dict(),
-            'epoch': self.epoch,
-            'epochs_since_improvement': self.epochs_since_improvement,
-            'epoch_finished': epoch_finished,
-            'train_finished' : train_finished,
-            'packed_losses_metrics': self.packed_losses_metrics,
-            'best_loss' : self.best_loss,
-            'vali_metric_old' : self.vali_metric_old,
-            'accum_substeps' : self.accum_substeps,
-            'epoch_finished' : epoch_finished,
-            }
+        if not model_only:
+            checkpoint = {
+                # 'model' : self.model,
+                'model': self.model.state_dict(), #get_complete_state_dict(self.model), # self.model.state_dict(), # get_complete_state_dict(self.model),
+                'learning_rate': self.learning_rate,
+                'optimizer': self.optimizer.state_dict(),
+                'scheduler': self.scheduler.state_dict(),
+                'scaler':   self.scaler.state_dict(),
+                'epoch': self.epoch,
+                'epochs_since_improvement': self.epochs_since_improvement,
+                'epoch_finished': epoch_finished,
+                'train_finished' : train_finished,
+                'packed_losses_metrics': self.packed_losses_metrics,
+                'best_loss' : self.best_loss,
+                'vali_metric_old' : self.vali_metric_old,
+                'accum_substeps' : self.accum_substeps,
+                'epoch_finished' : epoch_finished,
+                }
+        else:
+            checkpoint = {
+                # 'model' : self.model,
+                'model': self.model.state_dict(),
+                }
+        
         utils.check_dir(self.project_path)
         # # temp_path = self.project_path / (name + '.pth.tmp')
         path = self.project_path / (name + '.pth')
@@ -1060,13 +1067,14 @@ class Model_Dom():
     def get_epoch_display_batch(self, loss_batch, metrics_batch):       
         lead = "model"
         if loss_batch is not None and len(loss_batch) > 0:
+            loss_mean, loss_std = self.get_mesn_std(loss_batch)
             loss = np.array(loss_batch).mean()
-            loss = "loss {:.4f}, ".format(loss)
+            loss = f"loss_mean {loss_mean:.10f}, loss_std {loss_std}"
         else:
             loss = "loss=None, "
         if metrics_batch is not None and len(metrics_batch) > 0:
             metrics = list(np.array(metrics_batch).mean(axis=0))
-            metrics = self.pm.metrics + ": " + ", ".join(f"{x:.4f}" for x in metrics)                        
+            metrics = self.pm.metrics + ": " + ", ".join(f"{x:.10f}" for x in metrics)                        
         else:
             metrics = "metrics=None"
         self.display = lead + loss + metrics
@@ -1122,21 +1130,32 @@ class Model_Dom():
             _epoch_metrics = np.array(self.epoch_metrics).mean(axis=0)       # (C,)
             strC = " ".join(f"{x:.5g}" for x in _epoch_metrics)
             self.pbar_description = "loss: {:.4f} {}: ({})".format(_epoch_loss, self.pm.metrics, strC)
+            
+    def get_mesn_std(self, list):
+        arr = np.array(list)
+        return arr.mean(), arr.std()
 
     def get_pbar_description_step(self, step_loss, step_metrics):   # (,), (C,)
         self.recent_losses.append(step_loss)
-        norm = 50
+        norm = 200
         if len(self.recent_losses) > norm: self.recent_losses = self.recent_losses[-norm:]
-        self.ma_loss = sum(self.recent_losses) / len(self.recent_losses)
+        self.loss_mean, self.loss_std = self.get_mesn_std(self.recent_losses)
+        # self.loss_mean = sum(self.recent_losses) / len(self.recent_losses)
+        # self.loss_std = math.sqrt(sum([(loss-self.loss_mean)**2 for loss in self.recent_losses]) / len(self.recent_losses))
         
-        strC = " ".join(f"{x:.3g}" for x in step_metrics[-len(self.pm.targetVariables):])
-        self.pbar_description = "loss {:.3f} ma_loss {:.3f} {} ({}) substeps {}".format(step_loss, self.ma_loss, self.pm.metrics, strC, self.accum_substeps)
+        strC = " ".join(f"{x:.3g}" for x in step_metrics)
+        
+        scale = 10 ** 4
+        self.pbar_description = "loss {:.4f} loss_mean {:.4f} loss_std {:.4f} {} ({}) substeps {}".format(step_loss * scale, self.loss_mean * scale, self.loss_std * scale, self.pm.metrics, strC, self.accum_substeps)
         
     def stepOptimizer(self, loss_item):
         performed_step, lr, grad_norm = self.lr_controller.stepOptimizer(loss_item)
 
-    def forward_backward_no_optimizer_step(self, batch, train_dict):
-        return self.model.forward_backward_no_optimizer_step(batch, train_dict, self.accum_substeps)
+    def forward_backward_no_optimizer_step(self, batch, train_dict, trainable):
+        return self.model.forward_backward_no_optimizer_step(batch, train_dict, trainable, self.accum_substeps)
+    
+    def predict(self, batch):
+        return self.model.predict(batch)
         
     def store_step_loss_and_metrics(self, step_loss, step_metrics): # [substep_loss...], [substep_metrics...]
         loss = torch.stack(step_loss).mean().item()

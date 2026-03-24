@@ -7,6 +7,7 @@ from pathlib import Path
 import logging
 import sys, gc, copy, time, math
 from importlib import import_module
+from datetime import datetime, timedelta
 
 # import matplotlib
 # matplotlib.use("Agg")  # non-GUI backend, safe in threads
@@ -160,8 +161,9 @@ class Model_Trainer():
                 
         for epoch in range(0, self.pm.epochs):
             ran_epochs = True
-                        
-            train_losses, train_metrics = self.run_epoch("train_set", trainable=True)   # (,), (C,)
+
+            with torch.set_grad_enabled(True):
+                train_losses, train_metrics = self.run_epoch("train_set", trainable=True)   # (,), (C,)
  
             self.md.get_epoch_display_batch(train_losses, train_metrics)
 
@@ -173,7 +175,8 @@ class Model_Trainer():
             if self.md.pm.skip_validation:
                 logging.info("Validation skipped as configured with 'skip_validation'")
             else:
-                vali_losses, vali_metrics = self.run_epoch("vali_set", trainable=False)   # (,), (C,)
+                with torch.set_grad_enabled(False):
+                    vali_losses, vali_metrics = self.run_epoch("vali_set", trainable=False)   # (,), (C,)
                 
                 self.md.get_epoch_display_batch(vali_losses, vali_metrics)
                 logging.info("Finished vali epoch {}, {}".format(self.md.epoch, self.md.display))
@@ -273,6 +276,8 @@ class Model_Trainer():
             assert lr is not None
             lr *= factor
             focus_md.set_learning_rate(lr)
+            # lr = focus_md.get_learning_rate()
+            # print(f"lr = {lr}")
 
         return
     
@@ -314,7 +319,6 @@ class Model_Trainer():
             if (end-self.train_start_time) > self.pm.train_hours_limit * 3600: break
 
             if not progress_bar.no_more_data():  progress_bar.prefetch(x_set_label)        # Prefetch ensures getting new bacthes.
-            if batch is None: break     # just in case
             
             if False:
                 self.show_data(batch_x)
@@ -322,31 +326,32 @@ class Model_Trainer():
 
             self.md.optimizer.zero_grad(set_to_none=True)
                               
-            train_step_loss = []; train_step_metrics = []; substeps_per_step = 0
+            epoch_step_loss = []; epoch_step_metrics = []; substeps_per_step = 0
 
-            with autocast(device_type='cuda', dtype=torch.bfloat16):    # time: 97 -> 82, memory: little
-                #------------------------ this algorithm is studied in zeus_train_6_hourly.py -----------
+            # with autocast(device_type='cuda', dtype=torch.bfloat16):    # time: 97 -> 82, memory: little
+            #     #------------------------ this algorithm is studied in zeus_train_6_hourly.py -----------
                         
-                        
-                self.md.forward_backward_no_optimizer_step(batch, train_dict)
-                # substep_loss, substep_metrics = self.md.forward_backward_no_optimizer_step(batch, train_dict)
-                
-                # substeps_per_step += 1
-                # self.md.accum_substeps += 1
+            substep_loss, substep_metrics = self.md.forward_backward_no_optimizer_step(batch, train_dict, trainable)
+            
+            if trainable:
+                substeps_per_step += 1
+                self.md.accum_substeps += 1
 
-                # train_step_loss.append(substep_loss)          # [substep_loss...]
-                # train_step_metrics.append(substep_metrics)    # [substep_metrics...]                    
-                    
-                # #------------------------------------------------ The set of steps finished.
-                # self.md.store_step_loss_and_metrics(train_step_loss, train_step_metrics) # [substep_loss...], [substep_metrics...]
+            epoch_step_loss.append(substep_loss)          # [substep_loss...]
+            epoch_step_metrics.append(substep_metrics)    # [substep_metrics...]                    
                 
-                # if trainable:
-                #     utils.check_gradient(self.md.model)
-                #     # md.optimizer.step()     # # instead of the below lines
-                #     # scaler doesn't support bf16?  ---- this use of scaler is coupled with the use of scaler in  forward_backward_no_optimizer_step
-                #     self.md.scaler.step(self.md.optimizer)
-                #     self.md.scaler.update()
-                #     self.md.scheduler.step()
+            # #------------------------------------------------ The set of steps finished.
+            self.md.store_step_loss_and_metrics(epoch_step_loss, epoch_step_metrics) # [substep_loss...], [substep_metrics...]
+            
+            if trainable:
+                utils.check_gradient(self.md.model)
+                
+                self.md.optimizer.step()     # # instead of the below lines
+                # scaler doesn't support bf16?  ---- this use of scaler is coupled with the use of scaler in  forward_backward_no_optimizer_step
+                # self.md.scaler.step(self.md.optimizer)
+                # self.md.scaler.update()
+                
+                if self.pm.activate_scheduler:  self.md.scheduler.step()
 
             end1 = time.time()
             ms_wait = (end-start) * 1000
@@ -361,8 +366,8 @@ class Model_Trainer():
             start1 = time.time()
 
             # This is to save the model in case it suddenly deviates to diverge.
-            # if trainable is True:
-            #     self.md.save_best_loss_model(self.md.step_loss, elapse)
+            if trainable is True:
+                self.md.save_best_loss_model(self.md.step_loss, elapse)
             
             if trainable is True and step % self.pm.steps_to_save == 0:
                 self.md.pack_losses_metrics()
@@ -390,6 +395,118 @@ class Model_Trainer():
         epoch_metrics = self.md.epoch_metrics
 
         return epoch_losses, epoch_metrics  # (,), (C,)
+    
+
+    def play_test(self):
+        
+        from modules.utils import show_two_arrays, initialize_for_show_array, finalize_for_show_array
+        
+        def get_key():
+            """
+            Get the most recent key press without buffering.
+            Returns None if no key is currently pressed.
+            """
+            import keyboard
+            import time
+            
+            # Check all keys we care about
+            keys_to_check = {
+                'up': 'up', 'down': 'down', 'left': 'left', 'right': 'right',
+                'esc': 'quit',
+            }
+            
+            # Check if any key is currently pressed
+            for key, action in keys_to_check.items():
+                if keyboard.is_pressed(key):
+                    # Wait for key release to ensure we don't get multiple triggers
+                    while keyboard.is_pressed(key):
+                        time.sleep(0.01)
+                    return action
+            
+            return None
+        
+        initialize_for_show_array()
+        
+        #----------------------------------------------------------------------
+               
+        # self.dataset.set_data_slots(data_slots)
+        renewed = self.dataset.refresh_x_set('test_set')
+        # logging.info("{} {}".format(x_set_label, "renewed" if renewed else "left over from previous run"))
+
+        logging.info(f"--------- Starting interactive testing...")
+
+        self.md.zero_losses_metrics()
+                         
+        step = 1
+        start = time.time()
+        start1 = time.time()
+        
+        dt = inclusive_left
+                
+        old_path = None; key_stroked = True
+        while inclusive_left <= dt and dt <= inclusive_right:            
+            
+            if key_stroked:
+
+                file_path = self.get_file_path_npz(dt.year, dt.month, dt.day, dt.hour, modulo)
+                if file_path != old_path:
+                    dict_data = load_and_decode(file_path)
+                    old_path = file_path
+
+                variable = self.pm.meteo_variables[var_id]
+                arr_y = dict_data[variable]  # (C, H, W)
+
+            #--------------------------------------------------------------
+            
+            singleton_batch = self.dataset.take_singleton_batch(dt)
+            
+            if singleton_batch is not None:
+                pred, true = self.md.predict(singleton_batch)            
+                pred, true = pred[0], true[0]
+
+                # Display the array
+                show_two_arrays(arr1=arr_y, arr2=None, variable1=variable, variable2="", dt=dt, modulo=modulo)
+
+            #---------------------------------------------------------------
+            
+            # Wait for key input
+            key = None
+            start_time = time.time()
+            while key is None and (time.time() - start_time < 0.5):
+                key = get_key()
+                if key is None:
+                    time.sleep(0.1)  # Small sleep to prevent CPU overuse
+            
+            # Process key
+            key_stroked = True
+            
+            if key == "up": 
+                var_id += 1
+                var_id = 0 if var_id >= len(self.pm.meteo_variables) else var_id
+            elif key == "down": 
+                var_id -= 1
+                var_id = len(self.pm.meteo_variables) - 1 if var_id < 0 else var_id
+            elif key == "left": 
+                dt = dt - timedelta(hours=modulo)
+            elif key == "right": 
+                dt = dt + timedelta(hours=modulo)
+            elif key == 'sep':
+                h = dt.hour
+                dict = Snapshot.get_season_events(dt.year)
+                dt = dict['sep_equinox'].replace(hour=dt.hour, minute=0)
+            elif key == "quit":
+                print("Quitting...")
+                break
+            elif key is None:
+                # No key pressed, continue to next iteration
+                key_stroked = False
+                continue
+
+        finalize_for_show_array()
+            
+
+  
+    
     
 if __name__ == "__main__":
     

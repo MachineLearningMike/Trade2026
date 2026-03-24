@@ -15,6 +15,10 @@ class Binance_Dataset:
         
         self.save_dir = save_dir
         
+        # mark = dt.month, dt.day, dt.weekday, dt.hour, dt.minute
+        self.mark_mean = np.array([6.5, 16, 3, 11.5, 29.5])
+        self.mark_std = np.array([pow((n-m)*(n-m+2)/12, 0.5) for (m, n) in [(1, 12), (1, 31), (0, 6), (0, 23), (0, 59)]])   # population std
+        
     def get_paths(self, start_utc):
         folder_path = Path(self.save_dir) / str(start_utc.year).zfill(4) / str(start_utc.month).zfill(2) / str(start_utc.day).zfill(2)
         date_anchor = datetime(start_utc.year, start_utc.month, start_utc.day)
@@ -65,16 +69,41 @@ class Binance_Dataset:
             np.save(file_path_means, means)
             np.save(file_path_volumes, volumes)
     
-    def load_daatpoint(self, dt):
+    def is_consistent(self, arr):
+        report = True
+        try:
+            assert arr.shape[0] == 2880
+            assert not np.isnan(arr).any()
+            assert arr[arr < 0.5].shape[0] <= 0
+            assert arr[arr > 2.0].shape[0] <= 0
+        except:
+            report = False
+        return report
+     
+    def load_datapoint(self, dt):
         _, file_path_means, file_path_volumes = self.get_paths(dt)        
 
-        means, volumes = None, None
+        means, volumes, norm_marks = None, None, None
         try:
-            means = np.load(file_path_means)
-            # volumes = np.load(file_path_volumes)
+            means = np.load(file_path_means)           #------------- ugly but we need an even number for FFT.
+            means = (means[1:] + 1e-9) / (means[:-1] + 1e-9)
+            
+            assert self.is_consistent(means)
+  
         except:
-            pass
-        return means, volumes
+            means = None
+            return means, volumes, norm_marks
+        
+        marks = []
+        minutes = means.shape[0]
+        for m in range(minutes):
+            d = dt + timedelta(minutes=m)
+            marks.append([d.month, d.day, d.weekday(), d.hour, d.minute])
+        marks = np.array(marks)     # (n, 5)
+        norm_marks = (marks - self.mark_mean) / self.mark_std
+        
+        return means, volumes, norm_marks
+
                 
     def get_datapoint_datetimes(self):
     
@@ -150,7 +179,7 @@ class Binance_Dataset:
             "n_missings": len(missing),
             "n_unexpected": len(unexpected),
         }
-
+        
 
 if __name__ == "__main__":
 
@@ -163,7 +192,7 @@ if __name__ == "__main__":
     interval = '1m'
     minute_step = 10   # minutes
 
-    # binance.build_binance_dataset(symbol, start_utc, end_utc, interval, data_dir, minute_step)
+    # binance.build_binance_dataset(symbol, start_utc, end_utc, interval, data_dir, minute_step)/
 
     # datetimes = binance.get_datapoint_datetimes(data_dir)
     
