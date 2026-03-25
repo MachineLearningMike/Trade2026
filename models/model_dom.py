@@ -201,7 +201,7 @@ class Model_Dom():
         return "best_loss_model"
     
     def save_best_loss_model(self, loss, elapse):
-        if loss < 0.4 and loss < (1 - 0.000001) * self.best_loss:    # 0.4: hard-coded.
+        if loss < (1 - 0.000001) * self.best_loss:    # 0.4: hard-coded.
             self.best_loss = loss
             logging.info("!!!!!!!!!!!!!!! Saving best-loss model... loss {:.10f}, loss_mean {:.10f} loss_std {:.10f} iter {} elapse {} !!!!!!!!!!!!".format(loss, self.loss_mean, self.loss_std, self.accum_substeps, elapse))
             self.save_state(best_loss=True)

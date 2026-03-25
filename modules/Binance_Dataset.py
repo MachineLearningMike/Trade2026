@@ -74,22 +74,31 @@ class Binance_Dataset:
         try:
             assert arr.shape[0] == 2880
             assert not np.isnan(arr).any()
-            assert arr[arr < 0.5].shape[0] <= 0
-            assert arr[arr > 2.0].shape[0] <= 0
+            # assert arr[arr < 0.5].shape[0] <= 0
+            # assert arr[arr > 2.0].shape[0] <= 0
         except:
             report = False
         return report
      
-    def load_datapoint(self, dt):
+    def load_datapoint(self, dt, value='plain'):
         _, file_path_means, file_path_volumes = self.get_paths(dt)        
 
         means, volumes, norm_marks = None, None, None
         try:
             means = np.load(file_path_means)           #------------- ugly but we need an even number for FFT.
-            means = (means[1:] + 1e-9) / (means[:-1] + 1e-9)
+            
+            if value == 'ratio':
+                means = (means[1:]) / (means[:-1] + 1e-9)
+            elif value == 'log_ratio':
+                means = np.log((means[1:] + 1e-9) / (means[:-1] + 1e-9)) * 1000
+            elif value == 'plain':
+                means = means
+            else: 
+                print(f"Invalid value_type: {value}")
+                raise Exception('Invalid value')
             
             assert self.is_consistent(means)
-  
+              
         except:
             means = None
             return means, volumes, norm_marks

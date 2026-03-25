@@ -168,11 +168,11 @@ class Zeus_Dataset(Dataset):
         vali_points  = self.vali_points[:]
         test_points  = self.test_points[:]
 
-        # Shuffle using a local RNG for reproducibility.
-        rng = random.Random(seed)
-        rng.shuffle(train_points)
-        rng.shuffle(vali_points)
-        rng.shuffle(test_points)
+        # Never shuffle at all.
+        # rng = random.Random(seed)
+        # rng.shuffle(train_points)
+        # rng.shuffle(vali_points)
+        # rng.shuffle(test_points)
 
         return train_points, vali_points, test_points
     
@@ -184,22 +184,22 @@ class Zeus_Dataset(Dataset):
 
     def refresh_x_set(self, x_label, seed=None, renew_if_new_epoch=False):
         renewed = False
-        if self.x_set is None or len(self.x_set) <= 0:  # this is a brandnew epoch
-            # No need to copy.copy(), as self.x_sets are re-generated above.
-            if renew_if_new_epoch is True:
-                self.train_points, self.vali_points, self.test_points = self.generate_x_points(seed=seed)
+        # if self.x_set is None or len(self.x_set) <= 0:  # this is a brandnew epoch
+        # No need to copy.copy(), as self.x_sets are re-generated above.
+        # if renew_if_new_epoch is True:
+        self.train_points, self.vali_points, self.test_points = self.generate_x_points(seed=seed)
 
-                if platform.system() == "Windows":
-                    self.x_set = self.train_points[:] if x_label=='train_set' \
-                        else self.vali_points[:] if x_label=='vali_set' \
-                        else self.test_points[:] if x_label=='test_set' else None
-                else:
-                    self.x_set = self.train_points if x_label=='train_set' \
-                        else self.vali_points if x_label=='vali_set' \
-                        else self.test_points if x_label=='test_set' else None
-                
-                if x_label == 'train_set': [random.shuffle(self.x_set) for _ in range(10)]
-                renewed = True
+        if platform.system() == "Windows":
+            self.x_set = self.train_points[:] if x_label=='train_set' \
+                else self.vali_points[:] if x_label=='vali_set' \
+                else self.test_points[:] if x_label=='test_set' else None
+        else:
+            self.x_set = self.train_points if x_label=='train_set' \
+                else self.vali_points if x_label=='vali_set' \
+                else self.test_points if x_label=='test_set' else None
+        
+        if x_label == 'train_set': [random.shuffle(self.x_set) for _ in range(10)]
+        renewed = True
         
         self._fetched_batches = 0
         self.total_batches = math.ceil(len(self.x_set) / self.pm.batch_size)
@@ -233,8 +233,8 @@ class Zeus_Dataset(Dataset):
     
     #-------------------------------- take_next_batch ---------------------------------
     
-    def load_datapoint(self, dt):
-        means, volumes, norm_marks = self.binance_dataset.load_datapoint(dt)
+    def load_datapoint(self, dt, value):
+        means, volumes, norm_marks = self.binance_dataset.load_datapoint(dt, value)
         return means, volumes, norm_marks
         
     # def take_next_batch(self):        
@@ -274,7 +274,7 @@ class Zeus_Dataset(Dataset):
 
         # Use list comprehension with single future per datapoint
         futures = [
-            self._disk_threadPool.submit(self.load_datapoint, dt) 
+            self._disk_threadPool.submit(self.load_datapoint, dt, self.pm.value) 
             for dt in taken  # One future per datapoint, not per substep
         ]
         
@@ -291,7 +291,7 @@ class Zeus_Dataset(Dataset):
         return means, marks
     
     def take_singleton_batch(self, dt):
-        _means, _volumes, _norm_marks = self.load_datapoint(dt)
+        _means, _volumes, _norm_marks = self.load_datapoint(dt, self.pm.value)
         
         singleton_batch = None
  

@@ -36,8 +36,8 @@ class Trade26(nn.Module):
         
         outputs = self.model(x_enc, x_mark_enc, x_dec, x_mark_dec)
         
-        pred = outputs[0][:, -self.pm.pred_len:, :]
-        true = values[:, -self.pm.pred_len:, :]
+        pred = outputs[0] * 1 / 6       #------------------------------------------ 1 / 6
+        true = values[:, self.pm.seq_len : self.pm.seq_len + self.pm.pred_len, :]
         
         return pred, true
         

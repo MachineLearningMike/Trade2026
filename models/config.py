@@ -117,9 +117,10 @@ projects["M25"] = {
     },
     
     "autoformer_config": {
+        'value' : 'log_ratio',  # 'plain', 'ratio', 'log_ratio'
         'seq_len': 1440,
         'label_len': 720,
-        'pred_len': 16,
+        'pred_len': 4,
         'output_attention': True,
         'moving_avg': 60,
         'enc_in': 1,        # the number of encoder input channels
