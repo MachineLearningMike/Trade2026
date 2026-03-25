@@ -140,9 +140,65 @@ projects["M25"] = {
     }
 }
 
+projects["M25_2"] = {
+    "management": {
+        "model_module" : "model_m18",
+        "metrics" : "mse", # "mae", "rmse"
+        "steps_to_save": 200,
+        "skip_validation": False,
+        "epochs" : 30,
+        'epoch_patience' : 30,
+        
+        'choose_best_loss_model': False,
+        
+        'initial_steps': 200,
+        'half_life' : int(10228 * 80),    # covers  epochs
+        'overwrite_saved_lr': False,
+        'activate_scheduler': False,
+    },
+    
+    "data": {
+        "factor10": 10,
+        "org_height": 384,
+        "batch_size": 10,
+    },
+    
+    "model": {
+        "optimizer": "adamw",
+        'block_dicts' : [
+
+            {
+            }
+        ]
+    },
+    
+    "autoformer_config": {
+        'value' : 'log_ratio',  # 'plain', 'ratio', 'log_ratio'
+        'seq_len': 1440,
+        'label_len': 720,
+        'pred_len': 4,
+        'output_attention': True,
+        'moving_avg': 60,
+        'enc_in': 1,        # the number of encoder input channels
+        'dec_in': 1,        # the number of decoder input channels
+        'c_out': 1,         # the number of decoder output channels
+        'embed': 'timeF',   # 
+        'freq': 't',    # 't' for minute
+        'dropout': 0,   
+        'd_model': 32,
+        'factor': 3,
+        'n_heads': 4,
+        'd_ff': 256,
+        'activation': 'gelu',
+        'e_layers': 8,
+        'd_layers': 8,
+        
+    }
+}
+
 #------------------------------------- generate params -------------------------------
 
-project = "M25"
+project = "M25_2"   # adding classification losses.
 config["bayesProject"] = project
 
 config.update(projects[project]["management"])

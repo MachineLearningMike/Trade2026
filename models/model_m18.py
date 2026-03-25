@@ -17,7 +17,9 @@ class Trade26(nn.Module):
         
         self.model = Autoformer.Model(pm)
         
-        self.loss = nn.MSELoss()
+        self.mse_loss = nn.MSELoss()
+        self.bce_loss = nn.BCELoss()
+        self.sigmoid = torch.sigmoid
         
         
     def predict(self, batch):
@@ -62,7 +64,7 @@ class Trade26(nn.Module):
         # pred = outputs[0][:, -self.pm.pred_len:, :]
         # true = values[:, -self.pm.pred_len:, :]
         
-        loss = self.loss(pred, true)
+        loss = self.find_loss(pred, true)
         
         if trainable:
             loss.backward()
@@ -71,3 +73,19 @@ class Trade26(nn.Module):
         metrics = loss.unsqueeze(0)
     
         return loss, metrics    # (), (C,)
+    
+    
+    def find_loss(self, pred, true):    # (P,), (P,). mean = 0
+        
+        # mse_loss = self.mse_loss(pred, true)
+        
+        # true_label = (true >= 0).to(torch.float)   # 1 if true > 0 else 0
+        true_label = self.sigmoid(true)     #----------- continuous, this gives much more stability to loss.        
+        pred_prob = self.sigmoid(pred)
+        
+        bce_loss = self.bce_loss(pred_prob, true_label)
+        
+        loss = bce_loss
+        
+        return loss
+    
