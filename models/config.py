@@ -160,7 +160,7 @@ projects["M25_2"] = {
     "data": {
         "factor10": 10,
         "org_height": 384,
-        "batch_size": 10,
+        "batch_size": 16,
     },
     
     "model": {

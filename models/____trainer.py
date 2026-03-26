@@ -429,6 +429,9 @@ class Model_Trainer():
         plt.plot(x, truth, 'b-', label='Truth', linewidth=2, marker='o', markersize=4)
         plt.plot(x, prediction, 'r--', label='Prediction', linewidth=2, marker='s', markersize=4)
         
+        # Add thick, colored y=0 reference line
+        plt.axhline(y=0, color='green', linestyle='-', linewidth=3, alpha=0.7, label='y=0')
+        
         plt.xlabel('Sample Index')
         plt.ylabel('Value')
         plt.title('Truth vs Prediction')
@@ -560,6 +563,6 @@ if __name__ == "__main__":
     
     model_sequence_trainer = Model_Trainer(pm, bayes=None, trainable=True)
 
-    model_sequence_trainer.train()
+    # model_sequence_trainer.train()
     
     model_sequence_trainer.play_test()

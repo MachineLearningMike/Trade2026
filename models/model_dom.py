@@ -1065,11 +1065,10 @@ class Model_Dom():
 
 
     def get_epoch_display_batch(self, loss_batch, metrics_batch):       
-        lead = "model"
+        lead = ""
         if loss_batch is not None and len(loss_batch) > 0:
             loss_mean, loss_std = self.get_mesn_std(loss_batch)
-            loss = np.array(loss_batch).mean()
-            loss = f"loss_mean {loss_mean:.10f}, loss_std {loss_std}"
+            loss = f"loss_mean {loss_mean * 10**4:.10f}, loss_std {loss_std * 10**4:.10f}"
         else:
             loss = "loss=None, "
         if metrics_batch is not None and len(metrics_batch) > 0:
@@ -1158,8 +1157,11 @@ class Model_Dom():
         return self.model.predict(batch)
         
     def store_step_loss_and_metrics(self, step_loss, step_metrics): # [substep_loss...], [substep_metrics...]
+        
         loss = torch.stack(step_loss).mean().item()
+        
         self.epoch_losses.append(loss)
+
         self.total_losses.append(loss)
         
         metrics = torch.stack(step_metrics, dim=0).mean(dim=0).tolist()

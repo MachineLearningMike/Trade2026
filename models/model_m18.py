@@ -77,7 +77,7 @@ class Trade26(nn.Module):
     
     def find_loss(self, pred, true):    # (P,), (P,). mean = 0
         
-        # mse_loss = self.mse_loss(pred, true)
+        mse_loss = self.mse_loss(pred, true)
         
         # true_label = (true >= 0).to(torch.float)   # 1 if true > 0 else 0
         true_label = self.sigmoid(true)     #----------- continuous, this gives much more stability to loss.        
@@ -85,7 +85,7 @@ class Trade26(nn.Module):
         
         bce_loss = self.bce_loss(pred_prob, true_label)
         
-        loss = bce_loss
+        loss = mse_loss + bce_loss
         
         return loss
     
