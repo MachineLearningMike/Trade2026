@@ -1216,10 +1216,13 @@ def fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, int
             nRowsToFill = round((end_mili_inclusive - start_mili) / interval_mili) + 1
             assert nRowsToFill >= 1
 
-            # Comment out this line, as it always returns None, consistent with file.            
-            rows = exact_fetch(clientPool, binance_wait_sec, dataType, symbol, interval, 
-                              start_mili, end_mili_inclusive, nRowsToFill, interval_mili)
-            assert rows is None
+            if clientPool is not None:
+              # Comment out this line, as it always returns None, consistent with file.            
+              rows = exact_fetch(clientPool, binance_wait_sec, dataType, symbol, interval, 
+                                start_mili, end_mili_inclusive, nRowsToFill, interval_mili)
+              assert rows is None
+            else:
+              rows = None
                         
             if rows is not None:
                 Print(f"!!! file-missing canddles found in API !!!", end="")

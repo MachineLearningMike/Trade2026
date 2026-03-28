@@ -1,6 +1,58 @@
 import matplotlib.pyplot as plt
 import numpy as np
 
+epsilon = 1e-9
+
+def get_back_mean_std(arr, anchor, back, axis=0):
+    v = arr[max(0, anchor - back + 1): anchor + 1]
+    return v.mean(axis=axis), v.std(axis=axis)
+
+def get_zscore(arr, anchor, back, axis=0):
+    sma, std = get_back_mean_std(arr, anchor, back, axis=axis)
+    z_score = (arr[anchor] - sma) / (std + epsilon)
+    return z_score
+
+def get_level(arr, anchor, back, axis=0):
+    return get_zscore(arr, anchor, back, axis=axis)
+
+def get_change(arr, anchor, back, axis=0):    
+    pcs = []
+    for idx in range(max(0, anchor - back +1), anchor + 1):
+       sma = arr[max(0, idx - back + 1) : idx + 1].mean()
+       pc = (arr[idx] / sma) - 1
+       pcs.append(pc)
+    pcs = np.array(pcs)
+    price_change = get_zscore(pcs, len(pcs) - 1, back, axis=axis)
+    return price_change
+
+def normalize(arr, axis=0):
+    return (arr - arr.mean(axis=axis)) / (arr.std(axis=axis) + epsilon)
+    
+def ema(arr, span):
+    """
+    Simple function to get final EMA value
+    """
+    alpha = 2 / (span + 1)
+    ema = arr[0]
+    for value in arr[1:]:
+        ema = alpha * value + (1 - alpha) * ema
+    return ema
+    
+def get_volatility(arr, anchor, back, axis=0, span=20):
+    abs_volatilities = []
+    for idx in range(max(0, anchor - back + 1), anchor + 1):
+        span_curr = arr[max(0, idx - back + 1) : max(0, idx + 1)]
+        ema_curr = ema(span_curr, span) if span_curr.shape[0] > 0 else arr[idx]
+        span_past = arr[max(0, idx - 2 * back + 1) : max(0, idx - back + 1)]
+        ema_past =  ema(span_past, span) if span_past.shape[0] > 0 else arr[idx]
+        volatility = (ema_curr - ema_past) / (ema_past + epsilon)
+        abs_volatilities.append(volatility)
+    abs_volatilities = np.array(abs_volatilities)
+    # print(f"abs_volatilities: {len(abs_volatilities)}")
+    volatility = get_zscore(abs_volatilities, len(abs_volatilities) - 1, back, axis=axis)
+    return volatility
+        
+    
 def plot_array1(arr, title="Price History", xlabel="Time", ylabel="Price", figsize=(18, 3), flip=False, save_path=None, vlines=None, recolors=None):
     """
     Plot a 1D numpy array
@@ -116,7 +168,7 @@ def plot_array(arr, title="Price History", xlabel="Time", ylabel="Price", figsiz
         plt.show()
 
 
-def plot_arrays(arrays, labels=None, title="Price History", xlabel="Time", ylabel="Price", figsize=(18, 1), flip=False, save_path=None):
+def plot_arrays(arrays, labels=None, title="Price History", xlabel="Time", ylabel="Price", figsize=(18, 2), flip=False, save_path=None):
     """
     Plot multiple 1D numpy arrays on the same graph
     

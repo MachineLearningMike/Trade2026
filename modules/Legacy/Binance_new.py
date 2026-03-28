@@ -102,7 +102,7 @@ class Binance():
         raise RuntimeError('Call instance() instead')
 
     @classmethod
-    def instantiate(cls, exchangeParams = None):
+    def instantiate(cls, connected=True):
         if cls._singleton is None:
 
             Binance.Initialize()
@@ -125,8 +125,9 @@ class Binance():
             mili= round(milisec_since_epoch) % 1000
             # win32api.SetSystemTime(gmtime[0], gmtime[1], gmtime[6], gmtime[2], gmtime[3], gmtime[4], gmtime[5], mili) # Needed Administrator Permission
 
-            Binance.clientPool = ClientPool(1)
-            #Binance.clientPool.clients[0] = client        
+            if connected:
+                Binance.clientPool = ClientPool(1)
+                #Binance.clientPool.clients[0] = client        
 
         return cls._singleton
 
