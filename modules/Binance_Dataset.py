@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from modules.Binance_file_api_demiss import get_historical_klines
+from modules.Legacy.Binance_new import Binance
 
 class Binance_Dataset:
     def __init__(self, save_dir):
@@ -18,6 +18,8 @@ class Binance_Dataset:
         # mark = dt.month, dt.day, dt.weekday, dt.hour, dt.minute
         self.mark_mean = np.array([6.5, 16, 3, 11.5, 29.5])
         self.mark_std = np.array([pow((n-m)*(n-m+2)/12, 0.5) for (m, n) in [(1, 12), (1, 31), (0, 6), (0, 23), (0, 59)]])   # population std
+        
+        self.binance = Binance.instantiate()
         
     def get_paths(self, start_utc):
         folder_path = Path(self.save_dir) / str(start_utc.year).zfill(4) / str(start_utc.month).zfill(2) / str(start_utc.day).zfill(2)
@@ -59,12 +61,12 @@ class Binance_Dataset:
             except: pass
             if exist: continue
                 
-            data, successful = get_historical_klines(symbol=symbol, interval=interval, start_utc=start_utc, end_utc=end_utc, use_api_fallback=True)
+            candles, nFills, successful, _, reason = self.binance.Get_Price_Data_By_Time("klines", symbol, interval, start_utc, end_utc)
             print(f"{start_utc} {successful}")
             if not successful: continue
 
-            means = (data[:, 1] + data[:, 2]) / 2
-            volumes = data[:, 4]
+            means = (candles[:, 1] + candles[:, 2]) / 2
+            volumes = candles[:, 4]
 
             np.save(file_path_means, means)
             np.save(file_path_volumes, volumes)
@@ -201,9 +203,9 @@ if __name__ == "__main__":
     interval = '1m'
     minute_step = 10   # minutes
 
-    # binance.build_binance_dataset(symbol, start_utc, end_utc, interval, data_dir, minute_step)/
+    # binance.build_binance_dataset(symbol, start_utc, end_utc, interval, data_dir, minute_step)
 
-    # datetimes = binance.get_datapoint_datetimes(data_dir)
+    datetimes = binance.get_datapoint_datetimes()
     
     report = binance.analyze_datapoints(inclusive_left=None, inclusive_right=None, minute_step=10)
     print(report)
