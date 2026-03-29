@@ -12,17 +12,17 @@ def get_zscore(arr, anchor, back, axis=0):  # [anchor - back + 1, anchor], n = b
     z_score = (arr[anchor] - sma) / (std + epsilon)
     return z_score
 
-def get_level(arr, anchor, back, axis=0):   # [anchor - back + 1, anchor], n = back
+def get_level(arr, anchor, back, axis=0):   # [anchor - (back - 1), anchor], n = back
     return get_zscore(arr, anchor, back, axis=axis)
 
-def get_change(arr, anchor, back, axis=0):    # [anchor - 2 * back + 2, anchor], n = 2 * back - 1, safe init anchor = 2 * back - 2
+def get_change(arr, anchor, back, axis=0):    # [anchor - 2 * (back - 1), anchor], n = 2 * back - 1, safe init anchor = 2 * (back - 1)
     pcs = []
     for idx in range(max(0, anchor - back + 1), anchor + 1):
        sma = arr[max(0, idx - back + 1) : idx + 1].mean()   # [anchor - 2 * back + 2, anchor]
        pc = (arr[idx] / sma) - 1
        pcs.append(pc)
     pcs = np.array(pcs)
-    assert len(pcs) <= back
+    assert len(pcs) <= back     # = is required
     price_change = get_zscore(pcs, len(pcs) - 1, back, axis=axis)
     return price_change
 
@@ -48,7 +48,7 @@ def get_volatility(arr, anchor, back, axis=0, span=20):     # [anchor - 3 * back
         ema_past =  ema(span_past, span) if span_past.shape[0] > 0 else arr[idx]
         volatility = (ema_curr - ema_past) / (ema_past + epsilon)
         abs_volatilities.append(volatility)
-    assert len(abs_volatilities) <= back
+    assert len(abs_volatilities) <= back    # = is required
     abs_volatilities = np.array(abs_volatilities)
     # print(f"abs_volatilities: {len(abs_volatilities)}")
     volatility = get_zscore(abs_volatilities, len(abs_volatilities) - 1, back, axis=axis)
