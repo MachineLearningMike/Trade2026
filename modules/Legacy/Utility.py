@@ -1278,7 +1278,7 @@ def fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, int
                 array[:, 8] = 0.0     # Number of trades
                 array[:, 9] = 0.0     # Taker buy base volume
                 array[:, 10] = 0.0    # Taker buy quote volume
-                array[:, 11] = float(mark)  # Marker for data source. Original candles are marked 0 in the get_all_from_historic_file function.
+                array[:, 11] = mark  # Marker for data source. Original candles are marked 0 in the get_all_from_historic_file function.
                             
             # Insert the filled rows
             assert array.shape[0] == nRowsToFill
