@@ -2,8 +2,9 @@ import math
 import numpy as np
 
 
-class Market_Histtory():
-    def __self__(self, dim_compact_history=300, indicator_window=30):
+class Market_History:
+      
+    def __init__(self, dim_compact_history=300, indicator_window=30):
 
         nodes = [ ((k) * math.log(k) - k) / math.log(2) for k in range(1, dim_compact_history + 4) ]
         compress_kernel = [((nodes[i-1]+nodes[i])/2, (nodes[i]+nodes[i+1])/2) for i in range(1, dim_compact_history + 2)]
@@ -16,6 +17,10 @@ class Market_Histtory():
         self.compress_kernel = compress_kernel
         self.min_len_to_compress = min_len_to_compress
         self.min_len_to_lookback = min_len_to_lookback
+
+
+    def abs_normalize(self, arr):
+        return arr / (arr.std() + 1e-9)
 
 
     def compress_sequence(self, array, bidir=False): # bidir = False is better.
@@ -71,3 +76,7 @@ class Market_Histtory():
         volumes = self.compress_hitorical_sequence_preserve_last(volumes)
         price_curr = true_prices[running_anchor]
         return prices, volumes, price_curr
+    
+if __name__ == "__main__":
+    mh = Market_History(dim_compact_history=300, indicator_window=30)
+ 
