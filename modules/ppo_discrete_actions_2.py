@@ -8,6 +8,10 @@ import random
 from typing import List, Tuple, Dict, Optional
 from enum import Enum
 import warnings
+
+from RL_Market_History import Market_History
+from Legacy.Binance_new import Binance # Get_Price_Data_By_Time
+
 warnings.filterwarnings('ignore')
 
 # ========== ACTION ENUM ==========
@@ -350,6 +354,9 @@ class TradingEnvironment:
                  initial_balance=10000, transaction_cost=0.001,
                  unit_size=100, max_units=5):
         
+        self.exchange = Binance.instantiate(connect=False)
+        self.market_hisroty = Market_History(dim_compact_history=300, indicator_window=30)
+                    
         self.price_data = price_data
         self.lookback_window = lookback_window
         self.initial_balance = initial_balance
@@ -370,7 +377,7 @@ class TradingEnvironment:
         self.price_std = 1
         
         self.reset()
-    
+            
     def reset(self):
         self.current_step = self.lookback_window
         self.balance = self.initial_balance
