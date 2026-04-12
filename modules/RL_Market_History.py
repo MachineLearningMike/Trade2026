@@ -109,18 +109,16 @@ class Market_History:
     #     return c_prices, c_volumes, r_prices, price_curr, start, end
     
     def compress_history(self, history, anchor, use_backside=True, faithful_backward=True):
-        prices, volumes, raw_prices, raw_volumes, marks, price_mean, volue_mean = history
-        prices = prices[anchor - self.len_to_lookback : anchor + 1]
-        c_prices, start, end = self.compress_hitorical_sequence_preserve_last(prices, use_backside=use_backside, faithful_backward=faithful_backward)
-        volumes = volumes[anchor - self.len_to_lookback : anchor + 1]
-        c_volumes, start_v, end_v = self.compress_hitorical_sequence_preserve_last(volumes, use_backside=use_backside, faithful_backward=faithful_backward)
-        assert start == start_v and end == end_v
-        
+        raw_prices, raw_volumes, marks, price_mean, volue_mean = history
         r_prices = raw_prices[anchor - self.len_to_lookback : anchor + 1]
         r_volumes = raw_volumes[anchor - self.len_to_lookback : anchor + 1]
-        r_marks = marks[anchor - self.len_to_lookback : anchor + 1]
         
-        c_history = (c_prices, c_volumes, r_prices, r_volumes, r_marks, price_mean, volue_mean)
+        compact_prices, start, end = self.compress_hitorical_sequence_preserve_last(r_prices, use_backside=use_backside, faithful_backward=faithful_backward)
+        compact_volumes, start_v, end_v = self.compress_hitorical_sequence_preserve_last(r_volumes, use_backside=use_backside, faithful_backward=faithful_backward)
+        assert start == start_v and end == end_v
+        
+        r_marks = marks[anchor - self.len_to_lookback : anchor + 1]
+        c_history = (compact_prices, compact_volumes, r_prices, r_volumes, r_marks, price_mean, volue_mean)
         
         return c_history, start, end
     
