@@ -17,22 +17,22 @@ warnings.filterwarnings('ignore')
 # ========== ACTION ENUM ==========
 class TradingAction(Enum):
     HOLD = 0
-    BUY_SMALL = 1
-    BUY_BIG = 2
-    SELL_SMALL = 3
-    SELL_BIG = 4
+    BUY_1 = 1
+    BUY_2 = 2
+    SELL_1 = 3
+    SELL_2 = 4
     
     @property
     def size(self) -> int:
-        sizes = {self.HOLD: 0, self.BUY_SMALL: 1, self.BUY_BIG: 3, 
-                 self.SELL_SMALL: -1, self.SELL_BIG: -3}
+        sizes = {self.HOLD: 0, self.BUY_1: 1, self.BUY_2: 3, 
+                 self.SELL_1: -1, self.SELL_2: -3}
         return sizes[self]
     
     @property
     def name(self) -> str:
-        names = {self.HOLD: "HOLD", self.BUY_SMALL: "BUY_SMALL", 
-                 self.BUY_BIG: "BUY_BIG", self.SELL_SMALL: "SELL_SMALL", 
-                 self.SELL_BIG: "SELL_BIG"}
+        names = {self.HOLD: "HOLD", self.BUY_1: "BUY_1", 
+                 self.BUY_2: "BUY_2", self.SELL_1: "SELL_1", 
+                 self.SELL_2: "SELL_2"}
         return names[self]
 
 
@@ -352,10 +352,10 @@ class Trajectory:
 class TradingEnvironment:
     def __init__(self, price_data, lookback_window=20,
                  initial_balance=10000, transaction_cost=0.001,
-                 unit_size=100, max_units=5):
+                 unit_size=100, max_units=5, dim_compact_history=300, indicator_window=30):
         
         self.exchange = Binance.instantiate(connect=False)
-        self.market_hisroty = Market_History(dim_compact_history=300, indicator_window=30)
+        self.market_hisroty = Market_History(dim_compact_history=dim_compact_history, indicator_window=indicator_window)
                     
         self.price_data = price_data
         self.lookback_window = lookback_window
@@ -465,7 +465,7 @@ class TradingEnvironment:
         done = False
         
         portfolio_before = self.balance + self._get_position_value(current_price)
-        
+
         # Execute action
         if action == 1:  # SMALL BUY
             if self.balance >= self.unit_size * (1 + self.transaction_cost) and self.units_held + 1 <= self.max_units:
@@ -608,13 +608,13 @@ if __name__ == "__main__":
     
     # Generate synthetic data
     np.random.seed(42)
-    n_days = 1000
+    n_days = 10000
     returns = np.random.randn(n_days) * 0.02
     prices = 100 * np.exp(np.cumsum(returns))
     price_data = prices.reshape(-1, 1)
     
     # Split
-    train_size = 800
+    train_size = 8000
     train_data = price_data[:train_size]
     test_data = price_data[train_size:]
     
@@ -622,16 +622,20 @@ if __name__ == "__main__":
     print(f"   Training samples: {len(train_data)}")
     print(f"   Feature dimension: 10")
     
+    initial_balance = 10_000
+    unit_size = 100
+    max_units = 5
+    
     # Create environment and agent
     env = TradingEnvironment(train_data, lookback_window=20, 
-                             initial_balance=10000, unit_size=100, max_units=5)
+                             initial_balance=initial_balance, unit_size=unit_size, max_units=max_units)
     agent = StablePPOAgent(input_dim=10, action_dim=5, device='auto')
     
-    print(f"   Actions: 0=Hold, 1=Small Buy, 2=Big Buy, 3=Small Sell, 4=Big Sell")
+    print(f"   Actions: 0=Hold, 1=Buy_1, 2=Buy_2, 3=Sell_1, 4=Sell_2")
     print(f"   Max units: 5")
     
     # Train
-    env, agent = train_ppo(env, agent, episodes=300, print_interval=50)
+    env, agent = train_ppo(env, agent, episodes=500, print_interval=10)
     
     # Save
     agent.save("stable_ppo_model.pth")
@@ -639,7 +643,7 @@ if __name__ == "__main__":
     # Test
     print("\n🧪 Testing...")
     test_env = TradingEnvironment(test_data, lookback_window=20, 
-                                   initial_balance=10000, unit_size=100, max_units=5)
+                                   initial_balance=initial_balance, unit_size=unit_size, max_units=max_units)
     
     state = test_env.reset()
     done = False
@@ -651,7 +655,7 @@ if __name__ == "__main__":
         test_actions.append(action)
     
     final_value = test_env.get_portfolio_value()
-    total_return = (final_value - 10000) / 10000 * 100
+    total_return = (final_value - initial_balance) / initial_balance * unit_size
     
     print(f"\n{'='*60}")
     print(f"📊 TEST RESULTS")
