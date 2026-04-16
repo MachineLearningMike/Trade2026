@@ -312,7 +312,7 @@ def get_all_from_historic_file(sample_utc, dataType, symbol, interval, dailyNotM
   filepath = str(Path(os.path.join(folder, file_name)).with_suffix('.csv'))
 
   dynarray = None
-  nCreated = 0
+  nForged = 0
   successful = True
 
   interval_mili = intervalToMilliseconds(interval)
@@ -346,9 +346,9 @@ def get_all_from_historic_file(sample_utc, dataType, symbol, interval, dailyNotM
     else:
       successful = False
       
-    nCreated = 0
+    nForged = 0
 
-  return dynarray, nCreated, successful
+  return dynarray, nForged, successful
 
 def normalize_timestamps_by_magnitude(dynarray, timestamp_indices=[0, 6]):
     """
@@ -401,7 +401,7 @@ def get_from_historic_file(clientPool, binance_wait_sec, sample_utc, dataType, s
   filepath = str(Path(os.path.join(folder, file_name)).with_suffix('.csv'))
 
   dynarray = None
-  nCreated = 0
+  nForged = 0
   successful = True
 
   interval_mili = intervalToMilliseconds(interval)
@@ -467,11 +467,11 @@ def get_from_historic_file(clientPool, binance_wait_sec, sample_utc, dataType, s
 
             if successful and dynarray.shape[0] < nRowsExpected:
                 # Print("??? Missing data points found in the file: {}/{}. Filling in ... ".format(dynarray.shape[0], nRowsExpected))
-                dynarray, nCreated, successful = create_missing_prices_inland(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, start_mili, end_mili + interval_mili, interval_mili)
+                dynarray, nForged, successful = create_missing_prices_inland(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, start_mili, end_mili + interval_mili, interval_mili)
                 # Print("Done." if successful else "Failed.")
                 successful = dynarray.shape[0] == nRowsExpected
                 if not successful:
-                    # dynarray, nCreated, successful = create_missing_prices(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, start_mili, end_mili + interval_mili, interval_mili)
+                    # dynarray, nForged, successful = create_missing_prices(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, start_mili, end_mili + interval_mili, interval_mili)
                     pass                  
                    
         else:
@@ -497,17 +497,17 @@ def get_from_historic_file(clientPool, binance_wait_sec, sample_utc, dataType, s
     Print(newline + "NO, ", end="")
     no_line_feed = True
 
-  return dynarray, nCreated, successful
+  return dynarray, nForged, successful
 
 def create_missing_prices_inland(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, start_mili, end_mili, ignore_last=True):
     # end_mili is exclusive.
     assert dynarray is not None and dynarray.shape[0] > 0
 
-    nCreated = 0
+    nForged = 0
     successful = True
 
     interval_mili = intervalToMilliseconds(interval)
-    dynarray, nCreated, successful \
+    dynarray, nForged, successful \
     = fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, 0, dynarray.shape[0], ignore_last=ignore_last)
     # = fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, 0, dynarray.shape[0], ignore_last=ignore_last)
 
@@ -516,10 +516,10 @@ def create_missing_prices_inland(clientPool, binance_wait_sec, dynarray, dataTyp
     # nRowsExpexted = round((end_mili-start_mili)/interval_mili ) + 1
     # successful = dynarray.shape[0] == nRowsExpexted
     # if not successful:
-    #     dynarray, nCreated, successful \
+    #     dynarray, nForged, successful \
     #     = fill_outward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, start_mili, end_mili, ignore_last=ignore_last)
 
-    return dynarray, nCreated, successful
+    return dynarray, nForged, successful
 
 
 def select_from_dynarray_by_time(dataType, dynarray, start_utc, end_utc):
@@ -545,7 +545,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
                     If ignore_last=False, exclusive end index for searching
         ignore_last: If True, treat search_end as the last valid row index (inclusive)
     """
-    nCreated = 0
+    nForged = 0
     successful = True
     interval_mili = intervalToMilliseconds(interval)
     
@@ -637,7 +637,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
                 
                 # Insert the filled rows
                 dynarray = np.insert(dynarray, last + 1, array, axis=0)
-                nCreated += nRowsToFill
+                nForged += nRowsToFill
                 search_start = last + nRowsToFill
                 nRows = dynarray.shape[0]
                 # Recalculate exclusive_end after insertion
@@ -652,7 +652,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
             # No more gaps found in remaining slice
             break
     
-    return dynarray, nCreated, successful
+    return dynarray, nForged, successful
   
   
 # def fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, search_start, search_end, ignore_last=True):
@@ -668,9 +668,9 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
 #       ignore_last: If True, treat search_end as the last valid row index (inclusive)
   
 #   Returns:
-#       (dynarray, nCreated, successful)
+#       (dynarray, nForged, successful)
 #   """
-#   nCreated = 0
+#   nForged = 0
 #   successful = True
 #   interval_mili = intervalToMilliseconds(interval)
   
@@ -679,7 +679,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
   
 #   # First, ensure we have a valid starting point
 #   if dynarray.shape[0] == 0:
-#       return dynarray, nCreated, False
+#       return dynarray, nForged, False
   
 #   # Sort the array by timestamp
 #   sort_idx = np.argsort(dynarray[:, 0])
@@ -732,7 +732,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
 #                           array[i, 11] = -4           # Marker for rightward fill
                       
 #                       dynarray = np.insert(dynarray, last + 1, array, axis=0)
-#                       nCreated += nRowsToFill
+#                       nForged += nRowsToFill
 #                       Print("R-{} ".format(nRowsToFill), end="")
 #               break
               
@@ -766,7 +766,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
               
 #               # Insert the filled rows
 #               dynarray = np.insert(dynarray, last + 1, array, axis=0)
-#               nCreated += nRowsToFill
+#               nForged += nRowsToFill
 #               Print("R-{} ".format(nRowsToFill), end="")
               
 #               search_start = last + nRowsToFill
@@ -814,12 +814,12 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
 #                           array[i, 11] = -4
                       
 #                       dynarray = np.append(dynarray, array, axis=0)
-#                       nCreated += nRowsToFill
+#                       nForged += nRowsToFill
 #                       Print("R-{} ".format(nRowsToFill), end="")
 #               break
   
 #   # Final sorting and deduplication
-#   if nCreated > 0:
+#   if nForged > 0:
 #       sort_idx = np.argsort(dynarray[:, 0])
 #       dynarray = dynarray[sort_idx]
       
@@ -828,7 +828,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
 #       if len(unique_idx) < dynarray.shape[0]:
 #           dynarray = dynarray[unique_idx]
   
-#   return dynarray, nCreated, successful
+#   return dynarray, nForged, successful
 
 # def fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, search_start, search_end, ignore_last=True):   # comeback - overriding the above
 #     """
@@ -843,9 +843,9 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
 #         ignore_last: If True, treat search_end as the last valid row index (inclusive)
     
 #     Returns:
-#         (dynarray, nCreated, successful)
+#         (dynarray, nForged, successful)
 #     """
-#     nCreated = 0
+#     nForged = 0
 #     successful = True
 #     interval_mili = intervalToMilliseconds(interval)
     
@@ -854,7 +854,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
     
 #     # First, ensure we have a valid starting point
 #     if dynarray.shape[0] == 0:
-#         return dynarray, nCreated, False
+#         return dynarray, nForged, False
     
 #     # Sort the array by timestamp
 #     sort_idx = np.argsort(dynarray[:, 0])
@@ -897,7 +897,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
 #                             array[i, 11] = -4           # Marker for rightward fill
                         
 #                         dynarray = np.insert(dynarray, last + 1, array, axis=0)
-#                         nCreated += nRowsToFill
+#                         nForged += nRowsToFill
 #                         Print("R-{} ".format(nRowsToFill), end="")
 #                 break
                 
@@ -932,7 +932,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
                 
 #                 # Insert the filled rows
 #                 dynarray = np.insert(dynarray, last + 1, array, axis=0)
-#                 nCreated += nRowsToFill
+#                 nForged += nRowsToFill
 #                 Print("R-{} ".format(nRowsToFill), end="")
                 
 #                 search_start = last + nRowsToFill
@@ -980,12 +980,12 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
 #                             array[i, 11] = -4
                         
 #                         dynarray = np.append(dynarray, array, axis=0)
-#                         nCreated += nRowsToFill
+#                         nForged += nRowsToFill
 #                         Print("R-{} ".format(nRowsToFill), end="")
 #                 break
     
 #     # Final sorting and deduplication
-#     if nCreated > 0:
+#     if nForged > 0:
 #         sort_idx = np.argsort(dynarray[:, 0])
 #         dynarray = dynarray[sort_idx]
         
@@ -994,7 +994,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
 #         if len(unique_idx) < dynarray.shape[0]:
 #             dynarray = dynarray[unique_idx]
     
-#     return dynarray, nCreated, successful
+#     return dynarray, nForged, successful
 
 # def fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, search_start, search_end, ignore_last=True):
 #     """
@@ -1009,9 +1009,9 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
 #         ignore_last: If True, treat search_end as the last valid row index (inclusive)
     
 #     Returns:
-#         (dynarray, nCreated, successful)
+#         (dynarray, nForged, successful)
 #     """
-#     nCreated = 0
+#     nForged = 0
 #     successful = True
 #     interval_mili = intervalToMilliseconds(interval)
     
@@ -1020,7 +1020,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
     
 #     # First, ensure we have a valid starting point
 #     if dynarray.shape[0] == 0:
-#         return dynarray, nCreated, False
+#         return dynarray, nForged, False
     
 #     # Sort the array by timestamp
 #     sort_idx = np.argsort(dynarray[:, 0])
@@ -1063,7 +1063,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
 #                             array[i, 11] = -4           # Marker for rightward fill
                         
 #                         dynarray = np.insert(dynarray, last + 1, array, axis=0)
-#                         nCreated += nRowsToFill
+#                         nForged += nRowsToFill
 #                         Print("R-{} ".format(nRowsToFill), end="")
 #                 break
                 
@@ -1097,7 +1097,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
                 
 #                 # Insert the filled rows
 #                 dynarray = np.insert(dynarray, last + 1, array, axis=0)
-#                 nCreated += nRowsToFill
+#                 nForged += nRowsToFill
 #                 Print("R-{} ".format(nRowsToFill), end="")
                 
 #                 search_start = last + nRowsToFill
@@ -1145,7 +1145,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
 #                             array[i, 11] = -4
                         
 #                         dynarray = np.append(dynarray, array, axis=0)
-#                         nCreated += nRowsToFill
+#                         nForged += nRowsToFill
 #                         Print("R-{} ".format(nRowsToFill), end="")
 #                 break
     
@@ -1158,7 +1158,7 @@ def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interv
 #     if len(unique_idx) < dynarray.shape[0]:
 #         dynarray = dynarray[unique_idx]
     
-#     return dynarray, nCreated, successful
+#     return dynarray, nForged, successful
 
 def fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, search_start_mili, search_end_mili, ignore_last=True):
     """
@@ -1173,9 +1173,9 @@ def fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, int
         ignore_last: Legacy parameter, kept for compatibility
     
     Returns:
-        (dynarray, nCreated, successful)
+        (dynarray, nForged, successful)
     """
-    nCreated = 0
+    nForged = 0
     successful = True
     interval_mili = intervalToMilliseconds(interval)
     
@@ -1185,7 +1185,7 @@ def fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, int
     
     # First, ensure we have a valid starting point
     if dynarray.shape[0] == 0:
-        return dynarray, nCreated, successful
+        return dynarray, nForged, successful
     
     # Sort the array by timestamp
     sort_idx = np.argsort(dynarray[:, 0])
@@ -1287,7 +1287,7 @@ def fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, int
             
             # filename = plot_array_to_pixel_perfect(dynarray[gap_start_idx : gap_start_idx + array.shape[0] + 2, 4], save_dir="./plots")
 
-            nCreated += nRowsToFill
+            nForged += nRowsToFill
             search_start_idx = gap_start_idx + nRowsToFill + 1
             end_idx_exclusive = dynarray.shape[0]
         else:
@@ -1307,11 +1307,11 @@ def fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, int
     mask = (dynarray[:, 0] >= search_start_idx) & (dynarray[:, 0] < search_end_mili)
     dynarray = dynarray[mask]
     
-    Print(f"... total {nCreated} candles created.")
-    return dynarray, nCreated, successful
+    Print(f"... total {nForged} candles created.")
+    return dynarray, nForged, successful
 
 # def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, search_start, search_end, ignore_last=True):
-#     nCreated = 0
+#     nForged = 0
 #     successful = True
 #     interval_mili = intervalToMilliseconds(interval)
 
@@ -1397,7 +1397,7 @@ def fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, int
 #                     no_line_feed = True
 
 #                 dynarray = np.insert(dynarray, last + 1, array, axis=0)
-#                 nCreated += nRowsToFill
+#                 nForged += nRowsToFill
 #                 search_start = last + nRowsToFill
 #                 nRows = dynarray.shape[0]
 #                 search_end = nRows - 1 if ignore_last else nRows
@@ -1408,28 +1408,28 @@ def fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, int
 #         else:
 #             break   # starting_index_of_1st_gap doesn't exist, and all are not missing.
 
-#     return dynarray, nCreated, successful
+#     return dynarray, nForged, successful
 
 
 # def fill_outward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, start_mili, end_mili, ignore_last=True):
-#     nCreated = 0
+#     nForged = 0
 #     successful = True
 #     interval_mili = intervalToMilliseconds(interval)
 #     nTotalRows = round((end_mili - start_mili)/interval_mili) + 1
 
 #     mili = dynarray[0, 0] - interval_mili
-#     dynarray, nCreated, successful = \
+#     dynarray, nForged, successful = \
 #     fill_outward_single(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, start_mili, mili, ignore_last=ignore_last)
 
 #     if dynarray.shape[0] < nTotalRows:
 #         mili = dynarray[-1, 0] + interval_mili
-#         dynarray, nCreated2, successful = \
+#         dynarray, nForged2, successful = \
 #         fill_outward_single(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, mili, end_mili, ignore_last=ignore_last)
-#         nCreated + nCreated2
+#         nForged + nForged2
 
 #     successful = dynarray.shape[0] == nTotalRows
 
-#     return dynarray, nCreated, successful
+#     return dynarray, nForged, successful
 
 
 # def fill_outward_single(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, start_mili, end_mili, ignore_last=True)
@@ -1500,7 +1500,7 @@ def fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, int
 #             no_line_feed = True
 
 #         dynarray = np.insert(dynarray, last + 1, array, axis=0)
-#         nCreated += nRowsToFill
+#         nForged += nRowsToFill
 #         search_start = last + nRowsToFill
 #         nRows = dynarray.shape[0]
 #         search_end = nRows - 1 if ignore_last else nRows
@@ -1508,7 +1508,7 @@ def fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, int
 #     else:
 #         successful = False
 #         # raise Exception("starting_index_of_1st_gap found but nRowsToFill <= 0.")
-#     return dynarray, nCreated, successful
+#     return dynarray, nForged, successful
 
 
 
@@ -1577,7 +1577,7 @@ def create_missing_prices_core_inland(clientPool, binance_wait_sec, dynarray, da
 
 
 def create_missing_prices_core(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, interval_mili, search_start, search_end, ignore_last = False):
-    nCreated = 0
+    nForged = 0
     successful = True
 
     while search_start < search_end - 1:    # search_end is exclusive
@@ -1657,7 +1657,7 @@ def create_missing_prices_core(clientPool, binance_wait_sec, dynarray, dataType,
                     no_line_feed = True
 
                 dynarray = np.insert(dynarray, last + 1, array, axis=0)
-                nCreated += nRowsToFill
+                nForged += nRowsToFill
                 search_start = last + nRowsToFill
                 nRows = dynarray.shape[0]
                 search_end = nRows - 1 if ignore_last else nRows
@@ -1668,7 +1668,7 @@ def create_missing_prices_core(clientPool, binance_wait_sec, dynarray, dataType,
         else:
             break   # starting_index_of_1st_gap doesn't exist, and all are not missing.
 
-    return dynarray, nCreated, successful
+    return dynarray, nForged, successful
 
 
 def PrePad_with_Zero(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, interval_mili, start_utc):
@@ -1696,7 +1696,7 @@ def PrePad_with_Zero(clientPool, binance_wait_sec, dynarray, dataType, symbol, i
         dynarray = np.insert(dynarray, 0, array, axis=0)
         return dynarray
 
-    nCreated = nRowsToFill; successful = True
+    nForged = nRowsToFill; successful = True
     if nRowsToFill <= 0:    # should be 0
         pass
     elif nRowsToFill <= 1:  # should be 1
@@ -1708,11 +1708,11 @@ def PrePad_with_Zero(clientPool, binance_wait_sec, dynarray, dataType, symbol, i
     else:                   # should be > 2
         rows = [row0, row1]
         dynarray = add_rows(dynarray, rows)
-        dynarray, _nCreated, successful = \
+        dynarray, _nForged, successful = \
         create_missing_prices_core(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, interval_mili, 0, 2)
-        nCreated = _nCreated + 2
+        nForged = _nForged + 2
     
-    return dynarray, nCreated, successful
+    return dynarray, nForged, successful
 
 
 import dateutil

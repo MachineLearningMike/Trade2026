@@ -593,7 +593,7 @@ class Binance():
 
             # if search_end - search_start < nRowsExpected:
             #     Print("Demiss: Final: Missing points found. Correcting...")
-            #     gs.dynarray, nCreated, successful = create_missing_prices_inland(self.clientPool, Config['binance_wait_sec'], gs.dynarray, dataType, symbol, interval, start_mili, end_mili + interval_mili)
+            #     gs.dynarray, nForged, successful = create_missing_prices_inland(self.clientPool, Config['binance_wait_sec'], gs.dynarray, dataType, symbol, interval, start_mili, end_mili + interval_mili)
             #     successful = gs.dynarray.shape[0] == nRowsExpected
 
             if (round(gs.dynarray[search_end-1, slot]) - round(gs.dynarray[search_start, slot])) == (search_end - 1 - search_start) * interval_mili:
@@ -601,10 +601,10 @@ class Binance():
                     "The rows following prepending is not one-incremental."    # time-ordered no-missing.           
             else: # very rare but very expensive
                 # Acheives the Goal 2. #######################################
-                gs.dynarray, nCreated, no_missing \
+                gs.dynarray, nForged, no_missing \
                 = create_missing_prices_inland(Binance.clientPool, binance_wait_sec, gs.dynarray, dataType, symbol, interval, 0, 0, ignore_last = live and closed)
-                if nCreated > 0:
-                    monitor += ", F {}".format(nCreated)
+                if nForged > 0:
+                    monitor += ", F {}".format(nForged)
 
         if no_missing:
             # Mask out these assertions later: it's logically proven and expensive to compute, although it a complete proof.
@@ -1055,13 +1055,13 @@ class Binance():
     def Get_Price_Data_By_Time(self, dataType, symbol, interval, start_utc, end_utc, lookup=False):
         """
         Read price data from start to end. end is EXCLUSIVE.
-        Returns: (dynarray, nCreated, successful, fetchedFromGstream, reason)
+        Returns: (dynarray, nForged, successful, fetchedFromGstream, reason)
         """
         global file_not_found, no_line_feed
         file_not_found = False
         assert interval in ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d']        
 
-        nCreated = 0
+        nForged = 0
         successful = True
         reason = ""
 
@@ -1123,7 +1123,7 @@ class Binance():
 
             if success and array is not None and array.shape[0] > 0:
                 data_loaded = True
-                nCreated += fills
+                nForged += fills
                 dynarray = np.append(dynarray, array, axis=0)
             else:
                 break
@@ -1141,7 +1141,7 @@ class Binance():
                 array, fills, success = get_all_from_historic_file(focus_day_start, dataType, symbol, interval, dailyNotMonthly = True)
                 if success and array is not None and array.shape[0] > 0:
                     data_loaded = True
-                    nCreated += fills
+                    nForged += fills
                     dynarray = np.append(dynarray, array, axis=0)
                 else:
                     break
@@ -1151,22 +1151,22 @@ class Binance():
         # ========== 6. Filter to exact requested range ==========
         if data_loaded:
             dynarray = snap_sort_deduplicate_in_opening_time(dynarray, interval_mili)
-            dynarray, nCreated_fill, fill_success = fill_rightward(
+            dynarray, nForged_fill, fill_success = fill_rightward(
                 self.clientPool, Config['binance_wait_sec'], dynarray, dataType, symbol, interval,
                 start_mili, end_mili
             )
-            nCreated += nCreated_fill            
+            nForged += nForged_fill            
             dynarray = select_from_dynarray_by_time(dataType, dynarray, start_org, end_org)
             successful = True
             reason = ""
                     
         else:
-            nCreated = 0
+            nForged = 0
             dynarray = create_empty_dynarray()
             successful = False
             reason = "No data available from any source"
 
-        print(f"nCreated/nTotal/expected {nCreated}/{dynarray.shape[0]}/{nRowsExpected}. {reason}")
+        print(f"nForged/nTotal/expected {nForged}/{dynarray.shape[0]}/{nRowsExpected}. {reason}")
             
         # Remove timestamp columns (index 0 and 6) for final output
         if dynarray.shape[1] >= 7:
@@ -1180,7 +1180,7 @@ class Binance():
         successful = (dynarray.shape[0] == nRowsExpected)
         if not successful: reason = reason + ". The number of rows mismatches nRowsExpected."
 
-        return dynarray, nCreated, successful, fetchedFromGstream, reason
+        return dynarray, nForged, successful, fetchedFromGstream, reason
 
     def UpdateLookupState(self, firstOpenTimeMile, _latestDataStart, _checkedDataStart, start_lookedup):
         if _latestDataStart is None:
@@ -1195,7 +1195,7 @@ class Binance():
 
     def Get_Price_Data_By_Time_Batch(self, dataType, symbols, interval, start, end, lookup=True): # read [start, end]. end INCLUSIVE.
         table = []
-        nCreated = 0
+        nForged = 0
         successful = True
         nPoints = None
         reports = []
@@ -1205,7 +1205,7 @@ class Binance():
 
         counter = 1
         for symbol in symbols:
-            dyarray, _nCreated, successful, _, reason = \
+            dyarray, _nForged, successful, _, reason = \
             self.Get_Price_Data_By_Time(dataType, symbol, interval, start, end, lookup=lookup)
 
             report = symbol + ": "
@@ -1214,13 +1214,13 @@ class Binance():
                     nPoints = dyarray.shape[0]
                 elif nPoints != dyarray.shape[0]:
                     successful = False
-                    nCreated += _nCreated
+                    nForged += _nForged
 
-                report += str(dyarray.shape[0]) + ", {} created".format(_nCreated)
+                report += str(dyarray.shape[0]) + ", {} created".format(_nForged)
 
                 if nPoints == dyarray.shape[0]:
                     table.append(dyarray)
-                    nCreated += _nCreated
+                    nForged += _nForged
                     # Print(symbol, end="")
                     report += ". Success. {}-th.".format(counter)
                     nSuccess += 1
@@ -1240,7 +1240,7 @@ class Binance():
         Print("\nSuccessful for {}/{} markets".format(nSuccess, len(symbols)))
 
         successful = len(symbols) == nSuccess
-        return table, nCreated, reports, successful
+        return table, nForged, reports, successful
 
 
     def Get_Cached_Price(self, dataType, symbol, interval, start):
@@ -1282,4 +1282,4 @@ if __name__ == "__main__":
     candles, nFills, successful, _, reason = bn.Get_Price_Data_By_Time(datatype, symbol, interval, start, end)
     print(reason)
     if successful:          # price is a numpy array.
-        print("\n Successful !!!!!!!!!! (nCandles, nAttributes) = {}, nCreated = {}".format(candles.shape, nFills))
+        print("\n Successful !!!!!!!!!! (nCandles, nAttributes) = {}, nForged = {}".format(candles.shape, nFills))

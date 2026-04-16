@@ -83,7 +83,7 @@ class Market_History:
     
 
     def compress_hitorical_sequence_preserve_last(self, arr, use_backside=True, faithful_backward=True):
-        assert len(arr) >= self.len_to_compress
+        assert len(arr) >= self.len_to_compress     # check it
 
         arr_copy = arr[-self.len_to_compress:] if use_backside else arr[:self.len_to_compress]
 
@@ -110,6 +110,7 @@ class Market_History:
     
     def compress_history(self, history, anchor, use_backside=True, faithful_backward=True):
         raw_prices, raw_volumes, marks, price_mean, volue_mean = history
+        assert anchor >= self.len_to_lookback
         r_prices = raw_prices[anchor - self.len_to_lookback : anchor + 1]
         r_volumes = raw_volumes[anchor - self.len_to_lookback : anchor + 1]
         

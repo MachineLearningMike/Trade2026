@@ -657,21 +657,23 @@ if __name__ == "__main__":
     bn = Binance.instantiate(connect=False)
     # Get_Price_Data_By_Time function seamlessly collects/creates price candles from Binance.
     datatype = "klines" # "aggTrades" #, "klines"
-    symbol = "BTCUSDT"      # Any pair listed on Binance.
-    start = datetime(2025, 7, 12)    # Any datetime. Note Binance started operation in July 2017.
-    end = datetime(2026, 2, 26) # + timedelta(minutes=100)     # Any datetime
+    symbol = "XRPUSDT"      # Any pair listed on Binance.
+    start = datetime(2025, 1, 1)    # Any datetime. Note Binance started operation in July 2017.
+    end = datetime(2026, 3, 1) # + timedelta(minutes=100)     # Any datetime
     interval = '1m'    # in '1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d'.  (excludes: '3d', '1w')
     candles, nFills, successful, _, reason = bn.Get_Price_Data_By_Time(datatype, symbol, interval, start, end)
     # "Returning 10 columns: O H L C V, Quote V, nTrades, Buy base V, Buy quote V, Mark (0: original not forged)"
     open_idx, high_idx, low_idx, close_idx, volume_idx, mark_idx = 0, 1, 2, 3, 4, 9
     if successful:          # price is a numpy array.
-        print("\n Successful !!!!!!!!!! (nCandles, nAttributes) = {}, nCreated = {}".format(candles.shape, nFills))
+        print("\n Successful !!!!!!!!!! (nCandles, nAttributes) = {}, nForged = {}".format(candles.shape, nFills))
     else:
         print("\n Failed to Get_Price_Data_By_Time", reason)
         exit(0)
     
+    
     #------------------------------------- Get train/test data ------------------------------------
     n_candles = len(candles)
+    # price_data = candles[:, close_idx].reshape(-1, 1)
     price_data = candles[:, volume_idx].reshape(-1, 1)
     train_size = int(n_candles * 0.8)
     train_data = price_data[:train_size]
@@ -703,7 +705,7 @@ if __name__ == "__main__":
     train_env = TradingEnvironment(train_data, lookback_window=20, transaction_fee_rate=0.001,
                              initial_balance=initial_balance, unit_size=unit_size, max_units=max_units)
     
-    train_env, agent = train_ppo(train_env, agent, max_episode_len, episodes=3000, print_interval=1)
+    train_env, agent = train_ppo(train_env, agent, max_episode_len, episodes=2_000, print_interval=1)
     agent.save("stable_ppo_model.pth")
     
     #------------------------------------- Test agent ---------------------------------------------

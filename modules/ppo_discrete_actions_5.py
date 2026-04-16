@@ -72,16 +72,16 @@ class StablePPONetwork(nn.Module):
         
         self.action_dim = action_dim
         
-        self.history_process = BiLSTM(
-        # self.lstm = BiLSTMWithLastTimestep(
-        # self.lstm = BiLSTMWithAttention(  
+        # self.history_process = BiLSTM(
+        self.history_process = BiLSTMWithLastTimestep(
+        # self.history_process = BiLSTMWithAttention(  
             nInFeatures=hp_infeature_dim,   # input features per timestep
             nOutFeatures=hp_outfeature_dim, # output features
             hidden_size=hp_hidden_dim,      # LSTM hidden size
             num_layers=hp_num_layers,       # LSTM layers
             dropout=hp_dropout              # dropout
         )
-
+        
         def create_mlp(starting_dim, hidden_dims):
             layers = []
             prev_dim = starting_dim
@@ -345,7 +345,7 @@ class StablePPOAgent:
                 # Update
                 self.optimizer.zero_grad()
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
+                # torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 
                 # Accumulate losses
@@ -497,6 +497,9 @@ class TradingEnvironment:
         normal_price, local_price_mean, _ = normalize(compact_price)
         normal_volume, local_volume_mean, _ = normalize(compact_volume)
         
+        # normal_price, local_price_mean, _ = normalize(raw_price[-self.dim_compact_history:])    #------------------------- temporary
+        # normal_volume, local_volume_mean, _ = normalize(raw_volume[-self.dim_compact_history:])
+        
         historical_state = np.stack([normal_price, normal_volume], axis=1)  # (dim_compact_history, 2)
         assert historical_state.shape == (self.dim_compact_history, 2)
 
@@ -516,7 +519,7 @@ class TradingEnvironment:
         
         assert len(indicator_state) == TradingEnvironment.indicator_dim       
         indicator_state = np.array(indicator_state)     # (nIndicators,)
-        indicator_state = stablize(indicator_state, -10, 10)
+        # indicator_state = stablize(indicator_state, -10, 10)
         
         # I believe learned bi-diractional LSTM of historical state can be the best indicator.
         # This is not the place to run LSTM, which should be a part of actor's network that gets actions from states.
@@ -558,7 +561,7 @@ class TradingEnvironment:
             principal = self.unit_size * units * current_price
             fees = principal * self.tx_cost
             cash_out_flow = principal + fees
-            if self.balance >= cash_out_flow and self.balance - cash_out_flow > self.init_balance * 0.8:   # ask portfolio for a decision later
+            if self.balance >= cash_out_flow and self.balance - cash_out_flow > self.init_balance * 0.7:   # ask portfolio for a decision later
                 
                 # execute buy
                 self.balance -= cash_out_flow
@@ -566,12 +569,13 @@ class TradingEnvironment:
                 self.units_held += units * (1 - self.slippage)
                 self.total_trades += 1
                 
-                reward -= fees
+                reward -= fees / self.price_mean
             
         elif action in [TradingAction.SELL_1.value, TradingAction.SELL_2.value, TradingAction.SELL_3.value, TradingAction.SELL_ALL.value]:
             units = TradingAction(action).units if action != TradingAction.SELL_ALL.value else self.units_held
             # print(f"units {units} action {action}")
-            if self.units_held >= units and units > 0:
+            units = min(self.units_held, units)            
+            if units > 0:
                 cash_in_flow, profit, profit_rate = self.get_expected_reward(units, current_price * (1 - self.slippage))
                 
                 # execute sell
@@ -580,18 +584,16 @@ class TradingEnvironment:
                 self.units_held -= units
                 self.total_trades += 1
 
-                reward += profit / self.unit_size
+                reward += profit / self.price_mean * (5 if profit >= 0 and action == TradingAction.SELL_ALL else 3 if profit > 0 else 10)                
+                
                 sold = True
             
         elif action is None:
             pass    # takes no action and just returns self._form_state()
 
-        # Holding incentive
-        if self.units_held > 0:
-            reward += 0.01
- 
-        reward -= self.init_balance/1_000        #--------------- penalize all actions to save actions and time.
-        self.total_actions_taken += 1
+        reward -= self.init_balance / self.price_mean * 0.05        #--------------- penalize all actions to save actions and time.
+        
+        self.total_actions_taken += (1 if action is not None else 0)
         
         if (action == TradingAction.SELL_ALL.value and sold is True):
             done = True
@@ -614,6 +616,9 @@ def train_ppo(env, agent, max_episode_len, episodes=300, print_interval=50, devi
     print("="*60)
     
     profitabilities = deque(maxlen=int(episodes/10))
+    TxActRates = deque(maxlen=100)
+    ProTraRates = deque(maxlen=100)
+    
     acc_profit = 0
     
     for episode in range(episodes):
@@ -621,7 +626,7 @@ def train_ppo(env, agent, max_episode_len, episodes=300, print_interval=50, devi
         state_tuple = env.reset()
 
         done = False
-        episode_reward = 0
+        episode_return = 0
         step_count = 0
         
         learned = False
@@ -642,7 +647,7 @@ def train_ppo(env, agent, max_episode_len, episodes=300, print_interval=50, devi
             # action, log_prob = actor(state), value = critic(state), reward, done = env(action)
             # Discrepancy between actor and critic is represented.
             agent.remember(state_tuple, action, reward, done, log_prob, value)
-            episode_reward += reward
+            episode_return += reward
             state_tuple = next_state_tuple
             step_count += 1
             
@@ -650,8 +655,9 @@ def train_ppo(env, agent, max_episode_len, episodes=300, print_interval=50, devi
                 losses = agent.learn(next_state_tuple, done)      # next_state is None if done.
                 learned = True
         
-        if not learned:
-            agent.learn(next_state_tuple, done=False)
+        if not learned: agent.learn(next_state_tuple, done=False)
+        
+        agent.learn(next_state_tuple, done=done)
         
         if (episode + 1) % print_interval == 0:
             win_rate = (env.profitable_trades / max(env.total_trades, 1)) * 100
@@ -660,14 +666,21 @@ def train_ppo(env, agent, max_episode_len, episodes=300, print_interval=50, devi
             profitable = profit > 0
             profitabilities.append(1 if profitable else 0)
             p_frequency = sum(profitabilities) / len(profitabilities)
-            print(f"E: {episode+1 :5d} | "
-                  f"Rwd: {episode_reward:5.0f} | "
-                  f"Blnc: {env.balance:5.0f} {env.low_balance:5.0f} {env.high_balance:5.0f} | "
-                  f"Trades/Actions: {env.total_trades:3d}/{env.total_actions_taken:3d} | "
-                  f"Profit/Trades: {(env.balance-env.init_balance)/(env.total_trades + 1e-9):5.2f} | "
-                  f"p_freq: {p_frequency:5.2f} | "
-                  f"acc_profit: {acc_profit:6.0f} | "
-                  f"{'!!!!!' if profitable else ''}"
+            
+            TxActR = env.total_trades/env.total_actions_taken
+            TxActRates.append(TxActR)
+            ProTraR = (env.balance-env.init_balance)/(env.total_trades + 1e-9)
+            ProTraRates.append(ProTraR)
+            
+            print(f"Episode: {episode+1 :5d} | "
+                  f"Return: {episode_return:5.4f} | "
+                  f"Blnc: {env.balance:6.1f} {env.low_balance:6.1f} {env.high_balance:6.1f} | "
+                  f"Txs/Acts: {env.total_trades:3d} {env.total_actions_taken:3d} {sum(TxActRates)/len(TxActRates):5.2f} | "
+                  f"Pro/Txs: {ProTraR:5.2f} {sum(ProTraRates)/len(ProTraRates):5.2f} | "
+                  f"Pro_freq: {p_frequency:5.3f} | "
+                  f"Acc_Pro: {acc_profit:6.0f} | "
+                  f"Pro/epi: {acc_profit/episode:4.2f}"
+                  f"{'   !!!!!' if profitable else ''}"
                   )
     
     return env, agent
@@ -714,14 +727,14 @@ if __name__ == "__main__":
     # Get_Price_Data_By_Time function seamlessly collects/creates price candles from Binance.
     datatype = "klines" # "aggTrades" #, "klines"
     symbol = "BTCUSDT"      # Any pair listed on Binance.
-    start = datetime(2025, 7, 12)    # Any datetime. Note Binance started operation in July 2017.
-    end = datetime(2026, 2, 26) # + timedelta(minutes=100)     # Any datetime
+    start = datetime(2025, 10, 1)    # Any datetime. Note Binance started operation in July 2017.
+    end = datetime(2026, 4, 1) # + timedelta(minutes=100)     # Any datetime
     interval = '1m'    # in '1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d'.  (excludes: '3d', '1w')
     candles, nFills, successful, _, reason = bn.Get_Price_Data_By_Time(datatype, symbol, interval, start, end)
     # "Returning 10 columns: O H L C V, Quote V, nTrades, Buy base V, Buy quote V, Mark (0: original not forged)"
     open_idx, high_idx, low_idx, close_idx, volume_idx, mark_idx = 0, 1, 2, 3, 4, 9
     if successful:          # price is a numpy array.
-        print("\n Successful !!!!!!!!!! (nCandles, nAttributes) = {}, nCreated = {}".format(candles.shape, nFills))
+        print("\n Successful !!!!!!!!!! (nCandles, nAttributes) = {}, nForged = {}".format(candles.shape, nFills))
     else:
         print("\n Failed to Get_Price_Data_By_Time", reason)
         exit(0)
@@ -736,12 +749,13 @@ if __name__ == "__main__":
         return raw_price_train, raw_price_test
     
     # The agent can make 100 dollars every 5 minutes if we use volume in place of price !!!!!!!!!!!!!!!!!!!!!!!!!!!
-    raw_price_train, raw_price_test = split_array(candles[:, close_idx], train_size)   #----------------- temporary
+    raw_price_train, raw_price_test = split_array(candles[:, close_idx], train_size)  #----------------- temporary
     raw_volume_train, raw_volume_test = split_array(candles[:, volume_idx], train_size)  #----------------- temporary
     
-    # raw_price_train = raw_price_train - raw_price_train.mean()  #----------------------------------------- temporary
+    # raw_price_train = raw_price_train / 10000  #----------------------------------------- temporary
+    # raw_price_test = raw_price_test / 10000
     
-    plot_arrays([raw_price_train, raw_volume_train], labels=['price', 'volume'], title="price volume", xlabel="time", ylabel="", figsize=(18, 2), flip=False, save_path=None)
+    # plot_arrays([raw_price_train, raw_volume_train], labels=['price', 'volume'], title="price volume", xlabel="time", ylabel="", figsize=(18, 2), flip=False, save_path=None)
     
     raw_mark_train, raw_mark_test = split_array(candles[:, mark_idx], train_size)
     price_mean, volue_mean = raw_price_train.mean(), raw_volume_train.mean()
@@ -759,13 +773,13 @@ if __name__ == "__main__":
     max_units = 50
     action_dim = len(TradingAction)
     
-    dim_compact_history = 300
+    dim_compact_history = 1_000
     dim_history_indicator = 10
     indicator_window = 30
     history_dim = len(['price', 'volume'])
     max_episode_len = 1_000
     tx_cost = 0.001
-    slippage = 0.002
+    slippage = 0.0001
     
     state_params = { 
         'history_dim': history_dim, 
@@ -788,9 +802,9 @@ if __name__ == "__main__":
     }
     
     agent_params = {
-        'learning_rate': 1e-5,
-        'gamma': 0.99,          # PPO paper
-        'gae_lambda': 0.95,     # PPO paper
+        'learning_rate': 5e-6,
+        'gamma': 1.00,          # 0.99
+        'gae_lambda': 1.00,     # 0.95
         'clip_epsilon': 0.2,    # PPO paper
         'critic_coef': 0.5,     # DeepSeek
         'entropy_coef': 0.01,   # DeepSeek
@@ -822,7 +836,7 @@ if __name__ == "__main__":
     train_env = TradingEnvironment(market_history_train, portfolio_param, 
         dim_compact_history=dim_compact_history, indicator_window=indicator_window, max_eposode_len=max_episode_len)
     
-    train_env, agent = train_ppo(train_env, the_agent, max_episode_len, episodes=3000, print_interval=1, device=device)
+    train_env, agent = train_ppo(train_env, the_agent, max_episode_len, episodes=1_000_000, print_interval=1, device=device)
     agent.save("stable_ppo_model.pth")
     
     #------------------------------------- Test post-train ---------------------------------------------
