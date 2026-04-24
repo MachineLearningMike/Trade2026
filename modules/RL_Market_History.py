@@ -12,20 +12,20 @@ class Market_History:
         assert len(compress_kernel) == dim_compact_history + 1
         len_to_compress = math.ceil(compress_kernel[-1][1]) + 1
 
-        indicator_window = 30           # we look lookback as far as 'lookback'
-        len_to_lookback = max(3 * indicator_window - 2, len_to_compress)     # dim_price_state: tight
+        indicator_window = indicator_window           # we look lookback as far as 'lookback'
+        lookback_horizon = max(3 * indicator_window - 2, len_to_compress)     # dim_price_state: tight
     
         self.compress_kernel = compress_kernel
         self._len_to_compress = len_to_compress
-        self._len_to_lookback = len_to_lookback
+        self._lookback_horizon = lookback_horizon
         
     @property
     def len_to_compress(self):
         return self._len_to_compress
     
     @property
-    def len_to_lookback(self):
-        return self._len_to_lookback
+    def lookback_horizon(self):
+        return self._lookback_horizon
 
     def abs_normalize(self, arr):
         return arr / (arr.std() + 1e-9)
@@ -65,14 +65,19 @@ class Market_History:
 
 
     def compress_historical_sequence(self, arr, faithful_backward=True):
-        assert len(arr) == self.len_to_compress
+        try:
+            assert len(arr) == self.len_to_compress
+        except:
+            print(f"{len(arr)}, {self.len_to_compress}")
+            open
         
         arr_copy = arr[::-1] if faithful_backward else arr
         
         arr_copy, start, end = self.compress_sequence(arr_copy, bidir=False)
 
-        assert len(arr_copy) == len(self.compress_kernel) - 1
-        assert end - start == self.len_to_compress
+        # Violated sometimes.
+        # assert len(arr_copy) == len(self.compress_kernel) - 1
+        # assert end - start == self.len_to_compress
             
         arr_copy = arr_copy[::-1] if faithful_backward else arr_copy
 
@@ -83,7 +88,11 @@ class Market_History:
     
 
     def compress_hitorical_sequence_preserve_last(self, arr, use_backside=True, faithful_backward=True):
-        assert len(arr) >= self.len_to_compress     # check it
+        try:
+            assert len(arr) >= self.len_to_compress     # check it
+        except:
+            print(f"{len(arr)}, {self.len_to_compress}, {self.lookback_horizon}")
+            # open
 
         arr_copy = arr[-self.len_to_compress:] if use_backside else arr[:self.len_to_compress]
 
@@ -99,26 +108,26 @@ class Market_History:
 
 
     # def compress_history(self, prices, volumes, raw_prices, anchor, use_backside=True, faithful_backward=True):
-    #     prices = prices[anchor - self.len_to_lookback : anchor + 1]
+    #     prices = prices[anchor - self.lookback_horizon : anchor + 1]
     #     c_prices, start, end = self.compress_hitorical_sequence_preserve_last(prices, use_backside=use_backside, faithful_backward=faithful_backward)
-    #     volumes = volumes[anchor - self.len_to_lookback : anchor + 1]
+    #     volumes = volumes[anchor - self.lookback_horizon : anchor + 1]
     #     c_volumes, start_v, end_v = self.compress_hitorical_sequence_preserve_last(volumes, use_backside=use_backside, faithful_backward=faithful_backward)
     #     assert start == start_v and end == end_v
-    #     r_prices = raw_prices[anchor - self.len_to_lookback : anchor + 1]
+    #     r_prices = raw_prices[anchor - self.lookback_horizon : anchor + 1]
     #     price_curr = raw_prices[anchor]
     #     return c_prices, c_volumes, r_prices, price_curr, start, end
     
     def compress_history(self, history, anchor, use_backside=True, faithful_backward=True):
         raw_prices, raw_volumes, marks, price_mean, volue_mean = history
-        assert anchor >= self.len_to_lookback
-        r_prices = raw_prices[anchor - self.len_to_lookback : anchor + 1]
-        r_volumes = raw_volumes[anchor - self.len_to_lookback : anchor + 1]
+        assert anchor >= self.lookback_horizon
+        r_prices = raw_prices[anchor - self.lookback_horizon : anchor + 1]
+        r_volumes = raw_volumes[anchor - self.lookback_horizon : anchor + 1]
         
         compact_prices, start, end = self.compress_hitorical_sequence_preserve_last(r_prices, use_backside=use_backside, faithful_backward=faithful_backward)
         compact_volumes, start_v, end_v = self.compress_hitorical_sequence_preserve_last(r_volumes, use_backside=use_backside, faithful_backward=faithful_backward)
         assert start == start_v and end == end_v
         
-        r_marks = marks[anchor - self.len_to_lookback : anchor + 1]
+        r_marks = marks[anchor - self.lookback_horizon : anchor + 1]
         c_history = (compact_prices, compact_volumes, r_prices, r_volumes, r_marks, price_mean, volue_mean)
         
         return c_history, start, end

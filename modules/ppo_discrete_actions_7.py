@@ -510,9 +510,9 @@ class TradingEnvironment:
         while True:
             # episode_anchor is the inclusive end index into the market_history 
             # and is used to indicate the right-most, current candle of the history, from which the current episode begins.
-            assert self.historian.len_to_lookback <= history_len - self.max_eposode_len, f"{self.historian.len_to_lookback} > {history_len - self.max_eposode_len}"
-            episode_anchor = random.randint(self.historian.len_to_lookback, history_len - self.max_eposode_len)     # check for empty range error
-            candlespace = range(episode_anchor - self.historian.len_to_lookback, episode_anchor + self.max_eposode_len)
+            assert self.historian.lookback_horizon <= history_len - self.max_eposode_len, f"{self.historian.lookback_horizon} > {history_len - self.max_eposode_len}"
+            episode_anchor = random.randint(self.historian.lookback_horizon, history_len - self.max_eposode_len)     # check for empty range error
+            candlespace = range(episode_anchor - self.historian.lookback_horizon, episode_anchor + self.max_eposode_len)
             if (self.raw_mark[candlespace]==0).all(): break     # no forged candles. See Binance.Get_Price_Data_By_Time
             print(f"Found forged candles. picking others..........................................")
             

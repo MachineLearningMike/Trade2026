@@ -1273,8 +1273,8 @@ if __name__ == "__main__":
     # start = datetime(2018, 1, 1)    # Any datetime. Note Binance started operation in July 2017.
     # end = datetime(2026, 3, 26) # + timedelta(minutes=100)     # Any datetime
 
-    start = datetime(2020, 1, 1)    # Any datetime. Note Binance started operation in July 2017.
-    end = datetime(2025, 3, 26) # + timedelta(minutes=100)     # Any datetime
+    start = datetime(2026, 1, 1)    # Any datetime. Note Binance started operation in July 2017.
+    end = datetime(2026, 1, 2) # + timedelta(minutes=100)     # Any datetime
 
     interval = '1m'    # in '1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d'.  (excludes: '3d', '1w')
     print(f"interval: {interval}")

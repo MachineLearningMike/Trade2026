@@ -280,9 +280,11 @@ def snap_sort_deduplicate_in_opening_time(dynarray, interval_mili):
     org = dynarray.shape[0]
   
     #-------------------------- snap ----------------
-    dynarray[:, 0] = (dynarray[:, 0]/interval_mili).astype(int)*interval_mili # opening time
+    # dynarray[:, 0] = (dynarray[:, 0]/interval_mili).astype(int)*interval_mili # opening time
+    dynarray[:, 0] = (dynarray[:, 0] // interval_mili) * interval_mili
     # if interval_mili <= 60000: 
-    dynarray[:, 6] = (dynarray[:, 6]/interval_mili).astype(int)*interval_mili # closing time
+    # dynarray[:, 6] = (dynarray[:, 6]/interval_mili).astype(int)*interval_mili # closing time
+    dynarray[:, 6] = (dynarray[:, 6] // interval_mili) * interval_mili
     assert dynarray.shape[0] == org
 
     # "ALICEUSDT", https://data.binance.vision/data/spot/monthly/klines/ALICEUSDT/3m/ALICEUSDT-3m-2021-02.zip prohibits these lines.
@@ -350,14 +352,134 @@ def get_all_from_historic_file(sample_utc, dataType, symbol, interval, dailyNotM
 
   return dynarray, nForged, successful
 
+# def normalize_timestamps_by_magnitude(dynarray, timestamp_indices=[0, 6]):
+#     """
+#     Detect and convert timestamp columns based on magnitude.
+    
+#     Assumes:
+#     - Milliseconds: ~1.5e12 to 1.9e12
+#     - Microseconds: ~1.5e15 to 1.9e15
+#     - Nanoseconds: ~1.5e18 to 1.9e18
+#     """
+#     if dynarray.shape[0] == 0:
+#         return dynarray
+    
+#     # Typical ranges for year 2000-2100
+#     MS_LOW, MS_HIGH = 946684800000, 4102444800000  # Milliseconds
+#     US_LOW, US_HIGH = MS_LOW * 1000, MS_HIGH * 1000  # Microseconds
+#     NS_LOW, NS_HIGH = MS_LOW * 1_000_000, MS_HIGH * 1_000_000  # Nanoseconds
+    
+#     local_offset_mili = get_local_utc_offset_microseconds() // 1_000
+    
+#     for col in timestamp_indices:
+#         if col >= dynarray.shape[1]:
+#             continue
+        
+#         # Get a sample value
+#         sample = dynarray[0, col]
+        
+#         # Check by magnitude
+#         if MS_LOW <= sample <= MS_HIGH:
+#             # Already in milliseconds
+#             continue
+#         elif US_LOW <= sample <= US_HIGH:
+#             # Convert microseconds to milliseconds
+#             # print(f"Converting column {col} from microseconds to milliseconds...")
+#             dynarray[:, col] = dynarray[:, col] // 1000
+#         elif NS_LOW <= sample <= NS_HIGH:
+#             # Convert nanoseconds to milliseconds
+#             # print(f"Converting column {col} from nanoseconds to milliseconds...")
+#             dynarray[:, col] = dynarray[:, col] // 1_000_000
+#         else:
+#             print(f"Warning: Column {col} timestamp {sample} is outside expected ranges.")
+            
+#         dynarray[:, col] = dynarray[:, col] - local_offset_mili     # This compensates the local_offset_mili that was mistakenly introduced by pandas when reading cssv files.
+    
+#     return dynarray
+  
+# def normalize_timestamps_by_magnitude(dynarray, timestamp_indices=[0, 6]):
+#     """
+#     Detect and convert timestamp columns based on magnitude.
+#     """
+#     if dynarray.shape[0] == 0:
+#         return dynarray
+    
+#     # Typical ranges for year 2000-2100
+#     MS_LOW, MS_HIGH = 946684800000, 4102444800000  # Milliseconds (~9.4e11 to 4.1e12)
+#     US_LOW, US_HIGH = MS_LOW * 1000, MS_HIGH * 1000  # Microseconds (~9.4e14 to 4.1e15)
+#     NS_LOW, NS_HIGH = MS_LOW * 1_000_000, MS_HIGH * 1_000_000  # Nanoseconds
+    
+#     # Overflowed range: when microsecond timestamps overflow 32-bit signed ints
+#     # They can wrap to:
+#     # 1) Negative values: -2,147,483,648 to -1
+#     # 2) Small positive values: 0 to 2,147,483,647 (after multiple overflows)
+#     OVERFLOW_NEG_LOW, OVERFLOW_NEG_HIGH = -2147483648, -1
+#     OVERFLOW_POS_LOW, OVERFLOW_POS_HIGH = 0, 2147483647
+    
+#     local_offset_mili = get_local_utc_offset_microseconds() // 1_000
+    
+#     for col in timestamp_indices:
+#         if col >= dynarray.shape[1]:
+#             continue
+        
+#         # Get a sample value (first non-NaN, non-zero)
+#         sample = None
+#         for i in range(min(10, dynarray.shape[0])):
+#             val = dynarray[i, col]
+#             if not np.isnan(val) and val != 0:
+#                 sample = val
+#                 break
+        
+#         if sample is None:
+#             continue
+        
+#         # Check by magnitude
+#         if MS_LOW <= sample <= MS_HIGH:
+#             # Already in milliseconds
+#             pass
+            
+#         elif US_LOW <= sample <= US_HIGH:
+#             # Convert microseconds to milliseconds
+#             # print(f"Column {col}: Converting microseconds to ms ({sample:.0f})")
+#             dynarray[:, col] = dynarray[:, col] // 1000
+            
+#         elif NS_LOW <= sample <= NS_HIGH:
+#             # Convert nanoseconds to milliseconds
+#             # print(f"Column {col}: Converting nanoseconds to ms ({sample:.0f})")
+#             dynarray[:, col] = dynarray[:, col] // 1_000_000
+            
+#         elif (OVERFLOW_NEG_LOW <= sample <= OVERFLOW_NEG_HIGH) or \
+#              (OVERFLOW_POS_LOW <= sample <= OVERFLOW_POS_HIGH):
+#             # RECOVER OVERFLOWED TIMESTAMPS (32-bit wrap)
+#             # These are microsecond timestamps that overflowed
+#             # Add 2^32 to recover, but may need multiple additions if overflowed multiple times
+#             # print(f"Column {col}: Recovering overflowed timestamp ({sample:.0f})")
+            
+#             # Convert to int64
+#             dynarray[:, col] = dynarray[:, col].astype(np.int64)
+            
+#             # For positive small values, they might have wrapped multiple times
+#             # Add 2^32 repeatedly until we get a valid microsecond timestamp
+#             recovered = dynarray[:, col].copy()
+#             mask = (recovered >= 0) & (recovered <= 2147483647)
+#             # Add 2^32 once (most common)
+#             recovered[mask] = recovered[mask] + 4294967296
+            
+#             # Convert to milliseconds
+#             dynarray[:, col] = recovered // 1000
+            
+#         else:
+#             print(f"Warning: Column {col} timestamp {sample:.0f} is outside expected ranges.")
+#             continue
+            
+#         # Apply local offset compensation
+#         dynarray[:, col] = dynarray[:, col] - local_offset_mili
+    
+#     return dynarray
+
 def normalize_timestamps_by_magnitude(dynarray, timestamp_indices=[0, 6]):
     """
     Detect and convert timestamp columns based on magnitude.
-    
-    Assumes:
-    - Milliseconds: ~1.5e12 to 1.9e12
-    - Microseconds: ~1.5e15 to 1.9e15
-    - Nanoseconds: ~1.5e18 to 1.9e18
     """
     if dynarray.shape[0] == 0:
         return dynarray
@@ -367,31 +489,52 @@ def normalize_timestamps_by_magnitude(dynarray, timestamp_indices=[0, 6]):
     US_LOW, US_HIGH = MS_LOW * 1000, MS_HIGH * 1000  # Microseconds
     NS_LOW, NS_HIGH = MS_LOW * 1_000_000, MS_HIGH * 1_000_000  # Nanoseconds
     
-    local_offset_mili = get_local_utc_offset_microseconds() // 1_000
+    # Overflowed range
+    OVERFLOW_NEG_LOW, OVERFLOW_NEG_HIGH = -2147483648, -1
+    OVERFLOW_POS_LOW, OVERFLOW_POS_HIGH = 0, 2147483647
     
     for col in timestamp_indices:
         if col >= dynarray.shape[1]:
             continue
         
         # Get a sample value
-        sample = dynarray[0, col]
+        sample = None
+        for i in range(min(10, dynarray.shape[0])):
+            val = dynarray[i, col]
+            if not np.isnan(val) and val != 0:
+                sample = val
+                break
+        
+        if sample is None:
+            continue
         
         # Check by magnitude
         if MS_LOW <= sample <= MS_HIGH:
             # Already in milliseconds
-            continue
+            pass
+            
         elif US_LOW <= sample <= US_HIGH:
             # Convert microseconds to milliseconds
-            # print(f"Converting column {col} from microseconds to milliseconds...")
             dynarray[:, col] = dynarray[:, col] // 1000
+            
         elif NS_LOW <= sample <= NS_HIGH:
             # Convert nanoseconds to milliseconds
-            # print(f"Converting column {col} from nanoseconds to milliseconds...")
             dynarray[:, col] = dynarray[:, col] // 1_000_000
-        else:
-            print(f"Warning: Column {col} timestamp {sample} is outside expected ranges.")
             
-        dynarray[:, col] = dynarray[:, col] - local_offset_mili     # This compensates the local_offset_mili that was mistakenly introduced by pandas when reading cssv files.
+        elif (OVERFLOW_NEG_LOW <= sample <= OVERFLOW_NEG_HIGH) or \
+             (OVERFLOW_POS_LOW <= sample <= OVERFLOW_POS_HIGH):
+            # Recover overflowed timestamps
+            dynarray[:, col] = dynarray[:, col].astype(np.int64)
+            recovered = dynarray[:, col].copy()
+            mask = (recovered >= 0) & (recovered <= 2147483647)
+            recovered[mask] = recovered[mask] + 4294967296
+            dynarray[:, col] = recovered // 1000
+            
+        else:
+            print(f"Warning: Column {col} timestamp {sample:.0f} is outside expected ranges.")
+            continue
+    
+    # ❌ REMOVED: dynarray[:, col] = dynarray[:, col] - local_offset_mili
     
     return dynarray
 
@@ -2132,14 +2275,44 @@ def fix_utc_timestamps_from_csv(file_path):
     
     return df
 
-def read_csv_file(dataType, file_path):
-  dataframe = None
-  try:
-    dataframe = pd.read_csv(file_path, header=None, index_col=None) # Parse as UTC)
-  except:
-    datetime = None
+# def read_csv_file(dataType, file_path):
+#   dataframe = None
+#   try:
+#     dataframe = pd.read_csv(file_path, header=None, index_col=None) # Parse as UTC)
+#   except:
+#     datetime = None
 
-  return dataframe
+#   return dataframe
+
+# def read_csv_file(dataType, file_path):
+#     dataframe = None
+#     try:
+#         # Read all as string first
+#         dataframe = pd.read_csv(file_path, header=None, index_col=None, dtype=str)
+        
+#         # Then convert timestamp columns to int64
+#         dataframe[0] = pd.to_numeric(dataframe[0], downcast='integer').astype('int64')
+#         dataframe[6] = pd.to_numeric(dataframe[6], downcast='integer').astype('int64')
+        
+#     except Exception as e:
+#         print(f"Error reading {file_path}: {e}")
+#         dataframe = None
+
+#     return dataframe
+  
+def read_csv_file(dataType, file_path):
+    dataframe = None
+    try:
+        dataframe = pd.read_csv(
+            file_path, 
+            header=None, 
+            index_col=None,
+            dtype={0: 'int64', 6: 'int64'}  # CRITICAL: prevents overflow
+        )
+    except Exception as e:
+        print(f"Error reading {file_path}: {e}")
+        dataframe = None
+    return dataframe
 
 def write_csv_file(dataframe, filepath):
   dataframe.to_csv(filepath, columns=None, header=False, index=False)
