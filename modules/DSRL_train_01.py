@@ -16,11 +16,12 @@ from RL_Market_History import Market_History
 from RL_Indicators import normalize, get_level, get_change, get_volatility
 from indicator_super import calculate_supertrend_close_only
 from indicator_aggregated import calculate_best_indicators
-from DSRL_planning_with_fees_penalty_4 import find_strategy_with_fees_and_penalty_vectorized
+# from DSRL_planning_with_fees_penalty_4 import find_strategy_with_fees_and_penalty_vectorized
+from DSRL_planning_with_fees_penalty_5 import find_strategy_with_fees_and_penalty_vectorized
 from DSRL_rewards_with_fees_penalty_3 import find_strategic_rewards_with_fees_and_penalty
 
 from ppo_lstm_networks import BiLSTM, BiLSTMWithAttention, BiLSTMWithLastTimestep
-from RL_Trade_POC_Util import plot_arrays
+from RL_Trade_POC_Util import plot_arrays, interval_to_seconds
 
 warnings.filterwarnings('ignore')
 
@@ -285,6 +286,9 @@ class StablePPOAgent:
     
     def remember(self, state, action, reward, done, log_prob, value):
         self.trajectory.add(state, action, reward, done, log_prob, value)
+        
+    def get_remember_len(self):
+        return self.trajectory.__len__()
     
     def compute_returns_and_advantages(self, next_value: float):
         # action, log_prob = actor(state), value = critic(state), reward, done = env(action)
@@ -360,6 +364,8 @@ class StablePPOAgent:
             # while the policy network might choose a different action based on the next_state_tuple.
             # What should the agent learn from? the practical policy or the policy network?
             # Practical! because the agent should learn an optimal policy that fits the practice.
+            
+            assert False
             
             with torch.no_grad():
                 (historical_state, indicator_state) = next_state_tuple
@@ -793,7 +799,7 @@ class TradingEnvironment:
         
         self.total_actions += (1 if action is not None else 0)
         
-        if (action == TradingAction.SELLOUT.value and sold is True): done = True
+        if action == TradingAction.SELLOUT.value: done = True
         
         if tx is not None: self.tx_history.append(tx)
         
@@ -854,43 +860,57 @@ from collections import deque
 import math
           
 
-def train_ppo(env, agent, epochs=300, print_interval=50, training=True, device='cuda'):
+def train_ppo(env, agent, epochs=300, print_interval=50, training=True, interval_sec=60, device='cuda'):
     print("\n" + "="*60)
     print(f"🚀 STARTING PPO {'TRAINING' if training else 'TEST'}")
     print("="*60)
     
-    profitables = deque(maxlen=int(100))
-    TxActRates = deque(maxlen=100)
-    ProTraRates = deque(maxlen=100)
+    smooth = 1000
+    profitables = deque(maxlen=smooth)
+    TxActRates = deque(maxlen=smooth)
+    ProTraRates = deque(maxlen=smooth)
     acc_profit = 0
     acc_RF = 0
 
-    PA_len = 100
+    PA_len = smooth
     profits = deque(maxlen=PA_len)
     total_actions = deque(maxlen=PA_len)
-    PA_old = -100000
+    PA_old = float('-inf')
     
     for epoch in range(epochs):
         episode_anchor = env.historian.lookback_horizon + 1
    
         episodes = -1
         delta = env.max_episode_len
+        null_strategies_to_come = 0
         while episode_anchor < env.history_len - env.max_episode_len - delta:
             episode_anchor = env.get_valid_episode_anchor(search_start=episode_anchor)
             if episode_anchor >= env.history_len - env.max_episode_len - delta: continue
             episodes += 1
             
             state_tuple = env.reset(episode_anchor)
-            
-            buys, holds, net_profit = find_strategy_with_fees_and_penalty_vectorized(env.coming_price, r=(env.tx_cost + env.slippage) * 100, p=0, unit_size=env.unit_size)
-            assert holds > 0    # at least SELLOUT
+
+            if null_strategies_to_come > 0:
+                null_strategies_to_come -= 1
+                buys = 0; holds = 1
+            else:         
+                holds1, buys, holds2, net_profit, _ = find_strategy_with_fees_and_penalty_vectorized(env.coming_price, r=(env.tx_cost + env.slippage) * 100, p=0, unit_size=env.unit_size)
+                if holds1 > 0:
+                    buys = 0; holds = 1
+                    null_strategies_to_come = holds1 - 1
+                else:
+                    buys = buys; holds = holds2
+                    assert holds2 > 0    # at least SELLOUT
+
             target_actions = [TradingAction.BUY] * buys + [TradingAction.HOLD] * (holds-1) + [TradingAction.SELLOUT] * 1
+
             target_rewards = find_strategic_rewards_with_fees_and_penalty(env.coming_price, r=(env.tx_cost + env.slippage) * 100, p=0, buys=buys, holds=holds, unit_size=env.unit_size)
+
             assert len(target_actions) == len(target_rewards)
             
             done, episode_return, step_count = False, 0, 0
 
-            while not done and step_count < len(target_actions):
+            while not done: # and step_count < len(target_actions):
 
                 action = target_actions[step_count].value
                 log_prob = agent.eval_get_log_prob(state_tuple, action)
@@ -906,11 +926,12 @@ def train_ppo(env, agent, epochs=300, print_interval=50, training=True, device='
                     
                 state_tuple = next_state_tuple
                 step_count += 1
-                
-            episode_anchor += len(target_actions)
-                
-            if training:
+                                
+            if training and agent.get_remember_len() > 64:
                 agent.learn(next_state_tuple, done)
+            
+            assert step_count == len(target_rewards)
+            episode_anchor += len(target_rewards)
 
             #---------------------------------------------------------------------------------------------------------
                     
@@ -934,20 +955,19 @@ def train_ppo(env, agent, epochs=300, print_interval=50, training=True, device='
                 RF = profit + fees
                 acc_RF += RF
                 
-                print(f"EE {epoch:3d} {episodes:3d} {net_profit:7.2f} {buys:2d} {holds:1d} | "
-                    f"R {episode_return:6.2f} | "
+                print(f"EE {epoch:3d} {episodes:3d} {episode_anchor:3d} {net_profit:7.3f} {buys:2d} {holds:1d} R {episode_return:6.2f} | "
                     f"B {env.balance:6.0f} {env.low_balance:6.0f} {env.high_balance:6.0f} | "
                     f"T/A {env.total_trades:2d} {env.total_actions:2d} {sum(TxActRates)/len(TxActRates):5.2f} {sum(total_actions)/len(total_actions):5.2f} | "
-                    f"Pfr {p_frequency:5.3f} AccP {acc_profit:5.2f} P/A {sum(profits)/sum(total_actions) : 5.4f} | "
+                    f"Pfr {p_frequency:5.3f} AccP {acc_profit:5.2f} P/A {PA:5.4f} {PA/interval_sec * 3600 * 24:5.2f} | "
                     f"P {profit:3.2f} {profit/env.total_actions:3.2f} F {fees:3.2f} PF {RF:.2f} acc {acc_RF:.2f} | "
                     f"{env.codes} "
                     #   f"{rewards} "
-                    f"{'=====' if profit > 0 else ''}"
+                    f"{f'{profit:3.2f}' if profit > 0 else ''}"
                     )
             
-        if training and PA > PA_old:
-            agent.save("stable_ppo_model_24.pth")
-            PA_old = PA
+            if training and PA > PA_old:
+                agent.save("stable_ppo_model_D01.pth")
+                PA_old = PA
     
     return env, agent
 
@@ -970,6 +990,7 @@ if __name__ == "__main__":
     # end = start + timedelta(minutes=4808) # gives true_data_size === 2 when max_episode_len = 60 and dim_compact_history = 500
 
     interval = '1m'    # in '1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d'.  (excludes: '3d', '1w')
+    interval_sec = interval_to_seconds(interval)
     candles, nFills, successful, _, reason = bn.Get_Price_Data_By_Time(datatype, symbol, interval, start, end)
     # "Returning 10 columns: O H L C V, Quote V, nTrades, Buy base V, Buy quote V, Mark (0: original not forged)"
     open_idx, high_idx, low_idx, close_idx, volume_idx, mark_idx = 0, 1, 2, 3, 4, 9
@@ -1023,7 +1044,7 @@ if __name__ == "__main__":
     max_episode_len = 30
     dim_compact_history = 300
     dim_history_indicator = 30      # sensitive
-    indicator_window = 5
+    indicator_window = 10
     #-----------------------------------------------
     
     history_dim = len(['price', 'volume'])
@@ -1081,7 +1102,7 @@ if __name__ == "__main__":
     
     the_agent = StablePPOAgent(state_params, history_process_params, state_process_params, action_dim, agent_params)
 
-    # the_agent.load("stable_ppo_model_24.pth")
+    # the_agent.load("stable_ppo_model_D01.pth")
         
     #------------------------------------ test pre-train -----------------------------------------
     test_env = TradingEnvironment(market_history_test, portfolio_param, 
@@ -1094,10 +1115,10 @@ if __name__ == "__main__":
     train_env = TradingEnvironment(market_history_train, portfolio_param, 
         dim_compact_history=dim_compact_history, indicator_window=indicator_window, max_eposode_len=max_episode_len)
     
-    train_env, the_agent = train_ppo(train_env, the_agent, epochs=500_000, print_interval=1, training=True, device=device)
+    train_env, the_agent = train_ppo(train_env, the_agent, epochs=500_000, print_interval=1, training=True, interval_sec=interval_sec, device=device)
     
     #------------------------------------- Test post-train ---------------------------------------------
-    the_agent.load("stable_ppo_model_24.pth")
+    the_agent.load("stable_ppo_model_D01.pth")
     
     print("\n🧪 Testing post-train...")
     test_env = TradingEnvironment(market_history_test, portfolio_param, 

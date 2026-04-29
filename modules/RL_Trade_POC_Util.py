@@ -53,6 +53,23 @@ def get_volatility(arr, anchor, back, axis=0, span=20):     # [anchor - 3 * back
     # print(f"abs_volatilities: {len(abs_volatilities)}")
     volatility = get_zscore(abs_volatilities, len(abs_volatilities) - 1, back, axis=axis)
     return volatility
+
+
+def interval_to_seconds(interval: str) -> int:
+    """Convert interval string to seconds"""
+    unit = interval[-1]
+    value = int(interval[:-1]) if len(interval) > 1 else 1
+    
+    multipliers = {
+        's': 1,
+        'm': 60,
+        'h': 3600,
+        'd': 86400,
+        'w': 604800,
+        'M': 2592000  # Approximate
+    }
+    
+    return value * multipliers.get(unit, 60)
         
     
 def plot_array1(arr, title="Price History", xlabel="Time", ylabel="Price", figsize=(18, 3), flip=False, save_path=None, vlines=None, recolors=None):

@@ -32,7 +32,7 @@ def find_strategic_rewards_with_fees_and_penalty(prices, r=0, p=0, buys=0, holds
     n = len(prices)
     
     if buys == 0:
-        return [0.0] * holds
+        return [-1.0] * holds   #-------------------------- To strongly discourage the state.
     
     if buys + holds > n:
         raise ValueError(f"Not enough price data: need {buys + holds}, have {n}")
