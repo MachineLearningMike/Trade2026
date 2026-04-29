@@ -587,7 +587,7 @@ class TradingEnvironment:
             episode_anchor = random.randint(history_len - self.max_episode_len - data_complexity, history_len - self.max_episode_len)     # comeback
             
             # raw_prices, raw_volumes, marks, price_mean, volue_mean = self.market_history
-            # episode_anchor = history_len - self.max_episode_len - data_complexity            
+            # # episode_anchor = history_len - self.max_episode_len - data_complexity            
             # arrays = [raw_prices[episode_anchor : episode_anchor + self.max_episode_len]]
             # plot_arrays(arrays, labels=['price'], title="Price Volume", xlabel="Time", ylabel="Price", figsize=(18, 2), flip=False, save_path=None, lw=1)
             
@@ -905,7 +905,7 @@ def train_ppo(env, agent, max_episode_len, episodes=300, print_interval=50, trai
                   )
             
         if training and PA > PA_old and episode > 30:
-            agent.save("stable_ppo_model.pth")
+            agent.save("stable_ppo_model_18.pth")
             PA_old = PA
     
     return env, agent
@@ -1040,7 +1040,7 @@ if __name__ == "__main__":
     
     the_agent = StablePPOAgent(state_params, history_process_params, state_process_params, action_dim, agent_params)
 
-    # the_agent.load("stable_ppo_model.pth")
+    the_agent.load("stable_ppo_model_18.pth")
         
     #------------------------------------ test pre-train -----------------------------------------
     test_env = TradingEnvironment(market_history_test, portfolio_param, 
@@ -1056,7 +1056,7 @@ if __name__ == "__main__":
     train_env, the_agent = train_ppo(train_env, the_agent, max_episode_len, episodes=500_000, print_interval=1, training=True, device=device)
     
     #------------------------------------- Test post-train ---------------------------------------------
-    the_agent.load("stable_ppo_model.pth")
+    the_agent.load("stable_ppo_model_18.pth")
     
     print("\n🧪 Testing post-train...")
     test_env = TradingEnvironment(market_history_test, portfolio_param, 
