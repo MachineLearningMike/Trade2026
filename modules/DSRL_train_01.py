@@ -18,6 +18,7 @@ from indicator_super import calculate_supertrend_close_only
 from indicator_aggregated import calculate_best_indicators
 # from DSRL_planning_with_fees_penalty_4 import find_strategy_with_fees_and_penalty_vectorized
 from DSRL_planning_with_fees_penalty_5 import find_strategy_with_fees_and_penalty_vectorized
+from DSRL_planning_with_fees_penalty_6 import optimal_trading_strategy
 from DSRL_rewards_with_fees_penalty_3 import find_strategic_rewards_with_fees_and_penalty
 
 from ppo_lstm_networks import BiLSTM, BiLSTMWithAttention, BiLSTMWithLastTimestep
@@ -459,18 +460,20 @@ class StablePPOAgent:
                     
                     ratios = torch.exp(log_probs - batch_old_log_probs)
                     
-                    surr1 = ratios * batch_advantages
-                    surr2 = torch.clamp(ratios, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * batch_advantages
-                    actor_loss = - torch.min(surr1, surr2).mean()
-                                        
-                    critic_loss = nn.SmoothL1Loss()(state_values.squeeze(), batch_returns)
+                    # surr1 = ratios * batch_advantages
+                    # surr2 = torch.clamp(ratios, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * batch_advantages
+                    # actor_loss = - torch.min(surr1, surr2).mean()                                        
+                    # critic_loss = nn.SmoothL1Loss()(state_values.squeeze(), batch_returns)
+                    # entropy_loss = -entropy.mean()
+                    # total_loss = actor_loss + self.critic_coef * critic_loss  + self.entropy_coef * entropy_loss      # comeback
+                    
+                    surr1 = ratios * batch_returns
+                    surr2 = torch.clamp(ratios, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * batch_returns
+                    actor_loss = - torch.min(surr1, surr2).mean()                                        
+                    # critic_loss = nn.SmoothL1Loss()(state_values.squeeze(), batch_returns)
                     entropy_loss = -entropy.mean()
-                    
-                    # coef = critic_loss.detach() / (actor_loss.detach() + 1e-9)
-                    
-                    total_loss = actor_loss + self.critic_coef * critic_loss  + self.entropy_coef * entropy_loss      # comeback
-                    # total_loss = (coef * actor_loss + critic_loss + self.entropy_coef * entropy_loss)     # comeback
-                    
+                    total_loss = actor_loss + self.entropy_coef * entropy_loss      # comeback
+
                     if torch.isnan(total_loss): 
                         print(f"Warning: NaN loss at batch {start}")
                         continue
@@ -482,7 +485,7 @@ class StablePPOAgent:
                     self.optimizer.step()     # comeback
                     
                     losses['actor_loss'] += actor_loss.item()
-                    losses['critic_loss'] += critic_loss.item()
+                    # losses['critic_loss'] += critic_loss.item()
                     losses['entropy'] += entropy.mean().item()
                     losses['total_loss'] += total_loss.item()
                     update_count += 1
@@ -860,7 +863,7 @@ class TradingEnvironment:
 from collections import deque
 import math
           
-def train_ppo(env, agent, epochs=300, print_interval=50, training=True, test = False, interval_sec=60, device='cuda'):
+def train_ppo(env, agent, epochs=300, print_interval=50, training=True, online_test = False, interval_sec=60, device='cuda'):
     print("\n" + "="*60)
     print(f"🚀 STARTING PPO {'TRAINING' if training else 'TEST'}")
     print("="*60)
@@ -885,7 +888,7 @@ def train_ppo(env, agent, epochs=300, print_interval=50, training=True, test = F
             if null_strategies_to_come > 0:
                 null_strategies_to_come -= 1
                 pm.buys = 0; pm.holds = 1
-            else:         
+            else:
                 holds1, buys, holds2, pm.net_profit, _ = find_strategy_with_fees_and_penalty_vectorized(env.coming_price, r=(env.tx_cost + env.slippage) * 100, p=0, unit_size=env.unit_size)
                 if holds1 > 0:
                     pm.buys = 0; pm.holds = 1
@@ -896,7 +899,29 @@ def train_ppo(env, agent, epochs=300, print_interval=50, training=True, test = F
                     
             target_actions = [TradingAction.BUY] * pm.buys + [TradingAction.HOLD] * (pm.holds-1) + [TradingAction.SELLOUT] * 1
             target_rewards = find_strategic_rewards_with_fees_and_penalty(env.coming_price, r=(env.tx_cost + env.slippage) * 100, p=0, buys=pm.buys, holds=pm.holds, unit_size=env.unit_size)
+            
+            # encourage SELLOUT manually
+            if target_actions == [TradingAction.SELLOUT]:
+                target_rewards = [+2]
+            
             assert len(target_actions) == len(target_rewards)
+
+            # if null_strategies_to_come > 0:
+            #     null_strategies_to_come -= 1
+            #     pm.buys = 0; pm.holds = 1
+            #     target_actions = [TradingAction.SELLOUT] * 1
+            # else:         
+            #     full_actions, best_profit, first_holds, trimmed = optimal_trading_strategy(env.coming_price, r=(env.tx_cost + env.slippage) * 100, p=0, unit_size=env.unit_size)
+            #     if first_holds > 0:
+            #         null_strategies_to_come = first_holds - 1
+            #         pm.buys = 0; pm.holds = 1
+            #         target_actions = [TradingAction.SELLOUT] * 1
+            #     else:
+            #         pm.buys = len([a for a in trimmed if a is 'B'])
+            #         pm.holds = len([a for a in trimmed if a == 'H']) + 1    # + 1: SELLOUT is a kind of HOLD.
+            #         target_actions = [TradingAction.BUY] * pm.buys + [TradingAction.HOLD] * (pm.holds-1) + [TradingAction.SELLOUT] * 1
+            #         target_rewards = find_strategic_rewards_with_fees_and_penalty(env.coming_price, r=(env.tx_cost + env.slippage) * 100, p=0, buys=pm.buys, holds=pm.holds, unit_size=env.unit_size)
+            # assert len(target_actions) == len(target_rewards)
 
             #------------------------------ Teach agent with target_actions / target_rewards -----------------
             done, episode_return, step_count = False, 0, 0
@@ -919,7 +944,7 @@ def train_ppo(env, agent, epochs=300, print_interval=50, training=True, test = F
                 
             pm.episode_return = episode_return
                             
-            if training and agent.get_remember_len() > 64:
+            if training and agent.get_remember_len() > 100:
                 agent.learn(next_state_tuple, done)
 
             #---------------------------------------------------------------------------------------------------------
@@ -932,7 +957,7 @@ def train_ppo(env, agent, epochs=300, print_interval=50, training=True, test = F
                 
             #------------------------------ Test agent ------------------------------------------------------------
 
-            if test:
+            if online_test:
                 state_tuple = env.reset(episode_anchor)
 
                 done_1, episode_return_1, step_count_1 = False, 0, 0
@@ -946,7 +971,7 @@ def train_ppo(env, agent, epochs=300, print_interval=50, training=True, test = F
 
                     step_count_1 += 1
 
-                PA = display_performance("--", pm_1, env, epoch, episodes, episode_anchor, done_1)
+                PA = display_performance("  ", pm_1, env, epoch, episodes, episode_anchor, done_1)
                                         
             #------------------------------- Prepare for the next episode --------------------------------------------------
            
@@ -993,12 +1018,12 @@ def display_performance(flag, pm, env, epoch, episodes, episode_anchor, done):
     RF = profit + fees
     pm.acc_RF += RF
     
-    print(f"{flag} {epoch:3d} {episodes:3d} a {episode_anchor:3d} p {pm.net_profit:7.3f} b {pm.buys:2d} h {pm.holds:2d} R {pm.episode_return:6.2f} | "
+    print(f"{flag} {epoch:3d} {episodes:3d} a {episode_anchor:3d} p {pm.net_profit: 4.3f} ({pm.buys:2d} {pm.holds:2d}) R {pm.episode_return:6.2f} | "
         f"B {env.balance:6.0f} {env.low_balance:6.0f} {env.high_balance:6.0f} | "
         f"T/A {env.total_trades:2d} {env.total_actions:2d} {sum(pm.TxActRates)/len(pm.TxActRates):5.2f} {sum(pm.total_actions)/len(pm.total_actions):5.2f} | "
-        f"Pfr {p_frequency:5.3f} AccP {pm.acc_profit: 5.2f} P/A {PA: 7.3f} {(PA/interval_sec*3600*24): 5.0f} | "
+        f"Pfr {p_frequency:5.3f} AccP {pm.acc_profit: 5.0f} P/A {PA: 7.3f} {(PA/interval_sec*3600*24): 5.1f} | "
         f"P {profit: 4.2f} {profit/env.total_actions: 3.2f} F {fees:3.2f} PF {RF: .2f} acc {pm.acc_RF: 4.2f} | "
-        f"{env.codes} "
+        f"{flag} {env.codes} "
         #   f"{rewards} "
         f"{f'{profit:3.2f}' if profit > 0 else ''}"
         )
@@ -1018,7 +1043,7 @@ if __name__ == "__main__":
     # Get_Price_Data_By_Time function seamlessly collects/creates price candles from Binance.
     datatype = "klines" # "aggTrades" #, "klines"
     symbol = "BTCUSDT"      # Any pair listed on Binance.
-    start = datetime(2026, 2, 1) + timedelta(minutes=0)
+    start = datetime(2025, 2, 27) + timedelta(minutes=0)
     end = datetime(2026, 3, 1) # + timedelta(minutes=100)     # Any datetime
     # end = start + timedelta(minutes=4808) # gives true_data_size === 2 when max_episode_len = 60 and dim_compact_history = 500
 
@@ -1109,15 +1134,15 @@ if __name__ == "__main__":
     print(state_process_params)
     
     agent_params = {
-        'learning_rate': 1e-5,          # 16: 1e-5
+        'learning_rate': 1e-7,          # : 1e-5
         'gamma': 1,          # 0.99     # 16: 0.99
         'gae_lambda': 1,     # 0.95     # 16  0.95
         'clip_epsilon': 0.5,    # 0.2
         'critic_coef': 0.5,     # 0.5
         'entropy_coef': 0.020,   # 0.01
         'max_grad_norm': 0.2,   # 0.5
-        'ppo_epochs': 10,
-        'mini_batch_size': 32,
+        'ppo_epochs': 20,
+        'mini_batch_size': 64,
         'device': 'auto'
     }
     
@@ -1148,7 +1173,7 @@ if __name__ == "__main__":
     train_env = TradingEnvironment(market_history_train, portfolio_param, 
         dim_compact_history=dim_compact_history, indicator_window=indicator_window, max_eposode_len=max_episode_len)
     
-    train_env, the_agent = train_ppo(train_env, the_agent, epochs=500_000, print_interval=1, training=True, test=True, interval_sec=interval_sec, device=device)
+    train_env, the_agent = train_ppo(train_env, the_agent, epochs=500_000, print_interval=1, training=True, online_test=True, interval_sec=interval_sec, device=device)
     
     #------------------------------------- Test post-train ---------------------------------------------
     the_agent.load("stable_ppo_model_D01.pth")
