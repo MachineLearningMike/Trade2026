@@ -1,6 +1,6 @@
 import numpy as np
 
-def optimal_trading_strategy(prices, r=0, p=0, unit_size=1.0):
+def optimal_trading_strategy(prices, r=0, unit_size=1.0):
     """
     Optimal multi-phase trading strategy - can sell at ANY point.
     
@@ -18,10 +18,10 @@ def optimal_trading_strategy(prices, r=0, p=0, unit_size=1.0):
         return full, 0.0, n, []
     
     fee_rate = r / 100
-    buy_multiplier = unit_size * (1 - fee_rate)
+    buy_multiplier = (1 - fee_rate)
     sell_multiplier = (1 - fee_rate)
     
-    best_profit = 0.0
+    best_profit = float('-inf')
     best_buy_indices = []
     best_sell_idx = -1
     
@@ -33,15 +33,9 @@ def optimal_trading_strategy(prices, r=0, p=0, unit_size=1.0):
         
         for buy_idx in range(sell_idx):
             buy_price = prices[buy_idx]
-            net_gain = sell_price * sell_multiplier - buy_price * buy_multiplier
+            net_gain = sell_price * sell_multiplier * unit_size * buy_multiplier - buy_price * unit_size
             
-            if p > 0:
-                gross_gain = sell_price - buy_price
-                value = net_gain - (p / 100) * gross_gain
-                if value > 0:
-                    total_profit += value
-                    buy_indices.append(buy_idx)
-            elif net_gain > 0:
+            if net_gain > 0:
                 total_profit += net_gain
                 buy_indices.append(buy_idx)
         
@@ -82,11 +76,10 @@ def optimal_trading_strategy(prices, r=0, p=0, unit_size=1.0):
     
     return full_actions, best_profit, first_holds, trimmed
 
-
 # Convenience function for simple use cases
-def get_strategy(prices, r=0, p=0):
+def get_strategy(prices, r=0):
     """Simplified interface - returns trimmed actions and profit"""
-    _, profit, first_holds, trimmed = optimal_trading_strategy(prices, r, p)
+    _, profit, first_holds, trimmed = optimal_trading_strategy(prices, r)
     return trimmed, profit, first_holds
 
 
