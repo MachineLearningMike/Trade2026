@@ -70,8 +70,10 @@ def find_strategic_rewards_with_fees_and_penalty(prices, r=0, unit_size=1.0, act
                 buy_risk = sigmoid_math(buy_price_normal)    # This buy takes as much risk as sigmoid(buy_price_normal)
                 rewards[idx] += buy_risk * profit
                 price_inc = sell_price - buy_price
+                
                 try:
                     for i in range(idx+1, sell_action_index+1): # include SELLOUT, which is the last HOLD
+                        assert price_inc != 0.0
                         rewards[i] += (prices[i]-prices[i-1]) / price_inc * profit * (1-buy_risk)
                 except:
                     print(f"Bomb explodes!!!")

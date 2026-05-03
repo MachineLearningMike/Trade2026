@@ -15,7 +15,7 @@ def optimal_trading_strategy(prices, r=0, unit_size=1.0, max_buy_cost=None):
     n = len(prices)
     
     if n < 2:
-        full = ['H'] * n
+        full = ['S'] * n
         return full, 0.0, n, []
     
     fee_rate = r / 100
@@ -27,7 +27,7 @@ def optimal_trading_strategy(prices, r=0, unit_size=1.0, max_buy_cost=None):
     best_sell_idx = -1
     
     # Try every possible sell point
-    for sell_idx in range(1, n):
+    for sell_idx in range(0, n):        # SELLOUT is enabled as the first action, which means no actions at all.
         sell_price = prices[sell_idx]
         buy_indices = []
         total_profit = 0.0

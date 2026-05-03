@@ -1166,7 +1166,7 @@ if __name__ == "__main__":
         'critic_coef': 0.5,     # 0.5
         'entropy_coef': 0.20,   # 0.01
         'max_grad_norm': 0.2,   # 0.5
-        'ppo_epochs': 10,
+        'ppo_epochs': 5,
         'mini_batch_size': 64,
         'device': 'auto'
     }
@@ -1198,7 +1198,7 @@ if __name__ == "__main__":
     train_env = TradingEnvironment(market_history_train, portfolio_param, 
         dim_compact_history=dim_compact_history, indicator_window=indicator_window, max_eposode_len=max_episode_len)
     
-    train_env, the_agent = train_ppo(train_env, the_agent, epochs=500_000, print_interval=1, training=True, online_test=False, interval_sec=interval_sec, device=device)
+    train_env, the_agent = train_ppo(train_env, the_agent, epochs=500_000, print_interval=1, training=True, online_test=True, interval_sec=interval_sec, device=device)
     
     #------------------------------------- Test post-train ---------------------------------------------
     the_agent.load("stable_ppo_model_D06.pth")
