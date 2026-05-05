@@ -58,7 +58,8 @@ def optimal_trading_strategy(prices, r=0, unit_size=1.0, max_buy_cost=None, prob
     return strategy, is_random_strategy
 
 def create_random_strategy(prices, r=0, unit_size=1.0, max_buy_cost=None, prob_B = 0.5):
-    random_actions = ['B' if random.random() < prob_B else 'H' for _ in range(len(prices)-1)] + ['S']
+    random_len = random.randint(0, len(prices) -1)
+    random_actions = ['B' if random.random() < prob_B else 'H' for _ in range(random_len - 1)] + ['S']
     buy_indices = [idx for idx in range(len(random_actions)) if random_actions[idx] == 'B']
 
     fee_rate = r / 100
@@ -72,7 +73,7 @@ def create_random_strategy(prices, r=0, unit_size=1.0, max_buy_cost=None, prob_B
         net_gain = sell_price * sell_multiplier * unit_size * buy_multiplier - prices[buy_idx] * unit_size
         total_profit += net_gain
     
-    strategy = conclude_actions(total_profit, buy_indices, len(prices)-1, len(prices))
+    strategy = conclude_actions(total_profit, buy_indices, random_len, len(prices))
     
     return strategy
         

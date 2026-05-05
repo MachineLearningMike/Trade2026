@@ -350,7 +350,7 @@ class StablePPOAgent:
         return returns, advantages
     
     
-    def learn(self):
+    def learn(self, epochs=None):
         if len(self.trajectory) == 0:
             return {}
                
@@ -406,7 +406,8 @@ class StablePPOAgent:
         self.actor_critic.train()
         
         with torch.enable_grad():
-            for epoch in range(self.ppo_epochs):
+            epochs = epochs if epochs is not None else self.ppo_epochs
+            for epoch in range(epochs):
                 indices = np.random.permutation(dataset_size)
                 for start in range(0, dataset_size, self.mini_batch_size):
                     end = min(start + self.mini_batch_size, dataset_size)
@@ -469,6 +470,10 @@ class StablePPOAgent:
                     self.optimizer.zero_grad()
                     total_loss.backward()
                     # torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+                    
+                    for name, param in self.actor_critic.named_parameters():
+                        if param.grad is None:
+                            print(f"Parameter '{name}' did NOT receive a gradient --------------------------------------------")
                     
                     self.optimizer.step()     # comeback
                     
@@ -960,7 +965,8 @@ def train_ppo(env, agent, epochs=300, print_interval=50, training=True, online_t
 
             # if training and agent.get_remember_len() > 128:   #-------- This doens't work as expected. It delays and slows learning.
             # Learn immediately, instead.
-            agent.learn()
+            epochs = 100 if not is_random_strategy else None
+            agent.learn(epochs=epochs)
        
             pm.episode_return = episode_return
 
@@ -1062,7 +1068,7 @@ if __name__ == "__main__":
     # Get_Price_Data_By_Time function seamlessly collects/creates price candles from Binance.
     datatype = "klines" # "aggTrades" #, "klines"
     symbol = "BTCUSDT"      # Any pair listed on Binance.
-    start = datetime(2025, 10, 25) + timedelta(minutes=60*15)
+    start = datetime(2025, 1, 25) + timedelta(minutes=60*15)
     end = datetime(2026, 3, 1) # + timedelta(minutes=100)     # Any datetime
     # end = start + timedelta(minutes=4808) # gives true_data_size === 2 when max_episode_len = 60 and dim_compact_history = 500
 
@@ -1153,14 +1159,14 @@ if __name__ == "__main__":
     print(state_process_params)
     
     agent_params = {
-        'learning_rate': 5e-5,          # : 1e-5
+        'learning_rate': 1e-3,          # : 1e-5
         'gamma': 1,          # 0.99     # 16: 0.99
         'gae_lambda': 1,     # 0.95     # 16  0.95
         'clip_epsilon': 0.5,    # 0.2
         'critic_coef': 0.5,     # 0.5
         'entropy_coef': 0.20,   # 0.01
         'max_grad_norm': 0.2,   # 0.5
-        'ppo_epochs': 5,   # swings over 5
+        'ppo_epochs': 15,   # swings over 5
         'mini_batch_size': 64,
         'device': 'auto'
     }
