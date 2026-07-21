@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+
 # ------------------------------------------------------------
 # 1. Select device: GPU if available, else CPU
 # ------------------------------------------------------------
