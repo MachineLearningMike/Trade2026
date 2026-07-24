@@ -1,0 +1,10 @@
+{
+  "latest_checkpoint": "trading_checkpoints\\checkpoint_minibatch100_20260724_130004.pt",
+  "version": 4,
+  "epoch": 2,
+  "batch_idx": 30,
+  "total_minibatches_processed": 100,
+  "loss": 6.724579238891602,
+  "timestamp": 1784865604.8619,
+  "is_emergency": false
+}
