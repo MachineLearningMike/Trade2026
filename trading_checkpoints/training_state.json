@@ -1,11 +1,11 @@
 {
-  "latest_checkpoint": "trading_checkpoints\\checkpoint_minibatch105_20260724_214536.pt",
+  "latest_checkpoint": "trading_checkpoints\\checkpoint_minibatch3390_20260724_233933.pt",
   "version": 4,
-  "epoch": 2,
-  "batch_idx": 35,
-  "total_minibatches_processed": 105,
-  "loss": 5.036185884475708,
+  "epoch": 4,
+  "batch_idx": 678,
+  "total_minibatches_processed": 3390,
+  "loss": 3.8487230611410115,
   "training_finished": true,
-  "timestamp": 1784897136.22568,
+  "timestamp": 1784903973.746741,
   "is_emergency": false
 }

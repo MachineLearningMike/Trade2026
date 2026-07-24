@@ -63,9 +63,9 @@ def find_shortest_horizon(
     all_slopes = []
     
     # Search for the shortest horizon
-    for h in range(min_horizon, max_horizon + 1):
+    for horizon in range(min_horizon, max_horizon + 1):
         # Get the segment
-        segment = prices[:h]
+        segment = prices[:horizon]
         
         # Time indices starting from 0
         t = torch.arange(h, dtype=torch.float32, device=device)
@@ -89,18 +89,18 @@ def find_shortest_horizon(
         cumulative_deviation = torch.sum(deviations).item()
         
         # Store for analysis
-        all_horizons.append(h)
+        all_horizons.append(horizon)
         all_cum_devs.append(cumulative_deviation)
         all_slopes.append(slope)
         
         # If we've reached the threshold, return this horizon
         if cumulative_deviation >= max_accum_deviation:
-            return h, slope, intercept, cumulative_deviation, all_horizons, all_cum_devs, all_slopes
+            return horizon, slope, intercept, cumulative_deviation, all_horizons, all_cum_devs, all_slopes
     
     # If we never reach the threshold, return the max horizon
-    h = max_horizon
-    segment = prices[:h]
-    t = torch.arange(h, dtype=torch.float32, device=device)
+    horizon = max_horizon
+    segment = prices[:horizon]
+    t = torch.arange(horizon, dtype=torch.float32, device=device)
     
     y_centered = segment - f0
     numerator = torch.sum(t * y_centered)
@@ -117,7 +117,7 @@ def find_shortest_horizon(
     deviations = torch.abs(segment - predicted)
     cumulative_deviation = torch.sum(deviations).item()
     
-    return h, slope, intercept, cumulative_deviation, all_horizons, all_cum_devs, all_slopes
+    return horizon, slope, intercept, cumulative_deviation, all_horizons, all_cum_devs, all_slopes
 
 
 # ═══════════════════════════════════════════════════════════
@@ -254,8 +254,8 @@ class TradingDataset(Dataset):
         normalized = (window - mean) / std
         
         norm_params = {
-            'mean': mean.squeeze().cpu().numpy(),  # (F,)
-            'std': std.squeeze().cpu().numpy()     # (F,)
+            'mean': mean.squeeze(),  # (F,)
+            'std': std.squeeze()     # (F,)
         }
         
         return normalized, norm_params
@@ -277,8 +277,8 @@ class TradingDataset(Dataset):
             else:
                 x_normalized = x
                 norm_params = {
-                    'mean': torch.ones(self.F).numpy(),
-                    'std': torch.ones(self.F).numpy()
+                    'mean': torch.ones(self.F),
+                    'std': torch.ones(self.F)
                 }
             
             # Extract future prices for labeling
@@ -478,16 +478,21 @@ class ThreadedDataLoader:
             
             X_list = []
             Y_list = []
+            MEAN_list, STD_list = [], []
             
             for idx in batch_indices:
-                x, y, _ = self.dataset[idx]  # Ignore norm_params for training
+                x, y, norm_params = self.dataset[idx]  # Ignore norm_params for training
                 X_list.append(x)
                 Y_list.append(y)
+                MEAN_list.append(norm_params['mean'])
+                STD_list.append(norm_params['std'])
             
             X_batch = torch.stack(X_list)
             Y_batch = torch.stack(Y_list)
-            
-            yield X_batch, Y_batch
+            MEAN_batch = torch.stack(MEAN_list)
+            STD_batch = torch.stack(STD_list)
+
+            yield X_batch, Y_batch, MEAN_batch, STD_batch
     
     def get_total_batches_in_epoch(self):
         """Return total number of batches in current epoch (including partial last batch)."""

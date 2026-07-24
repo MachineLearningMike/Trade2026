@@ -171,7 +171,7 @@ class MarketTransformerWithHeads(nn.Module):
         mask = mask.masked_fill(~mask.bool(), 0.0)
         return mask
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, mean: Optional[torch.Tensor] = None, std: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
             x: (B, T, F) — raw market data. T must be divisible by patch_size.

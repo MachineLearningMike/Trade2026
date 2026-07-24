@@ -33,7 +33,7 @@ config = {
     'num_heads': 4,
     'ff_dim': 256,
     'dropout': 0.1,
-    'causal': True,
+    'causal': False,
     'max_seq_len': None,  # AUTO-COMPUTED
     
     # ============================================================

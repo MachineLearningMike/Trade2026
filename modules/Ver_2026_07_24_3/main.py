@@ -134,7 +134,7 @@ def main():
     parser.add_argument('--ff-dim', type=int, default=config['ff_dim'], help='Feed-forward dimension')
     parser.add_argument('--dropout', type=float, default=config['dropout'], help='Dropout rate')
     parser.add_argument('--head-hidden-dim', type=int, default=config['head_hidden_dim'], help='Hidden dimension for prediction heads')
-    parser.add_argument('--no-causal', action='store_true', help='Disable causal attention')
+    parser.add_argument('--no-causal', action='store_true', default=not config['causal'], help='Disable causal attention')
     parser.add_argument('--no-reconstruction', action='store_true', help='Disable reconstruction auxiliary loss')
     parser.add_argument('--use-binance', action='store_true', default=config['use_binance_data'], 
                        help='Use real Binance data instead of synthetic')

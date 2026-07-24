@@ -159,7 +159,7 @@ config = {
     # Whether to use causal (masked) attention
     # True: Each position only attends to previous positions (good for forecasting)
     # False: Full bidirectional attention (good for reconstruction/autoencoding)
-    'causal': True,
+    'causal': False,
     
     # Maximum sequence length (N = past_window // patch_size)
     # AUTO-COMPUTED from past_days and patch_size

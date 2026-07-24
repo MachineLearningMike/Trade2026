@@ -31,10 +31,10 @@ config = {
     # BINANCE DATA CONFIGURATION
     # ============================================================
     
-    'use_binance_data': False,
+    'use_binance_data': True,
     'binance_datatype': 'klines',
     'binance_interval': '1m',
-    'binance_start_date': '2026-01-01',
+    'binance_start_date': '2024-01-01',
     'binance_end_date': '2026-06-30',
     'binance_symbols': {
         "ETHUSDT": ["High", "Low", "Close", "Volume"],
@@ -73,11 +73,11 @@ config = {
     
     'patch_size': 30,
     'embed_dim': None,  # AUTO-COMPUTED
-    'num_layers': 4,
-    'num_heads': 4,
+    'num_layers': 8,
+    'num_heads': 8,
     'ff_dim': 256,
     'dropout': 0.1,
-    'causal': True,
+    'causal': False,
     'max_seq_len': None,  # AUTO-COMPUTED
     
     
@@ -93,8 +93,8 @@ config = {
     # TRAINING CONFIGURATION
     # ============================================================
     
-    'epochs': 3,
-    'batch_size': 16,
+    'epochs': 5,
+    'batch_size': 32,
     'learning_rate': 0.001,
     'save_every_n_minibatches': 50,
     'checkpoint_dir': 'trading_checkpoints',
