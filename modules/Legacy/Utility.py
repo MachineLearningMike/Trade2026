@@ -209,22 +209,22 @@ def create_empty_dynarray():
   return np.empty([0, 12], dtype=float)
   # https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#klinecandlestick-data
 
-def correcdynarray_dtypes(dataType, df):
-  if dataType == 'klines':
-    # https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#klinecandlestick-data
-    df[0] = df[0].astype('int64')     # Open time
-    df[1] = df[1].astype('float64')   # Open
-    df[2] = df[2].astype('float64')   # High
-    df[3] = df[3].astype('float64')   # Low
-    df[4] = df[4].astype('float64')   # Close
-    df[5] = df[5].astype('float64')   # Volume
-    df[6] = df[6].astype('int64')     # Close time
-    df[7] = df[7].astype('float64')   # Quote asset volume
-    df[8] = df[8].astype('int64')     # Number of trades
-    df[9] = df[9].astype('float64')   # Taker buy base asset volume
-    df[10] = df[10].astype('float64') # Taker buy quote asset volume
-    df[11] = df[11].astype('float64') # Ignore
-  return df
+# def correcdynarray_dtypes(dataType, df):
+#   if dataType == 'klines':
+#     # https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#klinecandlestick-data
+#     df[0] = df[0].astype('int64')     # Open time
+#     df[1] = df[1].astype('float64')   # Open
+#     df[2] = df[2].astype('float64')   # High
+#     df[3] = df[3].astype('float64')   # Low
+#     df[4] = df[4].astype('float64')   # Close
+#     df[5] = df[5].astype('float64')   # Volume
+#     df[6] = df[6].astype('int64')     # Close time
+#     df[7] = df[7].astype('float64')   # Quote asset volume
+#     df[8] = df[8].astype('int64')     # Number of trades
+#     df[9] = df[9].astype('float64')   # Taker buy base asset volume
+#     df[10] = df[10].astype('float64') # Taker buy quote asset volume
+#     df[11] = df[11].astype('float64') # Ignore
+#   return df
 
 
 
@@ -250,6 +250,8 @@ def parse_datalines_to_datalines(dataType, datalines):
       datalines[idx] = dl
   return datalines
 
+def get_feature_list():
+  return ['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore']
 
 def fetch_save_csv_data(clientPool, binance_wait_sec, sample_utc, dataType, symbol, interval, filepath, dailyNotMonthly = True):
   interval_mili = intervalToMilliseconds(interval)
@@ -1450,7 +1452,7 @@ def fill_rightward(clientPool, binance_wait_sec, dynarray, dataType, symbol, int
     mask = (dynarray[:, 0] >= search_start_idx) & (dynarray[:, 0] < search_end_mili)
     dynarray = dynarray[mask]
     
-    Print(f"... total {nForged} candles created.")
+    Print(f"... total {nForged} candles forged.")
     return dynarray, nForged, successful
 
 # def fill_inward(clientPool, binance_wait_sec, dynarray, dataType, symbol, interval, search_start, search_end, ignore_last=True):

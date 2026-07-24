@@ -572,7 +572,7 @@ class SimpleDataset(Dataset):
         self.X = torch.randn(size, input_dim)
         self.Y = torch.randn(size, output_dim)
     
-    def __len__(self):
+    def __len__(self):  
         return self.size
     
     def __getitem__(self, idx):

@@ -11,11 +11,23 @@ import copy
 
 import sys
 import os
-# Add the directory containing this file to Python's path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from Utility import * 
-from config import *
+# Force Python to look in the Legacy directory FIRST for config
+legacy_dir = os.path.dirname(os.path.abspath(__file__))
+# Remove any existing config from sys.modules to force reload
+if 'config' in sys.modules:
+    del sys.modules['config']
+
+# Add Legacy directory to the beginning of sys.path
+sys.path.insert(0, legacy_dir)
+
+# Now import from Legacy
+import config as legacy_config
+from Utility import *
+
+# Make Config and Print available
+Config = legacy_config.Config
+Print = legacy_config.Print
 
 from ThreadOnTimeMachine import *
 
@@ -1182,6 +1194,10 @@ class Binance():
 
         return dynarray, nForged, successful, fetchedFromGstream, reason
 
+    def GetFeatureList(self):
+        return ["Open", "High", "Low", "Close", "Volume", "QuoteVolume", "NumTrades", "BuyBaseVolume", "BuyQuoteVolume", "Mark"]
+
+
     def UpdateLookupState(self, firstOpenTimeMile, _latestDataStart, _checkedDataStart, start_lookedup):
         if _latestDataStart is None:
             _latestDataStart = datetime.fromtimestamp(firstOpenTimeMile/1000).replace(tzinfo=pytz.utc)
@@ -1260,26 +1276,49 @@ class Binance():
 
         return array
 
+    def get_combined_history(self, datatype, interval, start, end, symbol_dict):
+
+        features_to_return, nForged = [], 0
+
+        for symbol in symbol_dict.keys():
+            features = symbol_dict[symbol]
+
+            feature_list = self.GetFeatureList()
+
+            candles, nFills, successful, _, reason = self.Get_Price_Data_By_Time(datatype, symbol, interval, start, end)
+            print(reason if reason else "No reason provided.")
+            if successful:          # price is a numpy array.
+                print("Successful !!!!!!!!!! (nCandles, nAttributes) = {}, nForged = {}".format(candles.shape, nFills))
+                nForged += nFills
+
+                for feature in features:
+                    features_to_return.append(candles[:, feature_list.index(feature)])
+
+        return features_to_return, nForged
+
 
 if __name__ == "__main__":
     
-    bn = Binance.instantiate()
+    bn = Binance.instantiate(connect=False)
     
     # Get_Price_Data_By_Time function seamlessly collects/creates price candles from Binance.
     datatype = "klines" # "aggTrades" #, "klines"
-    symbol = "BTCUSDT"      # Any pair listed on Binance.
-
-    # dates that worked
-    # start = datetime(2018, 1, 1)    # Any datetime. Note Binance started operation in July 2017.
-    # end = datetime(2026, 3, 26) # + timedelta(minutes=100)     # Any datetime
-
-    start = datetime(2026, 1, 1)    # Any datetime. Note Binance started operation in July 2017.
-    end = datetime(2026, 1, 2) # + timedelta(minutes=100)     # Any datetime
-
     interval = '1m'    # in '1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d'.  (excludes: '3d', '1w')
-    print(f"interval: {interval}")
-    #------------------------------------------------------------------------------------------------------------------
-    candles, nFills, successful, _, reason = bn.Get_Price_Data_By_Time(datatype, symbol, interval, start, end)
-    print(reason)
-    if successful:          # price is a numpy array.
-        print("\n Successful !!!!!!!!!! (nCandles, nAttributes) = {}, nForged = {}".format(candles.shape, nFills))
+    start = datetime(2024, 1, 1)    # Any datetime. Note Binance started operation in July 2017.
+    end = datetime(2026, 6, 30) # + timedelta(minutes=100)     # Any datetime
+
+    symbol_dict  = {
+        "ETHUSDT": ["Open", "High", "Low", "Close", "Volume"],
+        "BTCUSDT": ["Open", "High", "Low", "Close", "Volume"]
+    }
+
+    features, nForget = bn.get_combined_history(datatype, interval, start, end, symbol_dict)
+
+    T = features[0].shape[0] if len(features) > 0 else 0
+    for feature in features:
+        assert feature.shape[0] == T, "All features must have the same number of time points."
+
+    print(f"nFeatures ========== {len(features)}, T ========== {T}, nForged ========== {nForget}")
+
+
+

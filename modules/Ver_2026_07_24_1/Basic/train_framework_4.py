@@ -1,25 +1,120 @@
-# trainer.py
-# Resumable trainer with checkpoint management and interruption handling
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import threading
+import queue
+from tqdm import tqdm
 import time
 import os
 import json
+from pathlib import Path
+import random
 import signal
 import sys
 import atexit
 import math
-from pathlib import Path
-from tqdm import tqdm
-from typing import Optional, Tuple
-from config import get_config
 
 
-# ═══════════════════════════════════════════════════════════
-# TRAINING STATE MANAGER
-# ═══════════════════════════════════════════════════════════
+class ThreadedDataLoader:
+    """DataLoader that pre-fetches next batch in a separate thread."""
+    
+    def __init__(self, dataset, batch_size=32, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        
+        self.current_epoch_indices = None
+        self.current_batch_start = 0
+        
+        self.iterator = None
+        self.prefetch_queue = queue.Queue(maxsize=1)
+        self.prefetch_thread = None
+        self.load_start_time = None
+        
+    def start_epoch(self, epoch, resume_indices=None, resume_batch_start=0):
+        self.epoch = epoch
+        
+        if resume_indices is not None:
+            self.current_epoch_indices = resume_indices
+        else:
+            self.current_epoch_indices = list(range(len(self.dataset)))
+            if self.shuffle:
+                random.shuffle(self.current_epoch_indices)
+        
+        self.current_batch_start = resume_batch_start
+        self._create_iterator()
+        self._start_prefetch()
+    
+    def _create_iterator(self):
+        start = self.current_batch_start * self.batch_size
+        remaining_indices = self.current_epoch_indices[start:]
+        self.iterator = self._batch_generator(remaining_indices)
+    
+    def _batch_generator(self, indices):
+        for i in range(0, len(indices), self.batch_size):
+            batch_indices = indices[i:i + self.batch_size]
+            
+            X_list = []
+            Y_list = []
+            for idx in batch_indices:
+                x, y = self.dataset[idx]
+                X_list.append(x)
+                Y_list.append(y)
+            
+            X_batch = torch.stack(X_list)
+            Y_batch = torch.stack(Y_list)
+            
+            yield X_batch, Y_batch
+    
+    def get_total_batches_in_epoch(self):
+        """Return total number of batches in current epoch (including partial last batch)."""
+        if self.current_epoch_indices is None:
+            return math.ceil(len(self.dataset) / self.batch_size)
+        return math.ceil(len(self.current_epoch_indices) / self.batch_size)
+    
+    def get_state(self):
+        return {
+            'epoch_indices': self.current_epoch_indices,
+            'batch_start': self.current_batch_start,
+            'batch_size': self.batch_size,
+            'shuffle': self.shuffle,
+        }
+    
+    def restore_state(self, state):
+        self.current_epoch_indices = state['epoch_indices']
+        self.current_batch_start = state['batch_start']
+    
+    def _start_prefetch(self):
+        self.load_start_time = time.time()
+        self.prefetch_thread = threading.Thread(target=self._prefetch_worker)
+        self.prefetch_thread.daemon = True
+        self.prefetch_thread.start()
+        
+    def _prefetch_worker(self):
+        try:
+            batch = next(self.iterator)
+            load_time = time.time() - self.load_start_time
+            self.prefetch_queue.put(('data', batch, load_time))
+        except StopIteration:
+            self.prefetch_queue.put(('stop', None, 0))
+        except Exception as e:
+            self.prefetch_queue.put(('error', e, 0))
+    
+    def get_next_batch(self):
+        wait_start = time.time()
+        status, data, load_time = self.prefetch_queue.get()
+        wait_time = time.time() - wait_start
+        
+        if status == 'stop':
+            return None, wait_time, load_time
+        elif status == 'error':
+            raise data
+        
+        self.current_batch_start += 1
+        self._start_prefetch()
+        return data, wait_time, load_time
+
 
 class TrainingState:
     """Manages saving and loading of complete training state with atomic writes."""
@@ -55,26 +150,8 @@ class TrainingState:
         # Atomic save: write to temp file, then rename
         temp_file = checkpoint_file.with_suffix('.tmp')
         torch.save(checkpoint, temp_file)
+        os.replace(temp_file, checkpoint_file)
         
-        # Retry rename with exponential backoff
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                os.replace(temp_file, checkpoint_file)
-                break
-            except (PermissionError, OSError) as e:
-                if attempt < max_retries - 1:
-                    time.sleep(0.1 * (2 ** attempt))  # Exponential backoff
-                else:
-                    # If rename fails, try copy as fallback
-                    try:
-                        import shutil
-                        shutil.copy2(temp_file, checkpoint_file)
-                        os.remove(temp_file)
-                    except:
-                        raise e
-        
-        # Save state info with retry
         state_info = {
             'latest_checkpoint': str(checkpoint_file),
             'version': 4,
@@ -86,25 +163,11 @@ class TrainingState:
             'is_emergency': is_emergency,
         }
         
-        # Atomic state file update with retry
+        # Atomic state file update
         temp_state = self.state_file.with_suffix('.tmp')
         with open(temp_state, 'w') as f:
             json.dump(state_info, f, indent=2)
-        
-        for attempt in range(max_retries):
-            try:
-                os.replace(temp_state, self.state_file)
-                break
-            except (PermissionError, OSError) as e:
-                if attempt < max_retries - 1:
-                    time.sleep(0.1 * (2 ** attempt))
-                else:
-                    # If rename fails, write directly with a different name
-                    fallback_file = self.save_dir / f'training_state_{timestamp}.json'
-                    with open(fallback_file, 'w') as f:
-                        json.dump(state_info, f, indent=2)
-                    print(f"⚠ State file saved as fallback: {fallback_file}")
-                    break
+        os.replace(temp_state, self.state_file)
         
         self._cleanup_old_checkpoints()
         
@@ -183,19 +246,17 @@ class TrainingState:
         )
         
         for old_file in all_checkpoints[self.max_checkpoints:]:
-            try:
-                old_file.unlink()
-            except:
-                pass
+            old_file.unlink()
 
-
-# ═══════════════════════════════════════════════════════════
-# RESUMABLE TRAINER
-# ═══════════════════════════════════════════════════════════
 
 class ResumableTrainer:
     """
-    Trainer with robust handling of all interruption scenarios.
+    Trainer with robust handling of all interruption scenarios:
+    - Normal run: Continuous training with periodic checkpoints
+    - Ctrl+C once: Graceful stop after current batch (save & exit)
+    - Ctrl+C twice: Force quit without saving
+    - SIGTERM: Cloud preemption - emergency save immediately
+    - Power failure: atexit emergency save (best effort)
     """
     
     def __init__(self, model, loss_fn, optimizer, dataloader, 
@@ -447,13 +508,6 @@ class ResumableTrainer:
             X, Y = batch
             X, Y = X.to(self.device), Y.to(self.device)
             
-            # Check if X is 3D (batch, features, time) and transpose if needed
-            if X.dim() == 3:
-                # Model expects (B, T, F) but we have (B, F, T)
-                # Transpose to (B, T, F)
-                X = X.transpose(1, 2)  # (B, F, T) -> (B, T, F)
-            # If X is 2D (batch, features), keep as is for dummy model
-            
             self.optimizer.zero_grad()
             P = self.model(X)
             L = self.loss_fn(P, X, Y)
@@ -508,109 +562,106 @@ class ResumableTrainer:
 
 
 # ═══════════════════════════════════════════════════════════
-# DEMO
+# DATASETS AND MODELS
+# ═══════════════════════════════════════════════════════════
+
+class SimpleDataset(Dataset):
+    """Simple dataset for testing."""
+    def __init__(self, size=1000, input_dim=10, output_dim=5):
+        self.size = size
+        self.X = torch.randn(size, input_dim)
+        self.Y = torch.randn(size, output_dim)
+    
+    def __len__(self):  
+        return self.size
+    
+    def __getitem__(self, idx):
+        return self.X[idx], self.Y[idx]
+
+
+class SimpleModel(nn.Module):
+    """Simple neural network model."""
+    def __init__(self, input_dim=10, hidden_dim=20, output_dim=5):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.relu = nn.ReLU()
+    
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        return self.fc2(x)
+
+
+def custom_loss(P, X, Y):
+    """Custom loss function."""
+    return nn.functional.mse_loss(P, Y)
+
+
+# ═══════════════════════════════════════════════════════════
+# MAIN
 # ═══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("TRAINER MODULE DEMO")
-    print("=" * 60)
+    import argparse
     
-    # Simple test setup with 3D data to match the real use case
-    class DummyModel(nn.Module):
-        def __init__(self, input_dim, output_dim):
-            super().__init__()
-            # For 3D input (B, T, F), we flatten and project
-            self.fc = nn.Linear(input_dim, output_dim)
-        
-        def forward(self, x):
-            # If x is 3D (B, T, F), flatten to (B, T*F)
-            if x.dim() == 3:
-                x = x.reshape(x.size(0), -1)  # Use reshape instead of view
-            return self.fc(x)
+    parser = argparse.ArgumentParser(description='Resilient Training')
+    parser.add_argument('--epochs', type=int, default=10, help='Number of epochs')
+    parser.add_argument('--save-every', type=int, default=10, help='Save every N minibatches')
+    parser.add_argument('--clean', action='store_true', help='Delete old checkpoints')
+    parser.add_argument('--dataset-size', type=int, default=500, help='Dataset size')
+    parser.add_argument('--batch-size', type=int, default=8, help='Batch size')
+    args = parser.parse_args()
     
-    # Create dummy data
-    input_dim = 10  # This is T * F for 3D data
-    output_dim = 2
-    batch_size = 4
-    T = 5   # time steps
-    F = 2   # features
-    total_samples = 100
+    CHECKPOINT_DIR = 'training_checkpoints'
     
-    model = DummyModel(T * F, output_dim)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    # Clean start if requested
+    if args.clean and Path(CHECKPOINT_DIR).exists():
+        import shutil
+        shutil.rmtree(CHECKPOINT_DIR)
+        print("Cleaned previous checkpoints.\n")
     
-    # Create dummy dataset that returns 3D tensors (B, F, T)
-    class DummyDataset:
-        def __len__(self): 
-            return total_samples
-        def __getitem__(self, idx): 
-            # Return (B, F, T) shape to simulate real data
-            x = torch.randn(F, T)  # (F, T)
-            y = torch.randn(output_dim)
-            return x, y
-    
-    class DummyLoader:
-        def __init__(self):
-            self.dataset = DummyDataset()
-            self.batch_size = batch_size
-            self.current_epoch_indices = list(range(total_samples))
-            self.current_batch_start = 0
-            self.dataset_len = total_samples
-        
-        def start_epoch(self, epoch, resume_indices=None, resume_batch_start=0):
-            self.current_batch_start = resume_batch_start
-            if resume_indices is not None:
-                self.current_epoch_indices = resume_indices
-        
-        def get_total_batches_in_epoch(self):
-            return math.ceil(self.dataset_len / self.batch_size)
-        
-        def get_next_batch(self):
-            if self.current_batch_start >= self.get_total_batches_in_epoch():
-                return None, 0, 0
-            
-            # Generate batch of 3D data (B, F, T)
-            remaining = self.dataset_len - self.current_batch_start * self.batch_size
-            batch_size = min(self.batch_size, remaining)
-            X_batch = torch.randn(batch_size, F, T)
-            Y_batch = torch.randn(batch_size, output_dim)
-            self.current_batch_start += 1
-            return (X_batch, Y_batch), 0.001, 0.001
-        
-        def get_state(self):
-            return {
-                'epoch_indices': self.current_epoch_indices,
-                'batch_start': self.current_batch_start
-            }
-        
-        def restore_state(self, state):
-            self.current_epoch_indices = state['epoch_indices']
-            self.current_batch_start = state['batch_start']
-    
-    dataloader = DummyLoader()
-    
-    def dummy_loss(P, X, Y):
-        return nn.functional.mse_loss(P, Y)
+    # Create dataset, model, dataloader, optimizer
+    dataset = SimpleDataset(size=args.dataset_size, input_dim=10, output_dim=5)
+    model = SimpleModel(input_dim=10, hidden_dim=20, output_dim=5)
+    dataloader = ThreadedDataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
     
     # Create trainer
     trainer = ResumableTrainer(
         model=model,
-        loss_fn=dummy_loss,
+        loss_fn=custom_loss,
         optimizer=optimizer,
         dataloader=dataloader,
-        save_dir='test_checkpoints',
+        save_dir=CHECKPOINT_DIR,
         device='cpu',
-        save_every_n_minibatches=5
+        save_every_n_minibatches=args.save_every
     )
     
-    print("\nRunning test training for 2 epochs...")
-    trainer.train(num_epochs=2, resume=False)
+    # Show status
+    print("=" * 60)
+    print("RESILIENT TRAINING")
+    print("=" * 60)
+    print(f"Dataset: {args.dataset_size} samples, batch size: {args.batch_size}")
+    print(f"Epochs: {args.epochs}")
+    print(f"Minibatches per epoch: {math.ceil(args.dataset_size / args.batch_size)}")
+    print(f"Save every: {args.save_every} minibatches")
+    print(f"Checkpoints: {CHECKPOINT_DIR}/")
+    print("=" * 60)
     
-    # Clean up test checkpoints
-    import shutil
-    if Path('test_checkpoints').exists():
-        shutil.rmtree('test_checkpoints')
-        print("\nCleaned up test checkpoints.")
+    # Check for existing checkpoint
+    state_file = Path(CHECKPOINT_DIR) / 'training_state.json'
+    if state_file.exists():
+        try:
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+            print(f"Found previous checkpoint at minibatch {state['total_minibatches_processed']}")
+            print(f"Epoch {state['epoch']+1}, batch {state['batch_idx']}")
+        except:
+            pass
+    else:
+        print("No previous checkpoint - fresh start")
     
-    print("\nTrainer module demo complete!")
+    print()
+    
+    # Train
+    trainer.train(num_epochs=args.epochs, resume=True)

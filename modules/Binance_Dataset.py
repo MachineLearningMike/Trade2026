@@ -19,7 +19,7 @@ class Binance_Dataset:
         self.mark_mean = np.array([6.5, 16, 3, 11.5, 29.5])
         self.mark_std = np.array([pow((n-m)*(n-m+2)/12, 0.5) for (m, n) in [(1, 12), (1, 31), (0, 6), (0, 23), (0, 59)]])   # population std
         
-        self.binance = Binance.instantiate()
+        self.binance = Binance.instantiate(connect=False)
         
     def get_paths(self, start_utc):
         folder_path = Path(self.save_dir) / str(start_utc.year).zfill(4) / str(start_utc.month).zfill(2) / str(start_utc.day).zfill(2)
