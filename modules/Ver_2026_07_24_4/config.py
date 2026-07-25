@@ -19,12 +19,13 @@ config = {
     
     # Number of features (F) in the input data
     'num_features': 5,
+
+    # Number of shape parameters of the distribution of a market feature
+    # Generalize it to transition params, later
+    'num_shapes': 4,
     
     # Total days of synthetic data to generate (for testing)
     'total_days': 30,
-    
-    # Index of the price feature in the features list (0-based)
-    'price_feature_idx': 0,
     
     
     # ============================================================
@@ -37,11 +38,11 @@ config = {
     'binance_start_date': '2024-01-01',
     'binance_end_date': '2026-06-30',
     'binance_symbols': {
-        "ETHUSDT": ["High", "Low", "Close", "Volume"],
-        "BTCUSDT": ["Close"]
+        "BTCUSDT": ["High", "Low", "Close", "Volume"],
+        "ETHUSDT": ["Close"]
     },
-    'binance_primary_symbol': "ETHUSDT",
-    
+    'binance_primary_symbol': "BTCUSDT",
+    'binance_primary_feature': "Close",    
     
     # ============================================================
     # HORIZON LABELING CONFIGURATION
@@ -71,10 +72,10 @@ config = {
     # TRANSFORMER CONFIGURATION
     # ============================================================
     
-    'patch_size': 30,
+    'patch_size': 15,
     'embed_dim': None,  # AUTO-COMPUTED
     'num_layers': 8,
-    'num_heads': 8,
+    'num_heads': 4,
     'ff_dim': 256,
     'dropout': 0.1,
     'causal': False,
@@ -93,10 +94,10 @@ config = {
     # TRAINING CONFIGURATION
     # ============================================================
     
-    'epochs': 5,
+    'epochs': 10,
     'batch_size': 32,
     'learning_rate': 0.001,
-    'save_every_n_minibatches': 50,
+    'save_every_n_minibatches': 100,
     'checkpoint_dir': 'trading_checkpoints',
     'max_checkpoints': 3,
     
@@ -120,10 +121,10 @@ config = {
     # LOSS CONFIGURATION
     # ============================================================
     
-    'slope_loss_weight': 0.1,
-    'intercept_loss_weight': 0.01,
+    'slope_loss_weight': 1.0,
+    'intercept_loss_weight': 1.0,
     'reconstruction_loss_weight': 0.01,
-    'use_reconstruction': True,
+    'use_reconstruction': False,
 }
 
 

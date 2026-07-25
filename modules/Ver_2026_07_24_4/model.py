@@ -171,10 +171,13 @@ class MarketTransformerWithHeads(nn.Module):
         mask = mask.masked_fill(~mask.bool(), 0.0)
         return mask
 
-    def forward(self, x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor, shape: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
             x: (B, T, F) — raw market data. T must be divisible by patch_size.
+            mean: (B, F)
+            std: (B, F)
+            shape: (B, F, config['num_shaps'])
 
         Returns:
             predictions: (B, 3) — [horizon, slope, intercept]

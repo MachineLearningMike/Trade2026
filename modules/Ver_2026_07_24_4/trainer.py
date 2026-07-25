@@ -522,16 +522,16 @@ class ResumableTrainer:
                 break
             
             compute_start = time.time()
-            
-            X, Y, MEAN, STD = batch
-            X, Y = X.to(self.device), Y.to(self.device)
+
+            x, y, mean, std, shape = batch
+            x, y = x.to(self.device), y.to(self.device)
 
             # Model expects (B, T, F) but we have (B, F, T)
-            X = X.transpose(1, 2)  # (B, F, T) -> (B, T, F)
+            x = x.transpose(1, 2)  # (B, F, T) -> (B, T, F)
             
             self.optimizer.zero_grad()
-            P = self.model(X, MEAN, STD)
-            L = self.loss_fn(P, X, Y)
+            P = self.model(x, mean, std, shape)
+            L = self.loss_fn(P, x, y)
             L.backward()
             self.optimizer.step()
             

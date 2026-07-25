@@ -14,6 +14,7 @@ from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
 import pickle
 import hashlib
+import matplotlib.pyplot as plt
 from config import get_config
 
 
@@ -68,7 +69,7 @@ def find_shortest_horizon(
         segment = prices[:horizon]
         
         # Time indices starting from 0
-        t = torch.arange(h, dtype=torch.float32, device=device)
+        t = torch.arange(horizon, dtype=torch.float32, device=device)
         
         # Fit linear trend CONSTRAINED through f[0]: y = m*t + f[0]
         y_centered = segment - f0
@@ -121,6 +122,102 @@ def find_shortest_horizon(
 
 
 # ═══════════════════════════════════════════════════════════
+# VISUALIZATION FUNCTION
+# ═══════════════════════════════════════════════════════════
+
+def visualize_linear_trends(
+    total_tensor: torch.Tensor,
+    valid_starts: List[int],
+    labels: List[Dict[str, Any]],
+    price_feature_idx: int,
+    past_window: int,
+    future_window: int,
+    num_samples: int = 6,
+    figsize: Tuple[int, int] = (15, 10)
+):
+    """
+    Visualize linear trends (horizon, slope, intercept) for randomly selected samples.
+    
+    Args:
+        total_tensor: Full price tensor of shape (F, T)
+        valid_starts: List of valid start indices
+        labels: List of label dictionaries containing horizon, slope, intercept
+        price_feature_idx: Index of the price feature
+        past_window: Number of past minutes
+        future_window: Number of future minutes
+        num_samples: Number of samples to visualize (must be even, for 2 rows)
+        figsize: Figure size
+    """
+    if num_samples % 2 != 0:
+        num_samples = 6  # Default to 6 for 2x3 grid
+    
+    # Randomly select samples
+    indices = random.sample(range(len(labels)), min(num_samples, len(labels)))
+    num_samples = len(indices)
+    n_cols = 3
+    n_rows = (num_samples + n_cols - 1) // n_cols
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+    axes = axes.flatten() if num_samples > 1 else [axes]
+    
+    for i, idx in enumerate(indices):
+        if i >= len(axes):
+            break
+            
+        ax = axes[i]
+        start = valid_starts[idx]
+        label = labels[idx]
+        
+        # Extract data
+        horizon = label['horizon']
+        slope = label['slope']
+        intercept = label['intercept']
+        cum_dev = label['cumulative_deviation']
+        threshold_reached = label['threshold_reached']
+        
+        # Get future prices
+        y_start = start + past_window
+        y_end = y_start + future_window
+        future_prices = total_tensor[price_feature_idx, y_start:y_end].cpu().numpy()
+        
+        # Plot future prices
+        time_steps = np.arange(future_window)
+        ax.plot(time_steps, future_prices, 'b-', linewidth=2, label='Actual Prices', alpha=0.7)
+        
+        # Plot trend line up to horizon
+        if horizon > 0:
+            trend_t = np.arange(horizon)
+            trend_prices = slope * trend_t + intercept
+            ax.plot(trend_t, trend_prices, 'r-', linewidth=2.5, 
+                   label=f'Trend: y={slope:.4f}t+{intercept:.2f}')
+            
+            # Mark horizon
+            ax.axvline(x=horizon - 1, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+            ax.axvline(x=0, color='green', linestyle=':', linewidth=1.5, alpha=0.5)
+            
+            # Fill the horizon region
+            ax.axvspan(0, horizon - 1, alpha=0.15, color='orange')
+        
+        # Annotate
+        ax.set_title(f'Sample {idx+1}: H={horizon}, m={slope:.4f}, b={intercept:.2f}\n'
+                    f'Cum Dev={cum_dev:.2f}, Reached={threshold_reached}',
+                    fontsize=10)
+        ax.set_xlabel('Time (minutes)')
+        ax.set_ylabel('Price')
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8, loc='best')
+    
+    # Hide unused subplots
+    for i in range(len(indices), len(axes)):
+        axes[i].set_visible(False)
+    
+    plt.suptitle('Linear Trend Visualization (Constrained through f[0])', 
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+
+
+# ═══════════════════════════════════════════════════════════
 # TRADING DATASET WITH PER-WINDOW NORMALIZATION AND CACHING
 # ═══════════════════════════════════════════════════════════
 
@@ -140,10 +237,14 @@ class TradingDataset(Dataset):
         device: str = 'cpu',
         normalize: bool = True,
         cache_dir: Optional[str] = None,
-        force_recompute: bool = False
+        force_recompute: bool = False,
+        visualize: bool = True
     ):
         """
         Initialize the trading dataset with per-window normalization and caching.
+        
+        Args:
+            visualize: Whether to visualize linear trends after label computation
         """
         self.past_days = past_days
         self.future_minutes = future_minutes
@@ -155,6 +256,7 @@ class TradingDataset(Dataset):
         self.device = device
         self.normalize = normalize
         self.force_recompute = force_recompute
+        self.visualize = visualize
         
         # Set cache directory - use config if not provided
         if cache_dir is None:
@@ -186,7 +288,24 @@ class TradingDataset(Dataset):
         # Load or compute labels and normalization parameters
         self.labels, self.norm_params = self._load_or_compute_labels()
         
-        print(f"TradingDataset initialized:")
+        # ============================================================
+        # VISUALIZE - ALWAYS, even when loading from cache
+        # ============================================================
+        if self.visualize and len(self.labels) > 0:
+            print("\n" + "="*60)
+            print("VISUALIZING LINEAR TRENDS")
+            print("="*60)
+            visualize_linear_trends(
+                total_tensor=self.Total,
+                valid_starts=self.valid_starts,
+                labels=self.labels,
+                price_feature_idx=self.price_feature_idx,
+                past_window=self.past_window,
+                future_window=self.future_window,
+                num_samples=6
+            )
+        
+        print(f"\nTradingDataset initialized:")
         print(f"  Features: {self.F}, Time steps: {self.T}")
         print(f"  Past window: {self.past_window} minutes ({past_days} days)")
         print(f"  Future window: {self.future_window} minutes")
@@ -243,22 +362,146 @@ class TradingDataset(Dataset):
         hash_obj = hashlib.md5(params.encode())
         return hash_obj.hexdigest()[:16]
     
-    def _normalize_window(self, window: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+    # def _normalize_window(self, window: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    #     """
+    #     Normalize a window by its mean and std.
+    #     """
+    #     mean = window.mean(dim=1, keepdim=True)  # (F, 1)
+    #     std = window.std(dim=1, keepdim=True)    # (F, 1)
+    #     std[std == 0] = 1  # Avoid division by zero
+        
+    #     normalized = (window - mean) / std
+        
+    #     norm_params = {
+    #         'mean': mean.squeeze(),  # (F,)
+    #         'std': std.squeeze()     # (F,)
+    #     }
+        
+    #     return normalized, norm_params
+
+    # def _normalize_window(self, window: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    #     """
+    #     Normalize a window by its mean and std, and return moments 1st-6th.
+        
+    #     Args:
+    #         window: Input tensor of shape (F, T) where F=features, T=time steps
+            
+    #     Returns:
+    #         normalized: Normalized window (F, T)
+    #         norm_params: Dictionary with all moment statistics
+    #     """
+    #     # Compute mean and std (same units as data)
+    #     mean = window.mean(dim=1, keepdim=True)  # (F, 1)
+    #     std = window.std(dim=1, keepdim=True)    # (F, 1)
+    #     std[std == 0] = 1  # Avoid division by zero
+        
+    #     # Normalize
+    #     normalized = (window - mean) / std
+        
+    #     # Central moments (have units: data^k)
+    #     # All computed with keepdim=False to get shape (F,)
+    #     centered = window - mean  # (F, T)
+        
+    #     m2 = (centered ** 2).mean(dim=1)  # (F,) - variance (units²)
+    #     m3 = (centered ** 3).mean(dim=1)  # (F,) - units³
+    #     m4 = (centered ** 4).mean(dim=1)  # (F,) - units⁴
+    #     m5 = (centered ** 5).mean(dim=1)  # (F,) - units⁵
+    #     m6 = (centered ** 6).mean(dim=1)  # (F,) - units⁶
+        
+    #     # Standardized moments (dimensionless)
+    #     # Safe division: std is guaranteed > 0 from earlier
+    #     std_squeezed = std.squeeze()  # (F,)
+        
+    #     skewness = m3 / (std_squeezed ** 3)      # (F,) - 3rd standardized
+    #     kurtosis = m4 / (std_squeezed ** 4)      # (F,) - 4th standardized
+    #     moment_5th_standardized = m5 / (std_squeezed ** 5)  # (F,)
+    #     moment_6th_standardized = m6 / (std_squeezed ** 6)  # (F,)
+        
+    #     # Store all moments (as you chose: store_all = {mean, std, variance, skewness, kurtosis, ...})
+    #     norm_params = {
+    #         # 1st order (raw moment - has units)
+    #         'mean': mean.squeeze(),  # (F,)
+            
+    #         # 2nd order (central moment - has units²)
+    #         'variance': m2,  # (F,)
+            
+    #         # 2nd order (sqrt of central moment - has same units as data)
+    #         'std': std_squeezed,  # (F,)
+            
+    #         # 3rd order (central moment - has units³)
+    #         'moment_3rd_central': m3,  # (F,)
+            
+    #         # 3rd order (standardized - dimensionless)
+    #         'skewness': skewness,  # (F,)
+            
+    #         # 4th order (central moment - has units⁴)
+    #         'moment_4th_central': m4,  # (F,)
+            
+    #         # 4th order (standardized - dimensionless)
+    #         'kurtosis': kurtosis,  # (F,)
+            
+    #         # 5th order (central moment - has units⁵)
+    #         'moment_5th_central': m5,  # (F,)
+            
+    #         # 5th order (standardized - dimensionless)
+    #         'moment_5th_standardized': moment_5th_standardized,  # (F,)
+            
+    #         # 6th order (central moment - has units⁶)
+    #         'moment_6th_central': m6,  # (F,)
+            
+    #         # 6th order (standardized - dimensionless)
+    #         'moment_6th_standardized': moment_6th_standardized,  # (F,)
+            
+    #         # Additional useful stats for 10080 samples
+    #         'n_samples': torch.tensor(window.size(1), device=window.device),  # 10080
+    #     }
+        
+    #     return normalized, norm_params
+
+    def _normalize_window(self, window: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Normalize a window by its mean and std.
+        Normalize a window and compute moments 1st-6th.
+        Uses root-transformed standardized moments for intuitive scaling.
         """
-        mean = window.mean(dim=1, keepdim=True)  # (F, 1)
-        std = window.std(dim=1, keepdim=True)    # (F, 1)
-        std[std == 0] = 1  # Avoid division by zero
+        mean = window.mean(dim=1, keepdim=True)
+        std = window.std(dim=1, keepdim=True)
+        std[std == 0] = 1
         
         normalized = (window - mean) / std
         
-        norm_params = {
-            'mean': mean.squeeze(),  # (F,)
-            'std': std.squeeze()     # (F,)
-        }
+        centered = window - mean
+        n = window.size(1)  # 10080
         
-        return normalized, norm_params
+        # Central moments (have units: data^k)
+        # m1 = (centered).mean(dim=1)  # Should be ~0
+        # m2 = (centered ** 2).mean(dim=1)  # variance σ²
+        m3 = (centered ** 3).mean(dim=1)
+        m4 = (centered ** 4).mean(dim=1)
+        m5 = (centered ** 5).mean(dim=1)
+        m6 = (centered ** 6).mean(dim=1)
+        
+        std_sq = std.squeeze().clamp(min=1e-6)  # Avoid division by zero
+        
+        # Helper for signed roots
+        def signed_root(x, power):
+            return torch.sign(x) * (torch.abs(x) ** (1/power))
+        
+        # ROOT-TRANSFORMED STANDARDIZED MOMENTS (same units as data)
+        # These are MORE INTUITIVE and better for ML!
+        # ms1 = signed_root(m1, 1) / std_sq      # (m1)^(1/1)/σ  = (m1/σ)^(1/1) == 0
+        # ms2 = signed_root(m2, 2) / std_sq      # (m2)^(1/2)/σ  = (m2/σ²)^(1/2) == 1
+        ms3 = signed_root(m3, 3) / std_sq        # (m3)^(1/3)/σ  = (m3/σ³)^(1/3)
+        ms4 = signed_root(m4, 4) / std_sq        # (m4)^(1/4)/σ  = (m4/σ⁴)^(1/4)
+        ms5 = signed_root(m5, 5) / std_sq        # (m5)^(1/5)/σ
+        ms6 = signed_root(m6, 6) / std_sq        # (m6)^(1/6)/σ
+        
+        mean = mean.squeeze()  # shape (F,)
+        std = std.squeeze()    # shape (F,)
+
+        # Stack: [ms3, ms4, ms5, ms6] -> shape (4, F)
+        shape_params = torch.stack([ms3, ms4, ms5, ms6,], dim=0)
+        
+        return normalized, mean, std, shape_params
     
     def _compute_labels_and_norm_params(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Pre-compute horizon labels and normalization parameters for all samples."""
@@ -307,7 +550,7 @@ class TradingDataset(Dataset):
             labels.append({
                 'horizon': h,
                 'slope': m,
-                'intercept': b,  # <-- INTERCEPT INCLUDED
+                'intercept': b,
                 'cumulative_deviation': cum,
                 'threshold_reached': cum >= self.max_accum_deviation,
             })
@@ -572,7 +815,7 @@ if __name__ == "__main__":
         else:
             features.append(np.random.randn(T).astype(np.float32))
     
-    # Create dataset with caching
+    # Create dataset with caching and visualization
     dataset = TradingDataset(
         features=features,
         price_feature_idx=config['price_feature_idx'],
@@ -585,7 +828,8 @@ if __name__ == "__main__":
         device=device,
         normalize=config['normalize'],
         cache_dir=config.get('cache_dir', 'dataset_cache'),
-        force_recompute=config.get('force_recompute', False)
+        force_recompute=config.get('force_recompute', False),
+        visualize=True  # Enable visualization
     )
     
     # Test dataloader

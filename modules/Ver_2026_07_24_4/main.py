@@ -75,6 +75,7 @@ def get_binance_data(config):
         start_date = config['binance_start_date']
         end_date = config['binance_end_date']
         symbol_dict = config['binance_symbols']
+        target = (config['binance_primary_symbol'], config['binance_primary_feature'])
         
         start = datetime.strptime(start_date, '%Y-%m-%d')
         end = datetime.strptime(end_date, '%Y-%m-%d')
@@ -85,8 +86,8 @@ def get_binance_data(config):
         print(f"  Start: {start_date}")
         print(f"  End: {end_date}")
         print(f"  Symbols: {list(symbol_dict.keys())}")
-        
-        features, nForget = bn.get_combined_history(datatype, interval, start, end, symbol_dict)
+
+        features, nForget, target_feature_id = bn.get_combined_history_2(datatype, interval, start, end, symbol_dict, target)
         
         T = features[0].shape[0] if len(features) > 0 else 0
         for feature in features:
@@ -96,12 +97,13 @@ def get_binance_data(config):
         print(f"  Number of features: {len(features)}")
         print(f"  Time points: {T}")
         print(f"  Forgotten points: {nForget}")
-        
-        return features, T, nForget
+        print(f"  Target feature Id: {target_feature_id}")
+
+        return features, T, nForget, target_feature_id
         
     except Exception as e:
         print(f"⚠ Error fetching Binance data: {e}")
-        return None, None, None
+        return None, None, None, None
 
 
 def main():
@@ -135,7 +137,7 @@ def main():
     parser.add_argument('--dropout', type=float, default=config['dropout'], help='Dropout rate')
     parser.add_argument('--head-hidden-dim', type=int, default=config['head_hidden_dim'], help='Hidden dimension for prediction heads')
     parser.add_argument('--no-causal', action='store_true', default=not config['causal'], help='Disable causal attention')
-    parser.add_argument('--no-reconstruction', action='store_true', help='Disable reconstruction auxiliary loss')
+    parser.add_argument('--no-reconstruction', action='store_true', default=not config['use_reconstruction'], help='Disable reconstruction auxiliary loss')
     parser.add_argument('--use-binance', action='store_true', default=config['use_binance_data'], 
                        help='Use real Binance data instead of synthetic')
     parser.add_argument('--symbol', type=str, default=config['binance_primary_symbol'], 
@@ -248,8 +250,8 @@ def main():
     features = None
     
     if config['use_binance_data'] and Binance is not None:
-        features, T, nForget = get_binance_data(config)
-        if features is None:
+        features, T, nForget, target_feature_id = get_binance_data(config)
+        if features is None or target_feature_id is None:
             print("⚠ Failed to fetch Binance data. Falling back to synthetic data.")
     
     if features is None:
@@ -267,7 +269,7 @@ def main():
     # ============================================================
     dataset = TradingDataset(
         features=features,
-        price_feature_idx=config['price_feature_idx'],
+        price_feature_idx=target_feature_id,
         past_days=config['past_days'],
         future_minutes=config['future_minutes'],
         step=config['step'],

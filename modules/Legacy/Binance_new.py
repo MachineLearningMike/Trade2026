@@ -1296,6 +1296,32 @@ class Binance():
 
         return features_to_return, nForged
 
+    def get_combined_history_2(self, datatype, interval, start, end, symbol_dict, target):
+
+        features_to_return, nForged, target_feature_id = [], 0, None
+
+        target_symbol, target_feature = target
+
+        feature_id = 0
+        for symbol in symbol_dict.keys():
+            features = symbol_dict[symbol]
+
+            feature_list = self.GetFeatureList()
+
+            candles, nFills, successful, _, reason = self.Get_Price_Data_By_Time(datatype, symbol, interval, start, end)
+            print(reason if reason else "No reason provided.")
+            if successful:          # price is a numpy array.
+                print("Successful !!!!!!!!!! (nCandles, nAttributes) = {}, nForged = {}".format(candles.shape, nFills))
+                nForged += nFills
+
+                for feature in features:
+                    features_to_return.append(candles[:, feature_list.index(feature)])
+                    if symbol == target_symbol and feature == target_feature:
+                        target_feature_id = feature_id
+                    feature_id += 1
+
+        return features_to_return, nForged, target_feature_id
+
 
 if __name__ == "__main__":
     
