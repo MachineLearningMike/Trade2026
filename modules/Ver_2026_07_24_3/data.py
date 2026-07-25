@@ -14,6 +14,7 @@ from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
 import pickle
 import hashlib
+import matplotlib.pyplot as plt
 from config import get_config
 
 
@@ -68,7 +69,7 @@ def find_shortest_horizon(
         segment = prices[:horizon]
         
         # Time indices starting from 0
-        t = torch.arange(h, dtype=torch.float32, device=device)
+        t = torch.arange(horizon, dtype=torch.float32, device=device)
         
         # Fit linear trend CONSTRAINED through f[0]: y = m*t + f[0]
         y_centered = segment - f0
@@ -121,6 +122,102 @@ def find_shortest_horizon(
 
 
 # ═══════════════════════════════════════════════════════════
+# VISUALIZATION FUNCTION
+# ═══════════════════════════════════════════════════════════
+
+def visualize_linear_trends(
+    total_tensor: torch.Tensor,
+    valid_starts: List[int],
+    labels: List[Dict[str, Any]],
+    price_feature_idx: int,
+    past_window: int,
+    future_window: int,
+    num_samples: int = 6,
+    figsize: Tuple[int, int] = (15, 10)
+):
+    """
+    Visualize linear trends (horizon, slope, intercept) for randomly selected samples.
+    
+    Args:
+        total_tensor: Full price tensor of shape (F, T)
+        valid_starts: List of valid start indices
+        labels: List of label dictionaries containing horizon, slope, intercept
+        price_feature_idx: Index of the price feature
+        past_window: Number of past minutes
+        future_window: Number of future minutes
+        num_samples: Number of samples to visualize (must be even, for 2 rows)
+        figsize: Figure size
+    """
+    if num_samples % 2 != 0:
+        num_samples = 6  # Default to 6 for 2x3 grid
+    
+    # Randomly select samples
+    indices = random.sample(range(len(labels)), min(num_samples, len(labels)))
+    num_samples = len(indices)
+    n_cols = 3
+    n_rows = (num_samples + n_cols - 1) // n_cols
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+    axes = axes.flatten() if num_samples > 1 else [axes]
+    
+    for i, idx in enumerate(indices):
+        if i >= len(axes):
+            break
+            
+        ax = axes[i]
+        start = valid_starts[idx]
+        label = labels[idx]
+        
+        # Extract data
+        horizon = label['horizon']
+        slope = label['slope']
+        intercept = label['intercept']
+        cum_dev = label['cumulative_deviation']
+        threshold_reached = label['threshold_reached']
+        
+        # Get future prices
+        y_start = start + past_window
+        y_end = y_start + future_window
+        future_prices = total_tensor[price_feature_idx, y_start:y_end].cpu().numpy()
+        
+        # Plot future prices
+        time_steps = np.arange(future_window)
+        ax.plot(time_steps, future_prices, 'b-', linewidth=2, label='Actual Prices', alpha=0.7)
+        
+        # Plot trend line up to horizon
+        if horizon > 0:
+            trend_t = np.arange(horizon)
+            trend_prices = slope * trend_t + intercept
+            ax.plot(trend_t, trend_prices, 'r-', linewidth=2.5, 
+                   label=f'Trend: y={slope:.4f}t+{intercept:.2f}')
+            
+            # Mark horizon
+            ax.axvline(x=horizon - 1, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+            ax.axvline(x=0, color='green', linestyle=':', linewidth=1.5, alpha=0.5)
+            
+            # Fill the horizon region
+            ax.axvspan(0, horizon - 1, alpha=0.15, color='orange')
+        
+        # Annotate
+        ax.set_title(f'Sample {idx+1}: H={horizon}, m={slope:.4f}, b={intercept:.2f}\n'
+                    f'Cum Dev={cum_dev:.2f}, Reached={threshold_reached}',
+                    fontsize=10)
+        ax.set_xlabel('Time (minutes)')
+        ax.set_ylabel('Price')
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8, loc='best')
+    
+    # Hide unused subplots
+    for i in range(len(indices), len(axes)):
+        axes[i].set_visible(False)
+    
+    plt.suptitle('Linear Trend Visualization (Constrained through f[0])', 
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+
+
+# ═══════════════════════════════════════════════════════════
 # TRADING DATASET WITH PER-WINDOW NORMALIZATION AND CACHING
 # ═══════════════════════════════════════════════════════════
 
@@ -140,10 +237,14 @@ class TradingDataset(Dataset):
         device: str = 'cpu',
         normalize: bool = True,
         cache_dir: Optional[str] = None,
-        force_recompute: bool = False
+        force_recompute: bool = False,
+        visualize: bool = True
     ):
         """
         Initialize the trading dataset with per-window normalization and caching.
+        
+        Args:
+            visualize: Whether to visualize linear trends after label computation
         """
         self.past_days = past_days
         self.future_minutes = future_minutes
@@ -155,6 +256,7 @@ class TradingDataset(Dataset):
         self.device = device
         self.normalize = normalize
         self.force_recompute = force_recompute
+        self.visualize = visualize
         
         # Set cache directory - use config if not provided
         if cache_dir is None:
@@ -186,7 +288,24 @@ class TradingDataset(Dataset):
         # Load or compute labels and normalization parameters
         self.labels, self.norm_params = self._load_or_compute_labels()
         
-        print(f"TradingDataset initialized:")
+        # ============================================================
+        # VISUALIZE - ALWAYS, even when loading from cache
+        # ============================================================
+        if self.visualize and len(self.labels) > 0:
+            print("\n" + "="*60)
+            print("VISUALIZING LINEAR TRENDS")
+            print("="*60)
+            visualize_linear_trends(
+                total_tensor=self.Total,
+                valid_starts=self.valid_starts,
+                labels=self.labels,
+                price_feature_idx=self.price_feature_idx,
+                past_window=self.past_window,
+                future_window=self.future_window,
+                num_samples=6
+            )
+        
+        print(f"\nTradingDataset initialized:")
         print(f"  Features: {self.F}, Time steps: {self.T}")
         print(f"  Past window: {self.past_window} minutes ({past_days} days)")
         print(f"  Future window: {self.future_window} minutes")
@@ -243,7 +362,7 @@ class TradingDataset(Dataset):
         hash_obj = hashlib.md5(params.encode())
         return hash_obj.hexdigest()[:16]
     
-    def _normalize_window(self, window: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def _normalize_window(self, window: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Normalize a window by its mean and std.
         """
@@ -307,7 +426,7 @@ class TradingDataset(Dataset):
             labels.append({
                 'horizon': h,
                 'slope': m,
-                'intercept': b,  # <-- INTERCEPT INCLUDED
+                'intercept': b,
                 'cumulative_deviation': cum,
                 'threshold_reached': cum >= self.max_accum_deviation,
             })
@@ -572,7 +691,7 @@ if __name__ == "__main__":
         else:
             features.append(np.random.randn(T).astype(np.float32))
     
-    # Create dataset with caching
+    # Create dataset with caching and visualization
     dataset = TradingDataset(
         features=features,
         price_feature_idx=config['price_feature_idx'],
@@ -585,7 +704,8 @@ if __name__ == "__main__":
         device=device,
         normalize=config['normalize'],
         cache_dir=config.get('cache_dir', 'dataset_cache'),
-        force_recompute=config.get('force_recompute', False)
+        force_recompute=config.get('force_recompute', False),
+        visualize=True  # Enable visualization
     )
     
     # Test dataloader

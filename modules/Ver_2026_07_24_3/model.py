@@ -171,7 +171,7 @@ class MarketTransformerWithHeads(nn.Module):
         mask = mask.masked_fill(~mask.bool(), 0.0)
         return mask
 
-    def forward(self, x: torch.Tensor, mean: Optional[torch.Tensor] = None, std: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
             x: (B, T, F) — raw market data. T must be divisible by patch_size.
@@ -212,6 +212,13 @@ class MarketTransformerWithHeads(nn.Module):
         aggregated = patch_map[:, -1, :]  # (B, D)
 
         # -------- 5. Prediction Head --------
+        # TODO: 
+        # exp_mean = torch.exp(-mean)     # We know price mean is positive.
+        # normal_mean = (exp_mean - mean_exp_mean) / std_exp_mean   # mean_exp_mean and std_exp_mean are precomputed from training data.
+
+        # exp_std = torch.exp(-std)     # We know std is positive.
+        # normal_std = (exp_std - mean_exp_std) / std_exp_std   # mean_exp_std and std_exp_std are precomputed from training data.
+
         predictions = self.prediction_head(aggregated)  # (B, 3)
 
         # -------- 6. Reconstruction (auxiliary) --------
