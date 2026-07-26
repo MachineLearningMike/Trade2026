@@ -77,10 +77,10 @@ config = {
     # ============================================================
     # TRANSFORMER CONFIGURATION
     # ============================================================
-    'patch_size': 15,
+    'patch_size': 30,
     'embed_dim': None,  # AUTO-COMPUTED
     'num_layers': 8,
-    'num_heads': 4,
+    'num_heads': 8,
     'ff_dim': 256,
     'dropout': 0.1,
     'causal': False,
@@ -98,7 +98,7 @@ config = {
     'epochs': 5,
     'batch_size': 32,
     'learning_rate': 0.001,
-    'save_every_n_minibatches': 100,
+    'save_every_n_minibatches': 50,
     'checkpoint_dir': 'trading_checkpoints',
     'max_checkpoints': 3,
     
@@ -114,7 +114,7 @@ config = {
     'clean': False,
     
     # ============================================================
-    # LOSS CONFIGURATION
+    # LOSS WEIGHT CONFIGURATION
     # ============================================================
     'slope_loss_weight': 1.0,
     'intercept_loss_weight': 1.0,

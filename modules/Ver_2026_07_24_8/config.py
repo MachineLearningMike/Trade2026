@@ -80,7 +80,7 @@ config = {
     # ============================================================
     # TRAINING CONFIGURATION
     # ============================================================
-    'epochs': 10,
+    'epochs': 5,
     'batch_size': 32,
     'learning_rate': 0.001,
     'save_every_n_minibatches': 100,

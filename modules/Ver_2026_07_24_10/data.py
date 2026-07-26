@@ -39,39 +39,27 @@ def get_weights(horizon: int, weight_type: str = 'exponential', decay: float = 0
     t = torch.arange(horizon, dtype=torch.float32)
     
     if weight_type == 'exponential':
-        # Exponential growth: t=horizon-1 gets highest weight, t=0 gets lowest
         weights = torch.exp(decay * t)
         weights = weights / weights.sum()
-        
     elif weight_type == 'linear':
-        # Linear: t=0 gets lowest weight, t=horizon-1 gets highest
         weights = torch.linspace(0.1, 1, horizon)
         weights = weights / weights.sum()
-        
     elif weight_type == 'sqrt':
-        # Square root: increasing weights
         weights = torch.sqrt(t + 1)
         weights = weights / weights.sum()
-        
     elif weight_type == 'sigmoid':
-        # Sigmoid: smooth transition from low to high
         mid = horizon / 2
         weights = 1 / (1 + torch.exp(-(t - mid) / (horizon / 6)))
         weights = weights + 0.1
         weights = weights / weights.sum()
-        
     elif weight_type == 'step':
-        # Step function: low weight for first half, high for second half
         weights = torch.ones(horizon)
         mid = horizon // 2
         weights[:mid] = 0.2
         weights = weights / weights.sum()
-        
     elif weight_type == 'none' or weight_type == 'uniform':
-        # Equal weights
         weights = torch.ones(horizon, dtype=torch.float32)
         weights = weights / weights.sum()
-        
     else:
         raise ValueError(f"Unknown weight_type: {weight_type}")
     
@@ -93,37 +81,8 @@ def find_shortest_horizon(
     weight_decay: float = 0.9,
     verbose: bool = False
 ) -> Tuple:
-    """
-    Find the SINGLE SHORTEST horizon where cumulative deviation reaches max_accum_deviation.
+    """Find the SINGLE SHORTEST horizon where cumulative deviation reaches max_accum_deviation."""
     
-    Supports three modes:
-        'floating'  - Unconstrained OLS fit (no anchor)
-        'anchored'  - Constrained to pass through f[0] (first future price)
-        'weighted'  - Weighted OLS with far future getting higher weights
-    
-    Args:
-        future_prices: Future price sequence, shape (future_length,)
-        max_accum_deviation: Threshold for cumulative absolute deviation
-        min_horizon: Minimum horizon to consider
-        max_horizon: Maximum horizon to consider
-        device: Device for computation
-        mode: 'floating', 'anchored', or 'weighted'
-        weight_type: Weighting scheme for 'weighted' mode
-        weight_decay: Decay factor for 'weighted' mode
-        verbose: Print detailed progress
-    
-    Returns:
-        horizon: The shortest horizon where cumulative deviation >= threshold
-        slope: Slope (m) at that horizon
-        intercept: Intercept (b) at that horizon
-        cumulative_deviation: The cumulative deviation at this horizon
-        all_horizons: List of all horizons tested
-        all_cum_devs: List of cumulative deviations for each horizon
-        all_slopes: List of slopes for each horizon
-        (additional returns for weighted mode: all_weights, all_intercepts)
-    """
-    
-    # Move to device and ensure 1D
     prices = future_prices.to(device)
     if prices.dim() > 1:
         prices = prices.squeeze()
@@ -146,25 +105,17 @@ def find_shortest_horizon(
         print(f"{'H':>4} | {'Slope':>12} | {'Cum Dev':>12} | {'Status':>15}")
         print("-" * 50)
     
-    # Search for the shortest horizon
     for h in range(min_horizon, max_horizon + 1):
-        # Get the segment
         segment = prices[:h]
-        
-        # Time indices starting from 0
         t = torch.arange(h, dtype=torch.float32, device=device)
         
         if mode == 'floating':
-            # ---- FLOATING MODE: Unconstrained OLS ----
             y_mean = segment.mean()
             t_mean = t.mean()
-            
             t_centered = t - t_mean
             y_centered = segment - y_mean
-            
             numerator = torch.sum(t_centered * y_centered)
             denominator = torch.sum(t_centered ** 2)
-            
             if denominator < 1e-10:
                 slope = 0.0
                 intercept = y_mean.item()
@@ -173,38 +124,27 @@ def find_shortest_horizon(
                 intercept = (y_mean - slope * t_mean).item()
             
         elif mode == 'anchored':
-            # ---- ANCHORED MODE: Constrained through f[0] ----
             f0 = prices[0].item()
             y_centered = segment - f0
             numerator = torch.sum(t * y_centered)
             denominator = torch.sum(t ** 2)
-            
             if denominator < 1e-10:
                 slope = 0.0
             else:
                 slope = (numerator / denominator).item()
-            
             intercept = f0
             
         elif mode == 'weighted':
-            # ---- WEIGHTED MODE: Weighted OLS ----
             weights = get_weights(h, weight_type, weight_decay)
             all_weights.append(weights.cpu().numpy())
-            
             w = weights.to(device)
-            
-            # Weighted means
             w_sum = w.sum()
             t_mean_w = torch.sum(w * t) / w_sum
             y_mean_w = torch.sum(w * segment) / w_sum
-            
-            # Weighted covariance and variance
             t_centered = t - t_mean_w
             y_centered = segment - y_mean_w
-            
             numerator = torch.sum(w * t_centered * y_centered)
             denominator = torch.sum(w * t_centered ** 2)
-            
             if denominator < 1e-10:
                 slope = 0.0
                 intercept = y_mean_w.item()
@@ -213,14 +153,12 @@ def find_shortest_horizon(
                 intercept = (y_mean_w - slope * t_mean_w).item()
         
         else:
-            raise ValueError(f"Unknown mode: {mode}. Choose 'floating', 'anchored', or 'weighted'")
+            raise ValueError(f"Unknown mode: {mode}")
         
-        # Calculate cumulative absolute deviation
         predicted = slope * t + intercept
         deviations = torch.abs(segment - predicted)
         cumulative_deviation = torch.sum(deviations).item()
         
-        # Store for analysis
         all_horizons.append(h)
         all_cum_devs.append(cumulative_deviation)
         all_slopes.append(slope)
@@ -230,7 +168,6 @@ def find_shortest_horizon(
             status = "✓ REACHED" if cumulative_deviation >= max_accum_deviation else "..."
             print(f"{h:>4} | {slope:>12.6f} | {cumulative_deviation:>12.4f} | {status:>15}")
         
-        # If we've reached the threshold, return this horizon
         if cumulative_deviation >= max_accum_deviation:
             if mode == 'weighted':
                 return h, slope, intercept, cumulative_deviation, all_horizons, all_cum_devs, all_weights, all_slopes, all_intercepts
@@ -320,6 +257,10 @@ def visualize_linear_trends(
     num_samples = min(num_samples, num_available)
     if num_samples % 2 != 0:
         num_samples = 6
+
+    # Set seed based on current second from epoch
+    seed = int(time.time())  # Current second
+    random.seed(seed)
     
     indices = random.sample(range(num_available), num_samples)
     n_cols = 3
@@ -344,7 +285,6 @@ def visualize_linear_trends(
         cum_dev = label[3].item()
         threshold_reached = label[4].item()
         
-        # Denormalize slope and intercept
         price_mean = mean[price_feature_idx].item()
         price_std = std[price_feature_idx].item()
         
@@ -423,7 +363,6 @@ class TradingDataset(Dataset):
         config = get_config()
         self.num_shapes = config['num_shapes']
         
-        # Horizon labeling mode
         self.horizon_mode = config.get('horizon_mode', 'anchored')
         self.weight_type = config.get('weight_type', 'exponential')
         self.weight_decay = config.get('weight_decay', 0.9)
@@ -462,6 +401,17 @@ class TradingDataset(Dataset):
         self.label_tensor, self.mean_tensor, self.std_tensor, self.shape_tensor = self._load_or_compute_labels()
         
         self._create_splits()
+        
+        # Cache local references for faster __getitem__
+        self._mean_tensor = self.mean_tensor
+        self._std_tensor = self.std_tensor
+        self._shape_tensor = self.shape_tensor
+        self._label_tensor = self.label_tensor
+        self._valid_starts = self.valid_starts
+        self._Total = self.Total
+        self._F = self.F
+        self._past_window = self.past_window
+        self._normalize = self.normalize
         
         if self.visualize and self.label_tensor.shape[0] > 0:
             print("\n" + "="*60)
@@ -575,10 +525,8 @@ class TradingDataset(Dataset):
         normalized = (window - mean) / std
         
         if not compute_moments:
-            # Fast path: just return normalized tensor, no stats
             return normalized, None, None, None
         
-        # Compute moments
         mean = mean.squeeze()
         std = std.squeeze()
         
@@ -632,12 +580,7 @@ class TradingDataset(Dataset):
             x = self.Total[:, start:start + self.past_window]
             
             if self.normalize:
-                # Compute everything once during initialization
-                x_normalized, mean, std, shape = self._normalize_window(
-                    x, 
-                    compute_moments=True
-                )
-                # Store stats only
+                x_normalized, mean, std, shape = self._normalize_window(x, compute_moments=True)
                 mean_list.append(mean)
                 std_list.append(std)
                 shape_list.append(shape)
@@ -655,14 +598,12 @@ class TradingDataset(Dataset):
             future_prices = self.Total[self.price_feature_idx, y_start:y_end]
             
             if self.normalize:
-                # Use the mean/std we just computed
                 price_mean = mean[self.price_feature_idx]
                 price_std = std[self.price_feature_idx]
                 future_prices_normalized = (future_prices - price_mean) / price_std
             else:
                 future_prices_normalized = future_prices
             
-            # Call the unified find_shortest_horizon with mode from config
             if self.horizon_mode == 'weighted':
                 h, m, b, cum, _, _, _, _, _ = find_shortest_horizon(
                     future_prices=future_prices_normalized,
@@ -780,151 +721,230 @@ class TradingDataset(Dataset):
         return len(self.valid_starts)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Get item - computes normalization fast, uses cached stats."""
+        """Optimized __getitem__ with cached references and view() instead of unsqueeze()."""
         
-        # Get the raw window
-        start = self.valid_starts[idx]
-        x = self.Total[:, start:start + self.past_window]
+        start = self._valid_starts[idx]
+        x = self._Total[:, start:start + self._past_window]
         
-        if self.normalize:
-            # Fast normalization: just subtract and divide (no expensive stats)
-            # Get cached stats
-            mean = self.mean_tensor[idx]
-            std = self.std_tensor[idx]
-            shape = self.shape_tensor[idx]
-            
-            # Normalize using cached stats (fast operation)
-            mean_expanded = mean.unsqueeze(1)  # (F, 1)
-            std_expanded = std.unsqueeze(1)    # (F, 1)
-            std_expanded[std_expanded == 0] = 1
-            
-            x_normalized = (x - mean_expanded) / std_expanded
+        if self._normalize:
+            # Use view() instead of unsqueeze() - no memory allocation
+            mean = self._mean_tensor[idx].view(-1, 1)
+            std = self._std_tensor[idx].view(-1, 1)
+            std[std == 0] = 1
+            x_normalized = (x - mean) / std
+            shape = self._shape_tensor[idx]
         else:
             x_normalized = x
-            mean = torch.zeros(self.F)
-            std = torch.ones(self.F)
-            shape = torch.zeros(self.F, self.num_shapes)
+            mean = torch.zeros(self._F)
+            std = torch.ones(self._F)
+            shape = torch.zeros(self._F, self.num_shapes)
         
-        # Get label
-        y = self.label_tensor[idx].clone().detach()
+        # No clone() - just return reference
+        y = self._label_tensor[idx]
         
         return x_normalized, y, mean, std, shape
 
 
 # ═══════════════════════════════════════════════════════════
-# THREADED DATA LOADER
+# OPTIMIZED THREADED DATA LOADER
 # ═══════════════════════════════════════════════════════════
 
 class ThreadedDataLoader:
-    """DataLoader that pre-fetches next batch in a separate thread."""
+    """Optimized DataLoader with reduced GIL contention and prefetching."""
     
-    def __init__(self, dataset, batch_size=32, shuffle=True):
+    def __init__(self, dataset, batch_size=32, shuffle=True, num_workers=1):
+        """
+        Args:
+            dataset: Dataset to load from
+            batch_size: Number of samples per batch
+            shuffle: Whether to shuffle indices
+            num_workers: Number of prefetch threads (keep at 1 to reduce GIL contention)
+        """
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.num_workers = max(1, min(num_workers, 2))  # Max 2 workers to reduce GIL contention
         
         self.current_epoch_indices = None
         self.current_batch_start = 0
+        self.epoch = 0
         
-        self.iterator = None
-        self.prefetch_queue = queue.Queue(maxsize=2)
+        # Smaller queue to reduce memory pressure
+        self.prefetch_queue = queue.Queue(maxsize=num_workers + 1)
         self.prefetch_thread = None
+        self.iterator = None
         self.load_start_time = None
+        self.running = False
         
     def start_epoch(self, epoch, resume_indices=None, resume_batch_start=0):
+        """Start a new epoch with optional resume."""
         self.epoch = epoch
         
-        if hasattr(self.dataset, 'indices'):
-            dataset_len = len(self.dataset)
-        else:
-            dataset_len = len(self.dataset)
+        dataset_len = len(self.dataset)
         
         if resume_indices is not None:
             self.current_epoch_indices = resume_indices
         else:
             self.current_epoch_indices = list(range(dataset_len))
             if self.shuffle:
+                random.seed(42 + epoch)
                 random.shuffle(self.current_epoch_indices)
         
         self.current_batch_start = resume_batch_start
+        self.running = True
         self._create_iterator()
         self._start_prefetch()
     
     def _create_iterator(self):
+        """Create a batch generator with minimal overhead."""
         start = self.current_batch_start * self.batch_size
         remaining_indices = self.current_epoch_indices[start:]
         self.iterator = self._batch_generator(remaining_indices)
     
     def _batch_generator(self, indices):
-        for i in range(0, len(indices), self.batch_size):
-            batch_indices = indices[i:i + self.batch_size]
+        """Generator that yields batches with minimal overhead."""
+        # Pre-allocate lists and cache method lookups
+        x_list = []
+        y_list = []
+        mean_list = []
+        std_list = []
+        shape_list = []
+        
+        dataset_get = self.dataset.__getitem__
+        batch_size = self.batch_size
+        
+        for i in range(0, len(indices), batch_size):
+            batch_indices = indices[i:i + batch_size]
             
-            x_list, y_list, mean_list, std_list, shape_list = [], [], [], [], []
+            # Clear lists but keep capacity
+            x_list.clear()
+            y_list.clear()
+            mean_list.clear()
+            std_list.clear()
+            shape_list.clear()
             
+            # Get items with minimal overhead
             for idx in batch_indices:
-                x, y, mean, std, shape = self.dataset[idx]
+                x, y, mean, std, shape = dataset_get(idx)
                 x_list.append(x)
                 y_list.append(y)
                 mean_list.append(mean)
                 std_list.append(std)
                 shape_list.append(shape)
             
+            # Stack tensors
             x_batch = torch.stack(x_list)
             y_batch = torch.stack(y_list)
             mean_batch = torch.stack(mean_list)
             std_batch = torch.stack(std_list)
             shape_batch = torch.stack(shape_list)
-
+            
             yield x_batch, y_batch, mean_batch, std_batch, shape_batch
     
     def get_total_batches_in_epoch(self):
+        """Get total number of batches in current epoch."""
         if self.current_epoch_indices is None:
-            if hasattr(self.dataset, 'indices'):
-                return math.ceil(len(self.dataset) / self.batch_size)
             return math.ceil(len(self.dataset) / self.batch_size)
         return math.ceil(len(self.current_epoch_indices) / self.batch_size)
     
     def get_state(self):
+        """Get current state for resuming."""
         return {
             'epoch_indices': self.current_epoch_indices,
             'batch_start': self.current_batch_start,
             'batch_size': self.batch_size,
             'shuffle': self.shuffle,
+            'epoch': self.epoch,
         }
     
     def restore_state(self, state):
+        """Restore state from checkpoint."""
         self.current_epoch_indices = state['epoch_indices']
         self.current_batch_start = state['batch_start']
+        self.batch_size = state['batch_size']
+        self.shuffle = state['shuffle']
+        self.epoch = state.get('epoch', 0)
     
     def _start_prefetch(self):
-        self.load_start_time = time.time()
-        self.prefetch_thread = threading.Thread(target=self._prefetch_worker)
-        self.prefetch_thread.daemon = True
-        self.prefetch_thread.start()
+        """Start the prefetch thread with reduced GIL impact."""
+        if self.prefetch_thread and self.prefetch_thread.is_alive():
+            return
         
+        self.load_start_time = time.perf_counter()
+        self.prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
+        self.prefetch_thread.start()
+    
     def _prefetch_worker(self):
+        """Worker that prefetches batches with minimized GIL holding."""
         try:
-            batch = next(self.iterator)
-            load_time = time.time() - self.load_start_time
-            self.prefetch_queue.put(('data', batch, load_time))
-        except StopIteration:
+            # Create a local iterator reference
+            iterator = self.iterator
+            
+            for batch in iterator:
+                if not self.running:
+                    break
+                # Put in queue - GIL is released during I/O
+                self.prefetch_queue.put(('data', batch, time.perf_counter() - self.load_start_time))
+                self.load_start_time = time.perf_counter()
+            
             self.prefetch_queue.put(('stop', None, 0))
         except Exception as e:
             self.prefetch_queue.put(('error', e, 0))
     
+    # def get_next_batch(self):
+    #     """Get the next batch with minimal waiting."""
+    #     try:
+    #         # Short timeout to allow GIL release
+    #         status, data, load_time = self.prefetch_queue.get(timeout=0.001)
+    #     except queue.Empty:
+    #         # Queue empty - try again with longer timeout
+    #         try:
+    #             status, data, load_time = self.prefetch_queue.get(timeout=0.01)
+    #         except queue.Empty:
+    #             return None, 0.001, 0
+        
+    #     if status == 'stop':
+    #         self.running = False
+    #         return None, 0, load_time
+    #     elif status == 'error':
+    #         raise data
+        
+    #     # Start prefetching next batch immediately
+    #     self._start_prefetch()
+    #     return data, 0, load_time
+
+    # def get_next_batch(self):
+    #     wait_start = time.time()
+    #     status, data, load_time = self.prefetch_queue.get()
+    #     wait_time = time.time() - wait_start
+        
+    #     if status == 'stop':
+    #         return None, wait_time, load_time
+    #     elif status == 'error':
+    #         raise data
+        
+    #     self.current_batch_start += 1
+    #     self._start_prefetch()
+    #     return data, wait_time, load_time
+
     def get_next_batch(self):
-        wait_start = time.time()
         status, data, load_time = self.prefetch_queue.get()
-        wait_time = time.time() - wait_start
         
         if status == 'stop':
-            return None, wait_time, load_time
+            data = None
         elif status == 'error':
             raise data
         
         self.current_batch_start += 1
         self._start_prefetch()
-        return data, wait_time, load_time
+
+        return data, load_time
+    
+    def __del__(self):
+        """Clean up."""
+        self.running = False
+        if hasattr(self, 'prefetch_thread') and self.prefetch_thread and self.prefetch_thread.is_alive():
+            self.prefetch_thread.join(timeout=0.1)
 
 
 # ═══════════════════════════════════════════════════════════

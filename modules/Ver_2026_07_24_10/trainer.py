@@ -184,7 +184,6 @@ class TrainingState:
             print(f"  Loss: {state_info['loss']:.4f}")
             if state_info.get('val_loss') is not None:
                 print(f"  Val Loss: {state_info['val_loss']:.4f}")
-            # Return history even when training is finished
             history = state_info.get('history', None)
             return 'finished', None, None, None, None, history, None, None
         
@@ -290,14 +289,12 @@ class TrainingHistory:
         self.timestamps = []
     
     def add_epoch(self, epoch: int, train_loss: float, val_loss: Optional[float] = None):
-        """Add an epoch to the history."""
         self.epochs.append(epoch)
         self.train_losses.append(train_loss)
         self.val_losses.append(val_loss if val_loss is not None else None)
         self.timestamps.append(time.time())
     
     def to_dict(self) -> Dict[str, List]:
-        """Convert history to dictionary for serialization."""
         return {
             'epochs': self.epochs,
             'train_losses': self.train_losses,
@@ -306,24 +303,19 @@ class TrainingHistory:
         }
     
     def from_dict(self, data: Dict[str, List]):
-        """Load history from dictionary."""
         self.epochs = data.get('epochs', [])
         self.train_losses = data.get('train_losses', [])
         self.val_losses = data.get('val_losses', [])
         self.timestamps = data.get('timestamps', [])
     
     def plot(self, save_path: Optional[str] = None, figsize: Tuple[int, int] = (12, 6)):
-        """Plot training history."""
         if not self.epochs:
             print("No training history to plot.")
             return
         
         fig, ax = plt.subplots(figsize=figsize)
-        
-        # Plot training loss
         ax.plot(self.epochs, self.train_losses, 'b-', linewidth=2, label='Training Loss')
         
-        # Plot validation loss if available
         val_losses = [v for v in self.val_losses if v is not None]
         if val_losses:
             val_epochs = [self.epochs[i] for i, v in enumerate(self.val_losses) if v is not None]
@@ -335,7 +327,6 @@ class TrainingHistory:
         ax.legend(fontsize=10)
         ax.grid(True, alpha=0.3)
         
-        # Add min/max annotations
         min_train = min(self.train_losses)
         min_train_epoch = self.epochs[self.train_losses.index(min_train)]
         ax.annotate(f'Min Train: {min_train:.4f}', 
@@ -361,7 +352,6 @@ class TrainingHistory:
         return fig
     
     def print_summary(self):
-        """Print a summary of the training history."""
         if not self.epochs:
             print("No training history available.")
             return
@@ -382,12 +372,13 @@ class TrainingHistory:
 
 
 # ═══════════════════════════════════════════════════════════
-# RESUMABLE TRAINER
+# RESUMABLE TRAINER - OPTIMIZED
 # ═══════════════════════════════════════════════════════════
 
 class ResumableTrainer:
     """
     Trainer with robust handling of all interruption scenarios and validation.
+    Optimized for speed with reduced overhead.
     """
     
     def __init__(self, model, loss_fn, optimizer, dataloader, 
@@ -423,7 +414,6 @@ class ResumableTrainer:
         self.current_loss = 0.0
         self.current_val_loss = None
         
-        # Training history
         self.history = TrainingHistory()
         
         self._setup_signal_handlers()
@@ -489,7 +479,6 @@ class ResumableTrainer:
                 print("CRITICAL: Could not save anything!")
     
     def run_validation(self, loader=None, desc="Validation"):
-        """Run validation on the given loader."""
         if loader is None:
             loader = self.val_loader
         
@@ -504,9 +493,9 @@ class ResumableTrainer:
         total_batches = loader.get_total_batches_in_epoch()
         
         with torch.no_grad():
-            pbar = tqdm(total=total_batches, desc=desc)
+            pbar = tqdm(total=total_batches, desc=desc, mininterval=0.5, miniters=5)
             while True:
-                batch, wait_time, load_time = loader.get_next_batch()
+                batch, load_time = loader.get_next_batch()
                 if batch is None:
                     break
                 
@@ -514,33 +503,26 @@ class ResumableTrainer:
                 x, y = x.to(self.device), y.to(self.device)
                 x = x.transpose(1, 2)
                 
-                compute_start = time.time()
                 P = self.model(x, mean, std, shape)
                 L = self.loss_fn(P, x, y)
-                compute_time = time.time() - compute_start
                 
                 total_loss += L.item()
                 num_batches += 1
                 
-                pbar.update(1)
-                pbar.set_postfix({
-                    'loss': f'{L.item():.4f}',
-                    'wait': f'{wait_time*1000:.0f}ms',
-                    'load': f'{load_time*1000:.0f}ms',
-                    'comp': f'{compute_time*1000:.0f}ms'
-                })
+                if num_batches % 5 == 0:
+                    pbar.update(5 if num_batches > 5 else 1)
+                    pbar.set_postfix({'loss': f'{L.item():.4f}'})
             
+            pbar.update(total_batches - pbar.n)
             pbar.close()
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
         return avg_loss
     
     def plot_history(self, save_path: Optional[str] = None):
-        """Plot the training history."""
         return self.history.plot(save_path=save_path)
     
     def _show_history_if_available(self):
-        """Show training history if available."""
         if self.history.epochs:
             self.history.print_summary()
             plot_path = self.state_manager.save_dir / 'training_history.png'
@@ -549,54 +531,43 @@ class ResumableTrainer:
         return False
     
     def train(self, num_epochs, resume=True):
-        """
-        Train the model.
-        If training is already finished (training_finished=True in checkpoint),
-        this method will exit immediately without doing any work.
-        """
+        """Train the model with robust checkpointing."""
         
-        # STEP 1: Check if training is already finished
         if resume:
             loaded = self.state_manager.load_latest_checkpoint(
                 self.model, self.optimizer, self.dataloader
             )
             
-            # # Check if training is finished and show history
-            # if loaded == 'finished':
-            #     print("\n" + "="*60)
-            #     print("✓ TRAINING ALREADY FINISHED!")
-            #     print("="*60)
-            #     print(f"All {num_epochs} epochs completed in previous run.")
-            #     print("Nothing to train.")
-            #     print("Use --clean to start fresh, or increase --epochs.")
-
-            #     # Get history from state file
-            #     try:
-            #         with open(self.state_manager.state_file, 'r') as f:
-            #             state_info = json.load(f)
-            #         history_data = state_info.get('history', None)
-            #         if history_data:
-            #             self.history.from_dict(history_data)
-            #             self._show_history_if_available()
-            #     except:
-            #         pass
-            #     return
-            
             if loaded:
+                if loaded == 'finished':
+                    print("\n" + "="*60)
+                    print("✓ TRAINING ALREADY FINISHED")
+                    print("="*60)
+                    print(f"All {num_epochs} epochs completed in previous run.")
+                    print("Nothing to train.")
+                    print("Use --clean to start fresh, or increase --epochs.")
+                    try:
+                        with open(self.state_manager.state_file, 'r') as f:
+                            state_info = json.load(f)
+                        history_data = state_info.get('history', None)
+                        if history_data:
+                            self.history.from_dict(history_data)
+                            self._show_history_if_available()
+                    except:
+                        pass
+                    return
+                
                 (self.start_epoch, self.start_batch, 
                  self.total_minibatches_processed, _, val_loss, history_data, _, is_emergency) = loaded
                 self.current_val_loss = val_loss
                 
-                # Restore history
                 if history_data:
                     self.history.from_dict(history_data)
                     print(f"✓ Loaded training history ({len(self.history.epochs)} epochs)")
                 
                 total_batches_in_epoch = self.dataloader.get_total_batches_in_epoch()
                 
-                # Check if training is actually complete
                 training_complete = False
-                
                 if self.start_epoch >= num_epochs:
                     training_complete = True
                 elif self.start_epoch == num_epochs - 1 and self.start_batch >= total_batches_in_epoch:
@@ -620,17 +591,7 @@ class ResumableTrainer:
                     print(f"All {num_epochs} epochs completed in previous run.")
                     print("Nothing to train.")
                     print("Use --clean to start fresh, or increase --epochs.")
-
-                    try:
-                        with open(self.state_manager.state_file, 'r') as f:
-                            state_info = json.load(f)
-                        history_data = state_info.get('history', None)
-                        if history_data:
-                            self.history.from_dict(history_data)
-                            self._show_history_if_available()
-                    except:
-                        pass
-
+                    self._show_history_if_available()
                     return
                 
                 if is_emergency:
@@ -643,7 +604,6 @@ class ResumableTrainer:
         else:
             print("\nStarting fresh training (resume disabled).")
         
-        # STEP 3: If we get here, training is NOT complete - proceed
         self.is_running = True
         self.ctrl_c_count = 0
         
@@ -677,11 +637,9 @@ class ResumableTrainer:
                 if not self.is_running:
                     break
                 
-                # Record training loss
                 train_loss = avg_loss if avg_loss is not None else 0
                 val_loss = None
                 
-                # Validation
                 if self.enable_validation and self.val_loader is not None:
                     if (epoch + 1) % self.validate_every_n_epochs == 0:
                         self.current_val_loss = self.run_validation(
@@ -690,10 +648,7 @@ class ResumableTrainer:
                         )
                         val_loss = self.current_val_loss
                 
-                # Add to history
                 self.history.add_epoch(epoch + 1, train_loss, val_loss)
-                
-                # Print epoch summary with history info
                 print(f'Epoch {epoch+1}/{num_epochs} - Loss: {train_loss:.4f}', end='')
                 if val_loss is not None:
                     print(f', Val Loss: {val_loss:.4f}', end='')
@@ -715,7 +670,6 @@ class ResumableTrainer:
                 print(f"   Epoch {self.current_epoch+1}, batch {self.current_batch}")
                 print(f"   Resume with: python train.py")
             elif self.current_epoch + 1 >= num_epochs:
-                # Save final checkpoint
                 self.state_manager.mark_training_finished(
                     model=self.model,
                     optimizer=self.optimizer,
@@ -732,15 +686,13 @@ class ResumableTrainer:
                 print(f"   All {num_epochs} epochs finished.")
                 if self.current_val_loss is not None:
                     print(f"   Final Val Loss: {self.current_val_loss:.4f}")
-
-                # Show and plot history
                 self._show_history_if_available()
             else:
                 print(f"\n⚠ Training ended unexpectedly at minibatch {self.total_minibatches_processed}")
                 print(f"   Epoch {self.current_epoch+1}/{num_epochs}")
     
     def train_epoch(self, epoch):
-        """Train one epoch."""
+        """Train one epoch with optimized timing and reduced overhead."""
         self.model.train()
         
         if epoch == self.start_epoch and self.start_batch > 0:
@@ -760,8 +712,11 @@ class ResumableTrainer:
         total_batches = self.dataloader.get_total_batches_in_epoch()
         total_samples = len(self.dataloader.current_epoch_indices)
         
+        # Optimized tqdm - update less frequently
         pbar = tqdm(total=total_batches, desc=f'Epoch {epoch+1}',
-                    initial=resume_batch_start)
+                    initial=resume_batch_start,
+                    mininterval=0.5,
+                    miniters=5)
         
         batch_idx = resume_batch_start
         total_loss = 0.0
@@ -771,72 +726,102 @@ class ResumableTrainer:
         total_wait_time = 0.0
         total_load_time = 0.0
         total_compute_time = 0.0
+        total_cycle_time = 0.0
+        
+        # Cache local references for speed
+        model = self.model
+        optimizer = self.optimizer
+        loss_fn = self.loss_fn
+        device = self.device
+        dataloader = self.dataloader
+
+        cycle_start = time.perf_counter()
+        wait_start = time.time()
         
         while True:
+
             if self.stop_requested:
                 self._emergency_save()
                 pbar.close()
                 self.is_running = False
                 return total_loss / batches_in_epoch if batches_in_epoch > 0 else 0
             
-            # Get batch with timing
-            batch, wait_time, load_time = self.dataloader.get_next_batch()
+            # Get batch
+            batch, load_time = dataloader.get_next_batch()
+            wait_time = time.time() - wait_start
             total_wait_time += wait_time
             total_load_time += load_time
             
             if batch is None:
                 break
             
-            compute_start = time.time()
-
+            compute_start = time.perf_counter()
+            
             x, y, mean, std, shape = batch
-            x, y = x.to(self.device), y.to(self.device)
-
-            # Model expects (B, T, F) but we have (B, F, T)
-            x = x.transpose(1, 2)  # (B, F, T) -> (B, T, F)
             
-            self.optimizer.zero_grad()
-            P = self.model(x, mean, std, shape)
-            L = self.loss_fn(P, x, y)
+            # Transfer to device with non_blocking
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            mean = mean.to(device, non_blocking=True)
+            std = std.to(device, non_blocking=True)
+            shape = shape.to(device, non_blocking=True)
+            
+            # Transpose
+            x = x.transpose(1, 2)
+            
+            # Forward + Backward + Optimizer
+            optimizer.zero_grad()
+            P = model(x, mean, std, shape)
+            L = loss_fn(P, x, y)
             L.backward()
-            self.optimizer.step()
+            optimizer.step()
             
-            compute_time = time.time() - compute_start
+            total_loss += L.item()  # it appears that this line takes a significant amount of time. It's a trick.
+            
+            compute_time = time.perf_counter() - compute_start
             total_compute_time += compute_time
             
+            cycle_time = time.perf_counter() - cycle_start
+            cycle_start = time.perf_counter()
+            total_cycle_time += cycle_time
+            
+            # Update metrics
             batch_idx += 1
             batches_in_epoch += 1
             self.total_minibatches_processed += 1
-            total_loss += L.item()
-            avg_loss = total_loss / batches_in_epoch
+
             self.current_batch = batch_idx
-            self.current_loss = avg_loss
-            
             samples_used = min(batch_idx * self.dataloader.batch_size, total_samples)
             
-            # Calculate averages
-            avg_wait = total_wait_time / batches_in_epoch * 1000  # ms
-            avg_load = total_load_time / batches_in_epoch * 1000  # ms
-            avg_comp = total_compute_time / batches_in_epoch * 1000  # ms
-            
-            pbar.update(1)
-            pbar.set_postfix({
-                'loss': f'{avg_loss:.4f}',
-                'wait': f'{avg_wait:.0f}ms',
-                'load': f'{avg_load:.0f}ms',
-                'comp': f'{avg_comp:.0f}ms',
-                'data': f'{samples_used}/{total_samples}',
-                'total': self.total_minibatches_processed
-            })
-            
+            # Update progress bar less frequently (every 10 batches)
+            if batch_idx % 10 == 0 or batch_idx == 1:
+                avg_loss = (total_loss / batches_in_epoch) if batches_in_epoch > 0 else 0
+                self.current_loss = avg_loss
+                avg_wait = total_wait_time / batches_in_epoch * 1000
+                avg_load = total_load_time / batches_in_epoch * 1000
+                avg_comp = total_compute_time / batches_in_epoch * 1000
+                avg_cycle = total_cycle_time / batches_in_epoch * 1000
+
+                pbar.update(5 if batch_idx > 5 else 1)
+                pbar.set_postfix({
+                    'loss': f'{avg_loss:.4f}',
+                    'wait': f'{avg_wait:.0f}ms',
+                    'load': f'{avg_load:.0f}ms',
+                    'comp': f'{avg_comp:.0f}ms',
+                    'cycle': f'{avg_cycle:.0f}ms',
+                    'data': f'{samples_used}/{total_samples}',
+                    'total': self.total_minibatches_processed
+                })
+
+            # Checkpoint check
             if (self.total_minibatches_processed % 
                 self.state_manager.save_every_n_minibatches == 0):
                 
-                dataloader_state = self.dataloader.get_state()
+                dataloader_state = dataloader.get_state()
                 
                 self.state_manager.save_checkpoint(
-                    model=self.model,
-                    optimizer=self.optimizer,
+                    model=model,
+                    optimizer=optimizer,
                     dataloader_state=dataloader_state,
                     epoch=epoch,
                     batch_idx=batch_idx,
@@ -847,11 +832,13 @@ class ResumableTrainer:
                     is_emergency=False,
                     training_finished=False
                 )
+            wait_start = time.time()
         
+        # Final pbar update
         pbar.update(total_batches - pbar.n)
         pbar.close()
         
-        return total_loss / batches_in_epoch if batches_in_epoch > 0 else 0
+        return (total_loss / batches_in_epoch) if batches_in_epoch > 0 else 0
 
 
 # ═══════════════════════════════════════════════════════════

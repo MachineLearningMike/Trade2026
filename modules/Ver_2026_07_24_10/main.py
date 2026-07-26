@@ -155,6 +155,8 @@ def main():
                        help='Use real Binance data instead of synthetic')
     parser.add_argument('--symbol', type=str, default=config.get('binance_primary_symbol', 'BTCUSDT'),
                        help='Primary trading pair symbol')
+    parser.add_argument('--price-feature-idx', type=int, default=config.get('price_feature_idx', 0),
+                       help='Index of price feature in the data')
     
     # Split arguments
     parser.add_argument('--train-ratio', type=float, default=config.get('train_ratio', 0.70),
@@ -172,7 +174,7 @@ def main():
     
     args = parser.parse_args()
     
-    # Update config
+    # Update config with all args
     config['epochs'] = args.epochs
     config['save_every_n_minibatches'] = args.save_every
     config['clean'] = args.clean
@@ -204,6 +206,7 @@ def main():
     config['validate'] = not args.no_validate
     config['validate_every_n_epochs'] = args.validate_every
     config['validate_batch_size'] = args.val_batch_size
+    config['price_feature_idx'] = args.price_feature_idx  # Add this line
     
     if args.no_normalize:
         config['normalize'] = False
@@ -275,12 +278,14 @@ def main():
             print("⚠ Failed to fetch Binance data. Falling back to synthetic data.")
     
     if features is None:
-        sys.exit(0)  # Exit if Binance data is requested but not available
         T = 60 * 24 * config['total_days']
         F = config['num_features']
+        # Use the price_feature_idx from config (now set)
+        price_feature_idx = config.get('price_feature_idx', 0)
         print(f"Generating synthetic trading data: {T} minutes, {F} features")
-        features = generate_synthetic_data(T, F, config['price_feature_idx'])
-        target_feature_id = config['price_feature_idx']
+        print(f"  Price feature index: {price_feature_idx}")
+        features = generate_synthetic_data(T, F, price_feature_idx)
+        target_feature_id = price_feature_idx
     
     config['num_features'] = len(features)
     print(f"Using device: {config['device']}")
@@ -347,6 +352,7 @@ def main():
         output_dim=config['output_dim'],
         use_reconstruction=config['use_reconstruction']
     )
+    # model = torch.compile(model, mode="reduce-overhead", fullgraph=True)    # reqiuires pip install triton
     
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
