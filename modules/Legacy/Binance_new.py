@@ -22,17 +22,25 @@ if 'config' in sys.modules:
 sys.path.insert(0, legacy_dir)
 
 # Now import from Legacy
-import config as legacy_config
+# import config as legacy_config
 from Utility import *
 
 # Make Config and Print available
-Config = legacy_config.Config
-Print = legacy_config.Print
+# Config = legacy_config.Config
+# Print = legacy_config.Print
 
 from ThreadOnTimeMachine import *
 
 from unicorn_binance_websocket_api.manager import BinanceWebSocketApiManager as UnicornSockets
 import logging
+
+def Print(*argv, end="\n"):
+    str = ''
+    for arg in argv:
+        str += arg
+    lockPrint.acquire()
+    print(str, end=end)
+    lockPrint.release()
 
 class ClientPool():
 

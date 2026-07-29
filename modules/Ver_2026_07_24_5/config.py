@@ -10,7 +10,7 @@ config = {
     'step': 60,
     'num_features': 5,
     'num_shapes': 4,
-    'total_days': 30,
+    'total_synthetic_days': 30,
     
     # ============================================================
     # BINANCE DATA CONFIGURATION

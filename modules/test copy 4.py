@@ -50,7 +50,7 @@ config = {
     
     # Total days of synthetic data to generate (for testing)
     # Determines total time steps T = 60 * 24 * total_days
-    'total_days': 30,
+    'total_synthetic_days': 30,
     
     # Index of the price feature in the features list (0-based)
     # Used for:
@@ -1429,7 +1429,7 @@ if __name__ == "__main__":
                        help='Batch size')
     parser.add_argument('--num-features', type=int, default=config['num_features'], 
                        help='Number of features')
-    parser.add_argument('--total-days', type=int, default=config['total_days'], 
+    parser.add_argument('--total-days', type=int, default=config['total_synthetic_days'], 
                        help='Total days of data')
     parser.add_argument('--step', type=int, default=config['step'], 
                        help='Step size for start indices')
@@ -1476,7 +1476,7 @@ if __name__ == "__main__":
     config['future_minutes'] = args.future_minutes
     config['batch_size'] = args.batch_size
     config['num_features'] = args.num_features
-    config['total_days'] = args.total_days
+    config['total_synthetic_days'] = args.total_days
     config['step'] = args.step
     config['max_accum_deviation'] = args.max_accum_deviation
     config['min_horizon'] = args.min_horizon
@@ -1505,7 +1505,7 @@ if __name__ == "__main__":
         print("Cleaned previous checkpoints.\n")
     
     # Create synthetic trading data
-    T = 60 * 24 * config['total_days']  # total_days of minute data
+    T = 60 * 24 * config['total_synthetic_days']  # total_days of minute data
     F = config['num_features']
     
     print(f"Generating synthetic trading data: {T} minutes, {F} features")

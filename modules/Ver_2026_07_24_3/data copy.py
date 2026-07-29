@@ -556,7 +556,7 @@ if __name__ == "__main__":
     device = config['device']
     
     # Generate synthetic data
-    T = 60 * 24 * config['total_days']
+    T = 60 * 24 * config['total_synthetic_days']
     F = config['num_features']
     
     print(f"Generating synthetic data: {T} minutes, {F} features")

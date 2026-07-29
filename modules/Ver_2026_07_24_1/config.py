@@ -9,7 +9,7 @@ config = {
     'future_minutes': 60,
     'step': 60,
     'num_features': 5,
-    'total_days': 30,
+    'total_synthetic_days': 30,
     'price_feature_idx': 0,
     
     # ============================================================

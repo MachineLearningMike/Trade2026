@@ -21,7 +21,7 @@ config = {
     'num_features': 5,
     
     # Total days of synthetic data to generate (for testing)
-    'total_days': 30,
+    'total_synthetic_days': 30,
     
     # Index of the price feature in the features list (0-based)
     'price_feature_idx': 0,

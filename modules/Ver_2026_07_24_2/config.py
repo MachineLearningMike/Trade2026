@@ -29,7 +29,7 @@ config = {
     
     # Total days of synthetic data to generate (for testing)
     # Determines total time steps T = 60 * 24 * total_days
-    'total_days': 30,
+    'total_synthetic_days': 30,
     
     # Index of the price feature in the features list (0-based)
     # Used for:
@@ -291,7 +291,7 @@ def get_config_summary():
             'future_minutes': config['future_minutes'],
             'step': config['step'],
             'num_features': config['num_features'],
-            'total_days': config['total_days'],
+            'total_synthetic_days': config['total_synthetic_days'],
         },
         'binance': {
             'use_binance_data': config['use_binance_data'],

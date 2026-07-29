@@ -25,7 +25,7 @@ config = {
     'num_shapes': 4,
     
     # Total days of synthetic data to generate (for testing)
-    'total_days': 30,
+    'total_synthetic_days': 30,
     
     
     # ============================================================
