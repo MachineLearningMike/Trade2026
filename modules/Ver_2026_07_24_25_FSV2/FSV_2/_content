@@ -1,0 +1,7 @@
+fsv/
+│
+├── fsv_downloader.py          # Main downloader
+├── feature_dictionary.py      # Metadata of every feature
+├── fred_client.py             # Generic FRED API client
+├── metadata.py                # Publish time / timezone / decay etc.
+└── data/

@@ -94,7 +94,7 @@ def generate_synthetic_data(T: int, F: int, price_feature_idx: int = 0):
 # HORIZON LABELING FUNCTION - SUPPORTS ALL MODES
 # ═══════════════════════════════════════════════════════════
 
-def find_shortest_horizon(
+def find_linear_regime(
     future,
     history,
     min_horizon=3,
@@ -556,7 +556,7 @@ class TradingDataset(Dataset):
             else:
                 future_prices_normalized = future_prices
             
-            best_h, best_slope, best_intercept = find_shortest_horizon(
+            best_h, best_slope, best_intercept = find_linear_regime(
                 future_prices_normalized,
                 self.Total[self.price_feature_idx, start:start + self.past_window],
                 min_horizon=self.min_horizon,

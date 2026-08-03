@@ -1,0 +1,228 @@
+fsv/
+│
+├── fsv_downloader.py          # Main downloader
+├── feature_dictionary.py      # Metadata of every feature
+├── fred_client.py             # Generic FRED API client
+├── metadata.py                # Publish time / timezone / decay etc.
+└── data/
+
+
+Phase 2 is working:
+
+Phase 1: Raw acquisition                 ✅
+    |
+    |-- fsv_downloader.py
+    |
+    v
+fsv_raw.csv                              ✅
+
+Phase 1.5: Information availability      ✅
+    |
+    |-- fsv_release_rules.py
+    |-- fsv_availability.py
+    |
+    v
+fsv_availability.csv                      ✅
+
+Phase 2: Data refinement                 ✅
+    |
+    |-- fsv_refiner.py
+    |
+    +--> fsv_refined_observed.csv          ✅
+    +--> fsv_refined_daily.csv             ✅
+    +--> fsv_quality_report.csv            ✅
+
+
+                 External Sources
+                       |
+        +--------------+--------------+
+        |                             |
+       FRED                      TwelveData
+        |                             |
+        +--------------+--------------+
+                       |
+                       v
+              fsv_raw_FRED.csv
+              (immutable raw data)
+                       |
+                       v
+              fsv_availability.csv
+              (information arrival time)
+                       |
+                       v
+              fsv_refiner.py
+                       |
+        +--------------+--------------+
+        |                             |
+ fsv_observed.csv             fsv_daily.csv
+                       |
+                       v
+              fsv_aligner.py
+                       |
+                       v
+              fsv_aligned.csv
+
+
+Download
+   |
+   v
+Raw observations
+   |
+   v
+Availability engine
+   |
+   v
+Refinement
+   |
+   v
+Daily calendar
+   |
+   v
+Alignment
+   |
+   v
+Modeling features
+
+
+                 Financial State Vector
+
+        Growth          Inflation       Liquidity
+          |                 |               |
+          v                 v               v
+
+      Rates  --------->  Credit  --------> Risk
+
+          |                 |               |
+          +-----------------+---------------+
+
+                         |
+                         v
+
+                  Market Regime
+
+
+fsv_raw.csv
+        |
+        |  (what existed)
+        v
+fsv_availability.csv
+        |
+        |  (what was knowable)
+        v
+fsv_daily.csv / fsv_aligned.csv
+        |
+        |  (synchronized market state)
+        v
+fsv_state.csv   <-- we are here
+
+
+
+                 External world
+                      |
+                      v
+              FSV raw features
+                      |
+                      v
+          Information availability
+                      |
+                      v
+             Aligned market history
+                      |
+                      v
+              State representation
+                      |
+          +-----------+-----------+
+          |                       |
+          v                       v
+   Regime classifier       Price pattern engine
+          |                       |
+          +-----------+-----------+
+                      |
+                      v
+             Trading decision model
+
+
+metadata.py
+      |
+      v
+fsv_downloader.py
+      |
+      v
+fsv_raw.csv
+      |
+      v
+fsv_availability.py
+      |
+      v
+fsv_availability.csv
+      |
+      v
+fsv_refiner.py
+      |
+      v
+fsv_daily.csv
+      |
+      v
+fsv_aligner.py
+      |
+      v
+fsv_aligned.csv
+      |
+      v
+fsv_state_builder.py
+      |
+      v
+fsv_state.csv
+      |
+      v
+fsv_validator.py   <--- now
+
+
+Raw external data
+        |
+        v
+Availability-aware data
+        |
+        v
+Daily aligned data
+        |
+        v
+Financial state representation
+        |
+        v
+Validation passed
+        |
+        v
+Ready for learning dataset construction
+
+
+
+                 Raw world
+                    |
+                    v
+          fsv_raw.csv
+                    |
+                    v
+      availability-aware timestamps
+                    |
+                    v
+      fsv_availability.csv
+                    |
+                    v
+          refined daily data
+                    |
+                    v
+      fsv_aligned.csv
+                    |
+                    v
+        financial state encoder
+                    |
+                    v
+          fsv_state.csv
+                    |
+                    v
+        target construction
+                    |
+                    v
+          fsv_training.csv   <--- HERE
+

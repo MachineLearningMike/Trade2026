@@ -1,0 +1,353 @@
+The complete pipeline ============================
+
+Raw Financial Data
+        |
+        v
++-----------------------+
+| 1. FSV Raw Collector  |
+|    fsv_raw.csv        |
++-----------------------+
+        |
+        v
++-----------------------------+
+| 2. Availability Builder     |
+|    fsv_availability.py      |
+|                             |
+|    - release timestamps     |
+|    - publication lag        |
+|    - no future leakage      |
+|                             |
+|    Output:                  |
+|    fsv_availability.csv     |
++-----------------------------+
+        |
+        v
++-----------------------------+
+| 3. Release Rules Engine     |
+|    fsv_release_rules.py     |
+|                             |
+|    Handles:                 |
+|    - FRED daily             |
+|    - FRED monthly           |
+|    - Treasury               |
+|    - spreads                |
+|    - macro releases         |
++-----------------------------+
+        |
+        v
++-----------------------------+
+| 4. FSV Refiner              |
+|    fsv_refiner.py           |
+|                             |
+|    - clean raw data         |
+|    - normalize dates        |
+|    - forward fill rules     |
+|    - create daily calendar  |
+|    - detect jumps           |
+|                             |
+|    Outputs:                 |
+|    fsv_observed.csv         |
+|    fsv_daily.csv            |
+|    fsv_refined_report.csv   |
++-----------------------------+
+        |
+        v
++-----------------------------+
+| 5. FSV Aligner              |
+|    fsv_aligner.py            |
+|                             |
+|    Aligns each feature      |
+|    according to availability|
+|                             |
+|    Input:                   |
+|    availability             |
+|    refined daily            |
+|                             |
+|    Output:                  |
+|    fsv_aligned.csv          |
+|    fsv_alignment_report.csv |
++-----------------------------+
+        |
+        v
++-----------------------------+
+| 6. FSV State Builder        |
+|    fsv_state_builder.py     |
+|                             |
+|    Converts raw variables   |
+|    into financial states    |
+|                             |
+|    Builds:                  |
+|                             |
+|    Rate State               |
+|    Credit State             |
+|    Liquidity State          |
+|    Market State             |
+|    Commodity State          |
+|    Regime State             |
+|    Composite Scores         |
+|                             |
+|    Output:                  |
+|    fsv_state.csv            |
++-----------------------------+
+        |
+        v
++-----------------------------+
+| 7. FSV Validator            |
+|    fsv_validator.py         |
+|                             |
+|    Checks:                  |
+|                             |
+|    - missing values         |
+|    - constants               |
+|    - outliers               |
+|    - correlations           |
+|    - leakage                |
+|                             |
+|    Outputs:                 |
+|    fsv_validation_report.txt|
+|    fsv_feature_health.csv   |
+|    fsv_outliers.csv         |
+|    fsv_correlations.csv     |
++-----------------------------+
+        |
+        v
++-----------------------------+
+| 8. Target Builder           |
+|    fsv_target_builder.py    |
+|                             |
+|    Creates prediction tasks |
+|                             |
+|    Examples:                |
+|                             |
+|    SP500 return             |
+|    Gold return              |
+|    Oil return               |
+|    Volatility               |
+|    Regime transition        |
+|                             |
+|    Output:                  |
+|    fsv_training.csv         |
+|    fsv_target_report.csv    |
++-----------------------------+
+        |
+        v
++-----------------------------+
+| 9. Ablation Testing         |
+|    fsv_ablation_test.py     |
+|                             |
+|    Measures contribution    |
+|    of state groups          |
+|                             |
+|    Tests:                   |
+|                             |
+|    Market                  |
+|    Rates                   |
+|    Credit                  |
+|    Liquidity               |
+|    Commodity               |
+|    All FSV                 |
+|                             |
+|    Models:                  |
+|    GradientBoosting         |
+|                             |
+|    Outputs:                 |
+|    fsv_ablation_results.csv |
+|    fsv_feature_stability.csv|
+|    fsv_feature_importance.csv|
++-----------------------------+
+        |
+        v
++-----------------------------+
+| 10. Baseline Models         |
+|     fsv_baseline_model.py   |
+|                             |
+|     Establishes predictive  |
+|     ceiling before AI       |
+|                             |
+|     Models:                 |
+|                             |
+|     Linear Regression       |
+|     Ridge                   |
+|     Random Forest           |
+|     Gradient Boosting       |
+|                             |
+|     Targets:                |
+|                             |
+|     sp500_return            |
+|     gold_return             |
+|     oil_return              |
+|     volatility              |
+|     regimes                 |
+|                             |
+|     Outputs:                |
+|     fsv_baseline_results.csv|
+|     fsv_baseline_feature... |
++-----------------------------+
+        |
+        v
++-----------------------------+
+| 11. Sequence Builder        |
+|     (next step)             |
+|                             |
+|     Convert:                |
+|                             |
+|     FSV(t)                  |
+|     FSV(t-1)                |
+|     ...                     |
+|     FSV(t-n)                |
+|                             |
+|     into temporal samples   |
+|                             |
+|     For:                    |
+|                             |
+|     LSTM                    |
+|     Transformer             |
+|     Temporal CNN            |
++-----------------------------+
+        |
+        v
++-----------------------------+
+| 12. Deep Financial AI Model |
+|     (future)                |
+|                             |
+|     Input:                  |
+|     Financial State History |
+|                             |
+|     Output:                 |
+|     Forecast distribution   |
+|                             |
+|     Examples:               |
+|                             |
+|     Market direction        |
+|     Expected return         |
+|     Volatility              |
+|     Regime probability      |
++-----------------------------+
+
+
+Current data flow =====================================
+
+FRED
+Treasury
+Oil
+Gold
+SP500
+VIX
+Macro indicators
+        |
+        v
+fsv_raw
+        |
+        v
+fsv_availability
+        |
+        v
+fsv_daily
+        |
+        v
+fsv_aligned
+        |
+        v
+fsv_state
+        |
+        v
+fsv_training
+        |
+        +----------------+
+        |                |
+        v                v
+ Ablation Test     Baseline Models
+
+
+Current feature count =====================================
+
+From your run:
+
+Raw columns:
+30
+
+Derived state columns:
+27
+
+Final FSV:
+57 dimensions
+
+Then training added targets:
+
+fsv_training.csv
+
+80 columns
+
+Meaning:
+
+57 financial state features
++
+target variables
++
+date
+
+
+2. State representation instead of raw indicators
+
+Instead of:
+
+10Y Treasury
+HY spread
+Fed assets
+VIX
+SP500
+
+alone:
+
+FSV creates:
+
+Rate pressure
+Credit stress
+Liquidity condition
+Risk appetite
+Commodity inflation pressure
+Market regime
+
+This is much closer to how a human macro trader thinks.
+
+
+3. Research order
+
+The correct order is:
+
+Validate data
+      |
+      v
+Measure signal
+      |
+      v
+Build baseline
+      |
+      v
+Sequence model
+      |
+      v
+Deep learning
+
+Not:
+
+Throw Transformer at data
+
+which usually produces beautiful overfitting.
+
+
+The next missing pieces
+
+The next logical modules are:
+
+fsv_sequence_builder.py
+        |
+        v
+fsv_sequence_validator.py
+        |
+        v
+fsv_transformer_model.py
+
+The sequence builder is the bridge from your current FSV to a real AI forecasting system.
+
+At this point the foundation is actually quite solid. The hard part (point-in-time financial data engineering) is already done.

@@ -211,5 +211,7 @@ __marimo__/
 *.pt
 *.pkl
 *.json
+*.npy
+
 
 

@@ -175,6 +175,134 @@ def find_shortest_horizon(
 
     return best_h, best_slope, best_intercept
 
+
+def find_power_regime(
+    future,
+    history,
+    min_horizon=3,
+    max_horizon=30,
+    fitness_threshold=1.0,
+    exponent_min=0.2,
+    exponent_max=3.0,
+    exponent_steps=30,
+):
+    """
+    Find the longest approximately power-law future segment.
+
+    Model:
+        y = b + a * x^e
+
+    Args:
+        future : Tensor (future_window,)
+            Future normalized prices.
+
+        history : Tensor (history_window,)
+            Past normalized prices used only for fitness normalization.
+
+        min_horizon : int
+            Minimum candidate horizon.
+
+        max_horizon : int
+            Maximum candidate horizon.
+
+        fitness_threshold : float
+            Maximum allowable dimensionless fitness.
+
+        exponent_min : float
+            Minimum power exponent.
+
+        exponent_max : float
+            Maximum power exponent.
+
+        exponent_steps : int
+            Number of exponent candidates.
+
+    Returns:
+        horizon : int
+        exponent : Tensor
+        scale : Tensor
+        bias : Tensor
+    """
+
+    device = future.device
+    dtype = future.dtype
+    eps = 1e-8
+
+    max_horizon = min(max_horizon, future.shape[0])
+
+    history_sigma = history.std().clamp(min=eps)
+
+    best_h = min_horizon
+    best_e = torch.tensor(1.0, device=device, dtype=dtype)
+    best_a = torch.tensor(0.0, device=device, dtype=dtype)
+    best_b = torch.tensor(0.0, device=device, dtype=dtype)
+
+    exponents = torch.linspace(
+        exponent_min,
+        exponent_max,
+        exponent_steps,
+        device=device,
+        dtype=dtype,
+    )
+
+    for h in range(min_horizon, max_horizon + 1):
+
+        y = future[:h]
+
+        x = torch.arange(
+            h,
+            device=device,
+            dtype=dtype,
+        )
+
+        best_fitness = torch.tensor(
+            float("inf"),
+            device=device,
+            dtype=dtype,
+        )
+
+        local_best = None
+
+        for e in exponents:
+
+            # avoid x=0 problems for fractional powers
+            z = (x + 1.0) ** e
+
+            z_mean = z.mean()
+            y_mean = y.mean()
+
+            dz = z - z_mean
+
+            a = torch.sum(
+                dz * (y - y_mean)
+            ) / (
+                torch.sum(dz * dz) + eps
+            )
+
+            b = y_mean - a * z_mean
+
+            prediction = a * z + b
+
+            deviation = torch.sum(
+                torch.abs(y - prediction)
+            )
+
+            if deviation < best_fitness:
+                best_fitness = deviation
+                local_best = (e, a, b)
+
+        fitness = best_fitness / history_sigma
+
+        if fitness <= fitness_threshold:
+
+            best_h = h
+            best_e, best_a, best_b = local_best
+
+        else:
+            break
+
+    return best_h, best_e, best_a, best_b
+
 # ═══════════════════════════════════════════════════════════
 # VISUALIZATION FUNCTION
 # ═══════════════════════════════════════════════════════════

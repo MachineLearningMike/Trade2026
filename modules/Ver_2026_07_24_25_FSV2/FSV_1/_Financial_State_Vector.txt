@@ -1,0 +1,72 @@
+Financial State Vector (FSV)
+
+├── Interest Rate State Vector (IRSV)
+│     ├── Fed funds
+│     ├── Treasury curve
+│     ├── Real yields
+│     └── Funding rates
+│
+├── Global Liquidity State Vector (GLSV)
+│     ├── Fed balance sheet
+│     ├── M2
+│     ├── USD conditions
+│     ├── SOFR
+│     └── Liquidity stress
+│
+├── Credit State Vector (CRSV)
+│     ├── AAA OAS
+│     ├── BBB OAS
+│     ├── High yield OAS
+│     └── Credit expansion/contraction
+│
+├── Equity State Vector (EQSV)
+│     ├── S&P500
+│     ├── Returns
+│     ├── Volatility
+│     └── Market breadth
+│
+├── Commodity State Vector (COMSV)
+│     ├── Oil
+│     ├── Gas
+│     ├── Copper
+│     └── Agriculture
+│
+├── Real Estate State Vector (RESV)
+│     ├── Home prices
+│     ├── Mortgage rates
+│     └── Housing activity
+│
+└── Safe Haven State Vector
+      ├── Gold
+      ├── BTC
+      ├── USD
+      └── VIX
+
+Market State Vector
+
+Price:
+    SP500
+    BTC
+    Gold
+    Oil
+
+Volatility:
+    VIX
+    realized volatility
+
+Liquidity:
+    volume
+    spread
+    order imbalance
+
+Macro:
+    rates
+    credit
+    USD
+
+Slow context:
+    Fed
+    M2
+    housing
+
+Stress=0.5×VIXpercentile​+0.3×HY_spreadpercentile​+0.2×USDpercentile​
