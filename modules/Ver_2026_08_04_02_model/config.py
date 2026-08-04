@@ -77,6 +77,8 @@ config = {
     'normalize': True,
     
     'force_recompute': False,
+
+    'n_latent_macro_features': 10,  # Number of latent macro features to use in the model
     
     # ============================================================
     # TRANSFORMER CONFIGURATION

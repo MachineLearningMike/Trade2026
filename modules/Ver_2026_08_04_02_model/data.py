@@ -460,6 +460,8 @@ class TradingDataset(Dataset):
     def __init__(
         self, 
         features: List[np.ndarray],
+        n_market_features: int,
+        n_macro_features: int,
         feature_names: List[str],
         price_feature_idx: int,
         past_days: int = 7,
@@ -475,6 +477,8 @@ class TradingDataset(Dataset):
         split_ratios: Optional[Tuple[float, float, float]] = None
     ):
         self.feature_names = feature_names
+        self.n_market_features = n_market_features
+        self.n_macro_features = n_macro_features
         self.past_days = past_days
         self.future_minutes = future_minutes
         self.price_feature_idx = price_feature_idx

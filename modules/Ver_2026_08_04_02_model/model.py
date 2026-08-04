@@ -104,6 +104,9 @@ class MarketTransformerWithHeads(nn.Module):
     def __init__(
         self,
         in_features: int,
+        n_market_features: int,
+        n_macro_features: int,
+        n_latent_macro_features: int,
         patch_size: int,
         embed_dim: int,
         num_layers: int,
@@ -123,6 +126,15 @@ class MarketTransformerWithHeads(nn.Module):
         self.causal = causal
         self.max_seq_len = max_seq_len
         self.use_reconstruction = use_reconstruction
+        self.n_market_features = n_market_features
+        self.n_macro_features = n_macro_features
+        self.n_latent_macro_features = n_latent_macro_features
+
+        #--------- get latent macro features --------
+        self.latent_macro_transform_x = nn.Linear(n_macro_features, n_latent_macro_features)
+        self.latent_macro_transform_mean = nn.Linear(n_macro_features, n_latent_macro_features)
+        self.latent_macro_transform_std = nn.Linear(n_macro_features, n_latent_macro_features)
+        self.latent_macro_transform_shape = nn.Linear(n_macro_features, n_latent_macro_features)
 
         # -------- Encoder --------
         self.patch_embed = PatchEmbed(in_features, patch_size, embed_dim)

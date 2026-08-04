@@ -54,6 +54,7 @@ def get_dataset(config):
         macro_feature_names_full.append(name + "_decay")
 
     total_features = np.concat([market_features, macro_features], axis=0)  # Concatenate market and macro features
+    n_market_features, n_macro_features = market_features.shape[0], macro_features.shape[0]
     
     train_ratio = config.get('train_ratio', 0.70)
     val_ratio = config.get('val_ratio', 0.20)
@@ -62,6 +63,8 @@ def get_dataset(config):
     
     dataset = TradingDataset(
         features=total_features,
+        n_market_features=n_market_features,
+        n_macro_features=n_macro_features,
         feature_names=market_feature_names + macro_feature_names_full,
         price_feature_idx=target_feature_id,
         past_days=config['past_days'],
@@ -369,6 +372,8 @@ def main(config):
     print(f"  Train samples: {len(dataset.train_indices)}")
     print(f"  Val samples: {len(dataset.val_indices)}")
     print(f"  Test samples: {len(dataset.test_indices)}")
+    print(f"  n_market_features: {dataset.n_market_features}")
+    print(f"  n_macro_features: {dataset.n_macro_features}")
     print(f"\nTransformer config:")
     print(f"  Patch size: {config['patch_size']}")
     print(f"  Embed dim: {config['embed_dim']}")
@@ -381,6 +386,9 @@ def main(config):
     
     model = MarketTransformerWithHeads(
         in_features=F,
+        n_market_features=dataset.n_market_features,
+        n_macro_features=dataset.n_macro_features,
+        n_latent_macro_features=config['n_latent_macro_features'],
         patch_size=config['patch_size'],
         embed_dim=config['embed_dim'],
         num_layers=config['num_layers'],
