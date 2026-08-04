@@ -212,6 +212,11 @@ __marimo__/
 *.pkl
 *.json
 *.npy
+*.csv
+*.png
+trading_checkpoints/
+autoformer/pic/
+
 
 
 
