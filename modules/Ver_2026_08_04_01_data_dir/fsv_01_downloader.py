@@ -165,6 +165,7 @@ class FSVDownloader:
 if __name__ == "__main__":
 
     import os
+    from config import get_config
     
     # Use environment variables for security
     FRED_API_KEY = os.environ.get("FRED_API_KEY")
@@ -191,8 +192,11 @@ if __name__ == "__main__":
 
     print(fsv.head())
 
+    config = get_config()
+    data_dir = config.get('data_dir', 'dataset_cache')
+
     fsv.to_csv(
-        "fsv_raw.csv",
+        f"{data_dir}/fsv_raw.csv",
         index=False,
         float_format="%.8g",
     )

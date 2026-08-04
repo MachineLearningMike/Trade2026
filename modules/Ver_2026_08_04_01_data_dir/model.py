@@ -175,8 +175,8 @@ class MarketTransformerWithHeads(nn.Module):
         """
         Args:
             x: (B, T, F) — raw market data. T must be divisible by patch_size.
-            mean: (B, F)
-            std: (B, F)
+            mean: (B, F, 1)
+            std: (B, F, 1)
             shape: (B, F, num_shapes)
         """
         B, T, F = x.shape
@@ -193,7 +193,7 @@ class MarketTransformerWithHeads(nn.Module):
         x = self.patch_embed(x)
 
         # -------- 2. Add Positional Encoding --------
-        x = x + self.pos_embed[:, :N, :]
+        x = x + self.pos_embed[:, :N, :]    # (B, N, D)
 
         # -------- 3. Transformer --------
         if self.causal:
@@ -203,8 +203,8 @@ class MarketTransformerWithHeads(nn.Module):
         else:
             attn_mask = None
 
-        x = self.transformer(x, mask=attn_mask)
-        patch_map = self.norm(x)
+        x = self.transformer(x, mask=attn_mask)     # (B, N, D)
+        patch_map = self.norm(x)    # (B, N, D)
 
         # -------- 4. Aggregate for prediction --------
         aggregated = patch_map[:, -1, :]  # (B, D)

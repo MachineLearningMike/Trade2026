@@ -7,8 +7,9 @@ Returns: (value, decay)
     - value: The data value
     - decay: 1 / 2 ** (age / timeframe)
 
-Each feature maintains its own search state across minutes within a batch.
-Results are organized by minute: [ [ (value, decay) for features ] for minutes ]
+One state structure for all features.
+State is reset for each feature, then maintained across minutes within that feature.
+Results are organized by feature: [ [ (value, decay) for minutes ] for features ]
 """
 
 import pandas as pd
@@ -68,12 +69,11 @@ def generate_cache_filename(
     query_datetime_from: Union[str, datetime, pd.Timestamp],
     query_datetime_to: Union[str, datetime, pd.Timestamp],
     is_utc: bool,
-    prefix: str = "fsv_decay",
+    prefix: str = "fsv_value_decay",
 ) -> str:
     """
     Generate a short unique filename by hashing all parameters collectively.
     """
-    # Convert datetimes to strings
     if isinstance(query_datetime_from, pd.Timestamp):
         dt_from_str = query_datetime_from.strftime("%Y%m%d_%H%M%S")
     else:
@@ -84,27 +84,38 @@ def generate_cache_filename(
     else:
         dt_to_str = str(query_datetime_to)
     
-    # Create a single string containing all parameters
     features_str = ",".join(sorted(features))
     param_str = f"{features_str}|{dt_from_str}|{dt_to_str}|{is_utc}"
-    
-    # Hash everything together (8 chars)
     param_hash = hashlib.md5(param_str.encode()).hexdigest()[:8]
     
-    filename = f"{prefix}_{param_hash}.npy"
-    return filename
+    return f"{prefix}_{param_hash}.npy"
 
 
 class FeatureState:
     """
-    Search state for a single feature across minutes.
+    ONE state structure for ALL features.
+    
+    Reset for each feature, then maintained across minutes within that feature.
     """
     
-    def __init__(self, intervals: Dict[str, np.ndarray]):
+    def __init__(self):
+        self.idx = 0
+        self.current_value = None
+        self.initialized = False
+        self.release = None
+        self.next_release = None
+        self.values = None
+        self.timeframe = 0
+    
+    def set_intervals(self, intervals: Dict[str, np.ndarray]):
+        """Set the intervals for the current feature."""
         self.release = intervals['release']
         self.next_release = intervals['next_release']
         self.values = intervals['value']
         self.timeframe = intervals['timeframe']
+    
+    def reset(self):
+        """Reset state for a new feature."""
         self.idx = 0
         self.current_value = None
         self.initialized = False
@@ -118,6 +129,9 @@ class FeatureState:
         next_release = self.next_release
         values = self.values
         timeframe = self.timeframe
+        
+        if release is None:
+            return None, None
         
         # If not initialized, find the first interval
         if not self.initialized:
@@ -172,12 +186,6 @@ class FeatureState:
         
         self.initialized = False
         return None, None
-    
-    def reset(self):
-        """Reset the search state."""
-        self.idx = 0
-        self.current_value = None
-        self.initialized = False
 
 
 class FSVValueLookup:
@@ -185,14 +193,12 @@ class FSVValueLookup:
     Query FSV value intervals for a given datetime.
     
     Returns: (value, decay)
-    Results organized by minute: [ [ (value, decay) for features ] for minutes ]
-    Each feature maintains its own search state across minutes.
+    Results organized by feature: [ [ (value, decay) for minutes ] for features ]
     """
     
     def __init__(
         self,
-        csv_file: str = "fsv_value_intervals.csv",
-        default_features: Optional[List[str]] = None,
+        csv_file: str = "dataset_cache/fsv_value_intervals.csv",
         features_to_exclude: Optional[List[str]] = None,
         cache_size: int = 10000,
     ):
@@ -201,7 +207,6 @@ class FSVValueLookup:
         
         Args:
             csv_file: Path to the CSV file containing value intervals
-            default_features: List of features to use by default (if empty, use all available)
             features_to_exclude: List of features to exclude from all queries
             cache_size: Size of the LRU cache for single queries
         """
@@ -230,17 +235,9 @@ class FSVValueLookup:
         self._index = self._build_interval_index(self.features_to_exclude)
         self.features = list(self._index.keys())
         
-        # Set default features (only from available features)
-        if default_features is None or len(default_features) == 0:
-            self.default_features = self.features
-        else:
-            self.default_features = [f for f in default_features if f in self.features]
         
-        # Initialize feature states for available features
-        self._states: Dict[str, FeatureState] = {}
-        for feature in self.features:
-            if feature in self._index:
-                self._states[feature] = FeatureState(self._index[feature])
+        # ONE state structure for ALL features
+        self._state = FeatureState()
         
         # LRU cache for single queries
         self._get_value_cached = lru_cache(maxsize=cache_size)(self._get_value_impl)
@@ -249,8 +246,6 @@ class FSVValueLookup:
         logger.info(f"Features to exclude: {len(self.features_to_exclude)}")
         if self.features_to_exclude:
             logger.info(f"  Excluded: {self.features_to_exclude}")
-        logger.info(f"Default features: {len(self.default_features)}")
-        logger.info(f"States initialized for {len(self._states)} features")
     
     def _build_timezone_map(self) -> Dict[str, str]:
         """Build timezone map from fsv_dictionary.py for all features."""
@@ -258,7 +253,6 @@ class FSVValueLookup:
         for feature, meta in FEATURES.items():
             tz = meta.get("timezone", "America/New_York")
             timezone_map[feature] = tz
-        logger.info(f"Timezone map built for {len(timezone_map)} features")
         return timezone_map
     
     def _build_interval_index(self, features_to_exclude: List[str]) -> Dict[str, Dict[str, np.ndarray]]:
@@ -285,7 +279,6 @@ class FSVValueLookup:
         index: Dict[str, Dict[str, np.ndarray]] = {}
         
         for feature in self.df["feature"].unique():
-            # Skip excluded features - EXCLUDE IN FIRST PLACE
             if feature in exclude_set:
                 continue
             
@@ -315,8 +308,7 @@ class FSVValueLookup:
             query_dt = query_dt.tz_convert('UTC')
         
         tz = pytz.timezone(tz_str)
-        local_dt = query_dt.tz_convert(tz)
-        return local_dt.replace(tzinfo=None)
+        return query_dt.tz_convert(tz).replace(tzinfo=None)
     
     def _prepare_query_dt_local(
         self,
@@ -386,10 +378,9 @@ class FSVValueLookup:
         Only includes features that are in self._index (excluded ones are already filtered out).
         """
         if features is None:
-            return self.features
+            return [f for f in self.features if f not in self.features_to_exclude]
         
-        # Features are already filtered at _build_interval_index level
-        return [f for f in self.features if f in features]
+        return [f for f in self.features if f in features and f not in self.features_to_exclude]
     
     def get_value_decay_batch_accumulated(
         self,
@@ -399,64 +390,53 @@ class FSVValueLookup:
         is_utc: bool = False,
     ) -> Tuple[List[List[Tuple[Optional[float], Optional[float]]]], Dict[str, int]]:
         """
-        Returns results by minute and miss counts per feature.
+        Returns results organized by feature: [ [ (value, decay) for minutes ] for features ]
+        and miss counts per feature.
         
-        Returns:
-            Tuple of (results, miss_counts)
-            - results: List of lists: for each minute, a list of (value, decay) for each feature.
-            - miss_counts: Dict mapping feature name -> number of times it returned None.
+        ONE state structure for ALL features.
+        State is reset for each feature, then maintained across minutes within that feature.
         """
         features = self.get_arranged_features(features)
         
-        # Convert to datetime
-        if isinstance(query_datetime_from, str):
-            dt_from = pd.Timestamp(query_datetime_from)
-        else:
-            dt_from = pd.Timestamp(query_datetime_from)
+        dt_from = pd.Timestamp(query_datetime_from)
+        dt_to = pd.Timestamp(query_datetime_to)
+        total_minutes = int((dt_to - dt_from).total_seconds() / 60)
         
-        if isinstance(query_datetime_to, str):
-            dt_to = pd.Timestamp(query_datetime_to)
-        else:
-            dt_to = pd.Timestamp(query_datetime_to)
-        
-        # Calculate total minutes
-        total_seconds = (dt_to - dt_from).total_seconds()
-        total_minutes = int(total_seconds / 60)
-        
-        # If start and end are the same or less than 1 minute, return empty
         if total_minutes <= 0:
             return [], {feature: 0 for feature in features}
         
         logger.info(f"Getting values for {len(features)} features over {total_minutes} minutes")
         
-        # Reset all states for the features being queried
-        for feature in features:
-            if feature in self._states:
-                self._states[feature].reset()
-        
-        # Initialize miss counter for each feature
-        miss_counts = {feature: 0 for feature in features}
-        
-        # Generate all minute datetimes
+        # Generate all minute datetimes ONCE
         minute_dt_strs = [(dt_from + timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M:%S") 
                          for i in range(total_minutes)]
         
-        results = []
+        results_by_feature = []
+        miss_counts = {feature: 0 for feature in features}
         
-        # Process minute by minute
-        for i, dt_str in enumerate(minute_dt_strs):
-            query_dt = pd.Timestamp(dt_str)
-            minute_results = []
+        # ONE state structure for ALL features
+        state = self._state
+        
+        for fid, feature in enumerate(features):
+            if feature not in self._index:
+                results_by_feature.append([(None, None)] * total_minutes)
+                miss_counts[feature] += total_minutes
+                continue
+
+            print(f"{fid+1}. Processing feature: {feature} ({len(minute_dt_strs)} minutes) ...")
             
-            for feature in features:
-                if feature not in self._states:
-                    minute_results.append((None, None))
-                    miss_counts[feature] += 1
-                    continue
+            # ==========================================================
+            # RESET STATE FOR THIS FEATURE (fresh start)
+            # ==========================================================
+            state.reset()
+            state.set_intervals(self._index[feature])
+            
+            feature_results = []
+            
+            # Process ALL minutes for THIS feature
+            for i, dt_str in enumerate(minute_dt_strs):
+                query_dt = pd.Timestamp(dt_str)
                 
-                state = self._states[feature]
-                
-                # Convert to local timezone if needed
                 if is_utc:
                     tz_str = self._timezone_map.get(feature, "America/New_York")
                     tz = pytz.timezone(tz_str)
@@ -466,25 +446,20 @@ class FSVValueLookup:
                 
                 query_np = np.datetime64(query_dt_local)
                 
+                # state is maintained across minutes within this feature
                 value, decay = state.advance_to(query_np, query_dt_local)
                 if value is None:
                     miss_counts[feature] += 1
-                minute_results.append((value, decay))
+                feature_results.append((value, decay))
             
-            results.append(minute_results)
+            results_by_feature.append(feature_results)
         
-        return results, miss_counts
+        return results_by_feature, miss_counts
     
     def get_features(self) -> list:
-        """Return all available features (excluded ones are not included)."""
         return self.features
     
-    def get_default_features(self) -> list:
-        """Return the default features."""
-        return self.default_features
-    
     def get_excluded_features(self) -> list:
-        """Return the list of excluded features."""
         return self.features_to_exclude
     
     def get_date_range(self) -> tuple:
@@ -493,12 +468,6 @@ class FSVValueLookup:
     def clear_cache(self):
         self._get_value_cached.cache_clear()
         logger.info("Cache cleared")
-    
-    def reset_states(self):
-        """Reset all feature search states."""
-        for state in self._states.values():
-            state.reset()
-        logger.info("All states reset")
 
 
 def format_value(value: Optional[float]) -> str:
@@ -522,27 +491,25 @@ def get_value_age_array(config):
     print("=" * 60)
     
     # Create cache directory
-    cache_dir = "cache"
-    os.makedirs(cache_dir, exist_ok=True)
+    data_dir = config.get("data_dir", "dataset_cache")
+    os.makedirs(data_dir, exist_ok=True)
     
     # Initialize lookup with excluded features
-    features_to_exclude = ["ted_spread", "commercial_paper_3m", "fhfa_price"]
+    features_to_exclude = config.get("features_to_exclude", [])
     
     lookup = FSVValueLookup(
-        "fsv_value_intervals.csv",
-        default_features=["building_permits", "10y_treasury", "sp500", "vix"],
+        f"{data_dir}/fsv_value_intervals.csv",
         features_to_exclude=features_to_exclude,
         cache_size=10000,
     )
     
     print(f"\nExcluded features: {lookup.get_excluded_features()}")
     print(f"Available features: {len(lookup.get_features())}")
-    print(f"Default features: {lookup.get_default_features()}")
     
-    # Define query parameters - USE A PROPER TIME RANGE
+    # Define query parameters
     dt_from = config.get('binance_start_date', "2024-01-01 00:00:00")
     dt_to = config.get('binance_end_date', "2026-07-01 00:00:00")
-    features = None  # Will use default features
+    features = None
     features = lookup.get_arranged_features(features)
     is_utc = True
     
@@ -550,16 +517,21 @@ def get_value_age_array(config):
     print(f"Time range: {dt_from} to {dt_to}")
     print(f"Is UTC: {is_utc}")
     
-    # Generate cache filename (short hash of all parameters)
+    # Generate cache filename
     cache_filename = generate_cache_filename(
         features=features,
         query_datetime_from=dt_from,
         query_datetime_to=dt_to,
         is_utc=is_utc,
     )
-    cache_path = os.path.join(cache_dir, cache_filename)
+    cache_path = os.path.join(data_dir, cache_filename)
     
     print(f"\nCache file: {cache_path}")
+    
+    # Initialize variables
+    arr = np.array([], dtype=np.float32)
+    total_minutes = 0
+    miss_counts = {}
     
     # ==========================================================
     # Check if cache exists, load or compute
@@ -574,15 +546,15 @@ def get_value_age_array(config):
         print(f"Load time: {elapsed:.4f}s")
         
         # Load metadata if exists
-        metadata_path = cache_path.replace('.npy', '_metadata.json')
+        metadata_path = cache_path.replace('.npy', '_meta.json')
         if os.path.exists(metadata_path):
             with open(metadata_path, 'r') as f:
                 metadata = json.load(f)
             miss_counts = metadata.get('miss_counts', {})
-            total_minutes = metadata.get('total_minutes', arr.shape[0])
+            total_minutes = metadata.get('total_minutes', arr.shape[1] if len(arr.shape) > 1 else 0)
         else:
             miss_counts = {}
-            total_minutes = arr.shape[0]
+            total_minutes = arr.shape[1] if len(arr.shape) > 1 else 0
     else:
         print("\nCache miss! Computing...")
         
@@ -596,13 +568,14 @@ def get_value_age_array(config):
         )
         compute_time = time.time() - start
         
-        total_minutes = len(results)
+        total_features = len(results)
         
-        if total_minutes == 0:
-            print("No minutes to process. Check your time range.")
+        if total_features == 0:
+            print("No features to process. Check your feature list.")
             arr = np.array([], dtype=np.float32)
         else:
-            print(f"Results shape: {total_minutes} minutes x {len(results[0]) if results else 0} features")
+            total_minutes = len(results[0]) if results else 0
+            print(f"Results shape: {total_features} features x {total_minutes} minutes")
             print(f"Compute time: {compute_time:.4f}s")
             
             # Convert to numpy array
@@ -630,7 +603,7 @@ def get_value_age_array(config):
                 'shape': arr.shape,
                 'features_to_exclude': lookup.get_excluded_features(),
             }
-            metadata_path = cache_path.replace('.npy', '_metadata.json')
+            metadata_path = cache_path.replace('.npy', '_meta.json')
             with open(metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=2)
             print(f"Saved metadata to: {metadata_path}")
@@ -665,9 +638,9 @@ def get_value_age_array(config):
         
         feature_null_stats = []
         
-        for j, feature in enumerate(features):
-            feature_nan_count = nan_mask[:, j, :].sum()
-            feature_nan_pct = feature_nan_count / (arr.shape[0] * 2) * 100  # 2 = value + decay
+        for i, feature in enumerate(features):
+            feature_nan_count = nan_mask[i, :, :].sum()
+            feature_nan_pct = feature_nan_count / (arr.shape[1] * 2) * 100  # 2 = value + decay
             
             miss_count = miss_counts.get(feature, 0)
             miss_pct = miss_count / total_minutes * 100 if total_minutes > 0 else 0
@@ -732,81 +705,33 @@ def get_value_age_array(config):
         # ==========================================================
         
         print("\n" + "=" * 60)
-        print("Sample data (first 3 minutes)")
+        print("Sample data (first 3 features, first 5 minutes)")
         print("=" * 60)
         
         for i in range(min(3, arr.shape[0])):
-            dt = pd.Timestamp(dt_from) + timedelta(minutes=i)
-            print(f"\n  Minute {i} ({dt.strftime('%Y-%m-%d %H:%M:%S')}):")
-            for j, feature in enumerate(features[:5]):  # Show first 5 features
+            feature = features[i]
+            print(f"\n  {feature}:")
+            for j in range(min(5, arr.shape[1])):
+                dt = pd.Timestamp(dt_from) + timedelta(minutes=j)
                 value = arr[i, j, 0]
                 decay = arr[i, j, 1]
-                print(f"    {feature}: value={value:.4f}, decay={decay:.4f}")
-            if len(features) > 5:
-                print(f"    ... and {len(features) - 5} more features")
+                print(f"    Minute {j} ({dt.strftime('%H:%M:%S')}): value={value:.4f}, decay={decay:.4f}")
     
     print("\n" + "=" * 60)
     print("Done!")
     print("=" * 60)
 
-    return arr
+    shape = arr.shape   # (num_features, num_minutes, 2)
+    reshaped = arr.transpose(0, 2, 1).reshape(-1, shape[1])     # Reshape to (num_features * 2, num_minutes)
 
+    return reshaped, lookup.features
 
-def load_value_age_array(
-    query_datetime_from: Union[str, datetime, pd.Timestamp],
-    query_datetime_to: Union[str, datetime, pd.Timestamp],
-    features: Optional[List[str]] = None,
-    features_to_exclude: Optional[List[str]] = None,
-    is_utc: bool = False,
-    cache_dir: str = "cache",
-):
-    lookup = FSVValueLookup(
-        "fsv_value_intervals.csv",
-        default_features=[],
-        features_to_exclude=features_to_exclude,
-        cache_size=10000,
-    )
-    
-    print(f"\nExcluded features: {lookup.get_excluded_features()}")
-    print(f"Available features: {len(lookup.get_features())}")
-    print(f"Default features: {lookup.get_default_features()}")
-    
-    features = lookup.get_arranged_features(features)
-    
-    print(f"\nFeatures to query: {features}, len={len(features)}")
-    print(f"Time range: {query_datetime_from} to {query_datetime_to}")
-    print(f"Is UTC: {is_utc}")
-    
-    # Generate cache filename (short hash of all parameters)
-    cache_filename = generate_cache_filename(
-        features=features,
-        query_datetime_from=query_datetime_from,
-        query_datetime_to=query_datetime_to,
-        is_utc=is_utc,
-    )
-    cache_path = os.path.join(cache_dir, cache_filename)
-    
-    print(f"\nCache file: {cache_path}")
-
-    try:
-        start = time.time()
-        arr = np.load(cache_path)
-        elapsed = time.time() - start
-        print(f"Loaded array shape: {arr.shape}")
-        print(f"Load time: {elapsed:.4f}s")
-    except:
-        print("\nCache miss!`")
-        arr = None
-
-    return arr
 
 
 if __name__ == "__main__":
 
     from config import get_config
 
-    arr = get_value_age_array(get_config())
-    
-    
+    config = get_config()
 
-    
+    arr, macro_feature_str_list = get_value_age_array(config)

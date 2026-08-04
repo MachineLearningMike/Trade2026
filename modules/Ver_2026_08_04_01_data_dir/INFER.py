@@ -203,7 +203,7 @@ def load_test_data(
         max_horizon=config['max_horizon'],
         device='cpu',
         normalize=config['normalize'],
-        cache_dir=config.get('cache_dir', 'dataset_cache'),
+        data_dir=config.get('data_dir', 'dataset_cache'),
         force_recompute=config.get('force_recompute', False),
         split_ratios=(0.7, 0.2, 0.1)
     )
@@ -398,7 +398,7 @@ if __name__ == "__main__":
         max_horizon=config['max_horizon'],
         device='cpu',
         normalize=config['normalize'],
-        cache_dir=config.get('cache_dir', 'dataset_cache'),
+        data_dir=config.get('data_dir', 'dataset_cache'),
         force_recompute=config.get('force_recompute', False),
         split_ratios=(0.7, 0.2, 0.1)  # Train, Val, Test
     )

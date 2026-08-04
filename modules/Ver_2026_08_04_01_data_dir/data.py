@@ -470,7 +470,7 @@ class TradingDataset(Dataset):
         max_horizon: Optional[int] = None,
         device: str = 'cpu',
         normalize: bool = True,
-        cache_dir: Optional[str] = None,
+        data_dir: Optional[str] = None,
         force_recompute: bool = False,
         split_ratios: Optional[Tuple[float, float, float]] = None
     ):
@@ -501,10 +501,10 @@ class TradingDataset(Dataset):
         self.split_ratios = split_ratios
         self.shuffle_split = config.get('shuffle_split', True)
         
-        if cache_dir is None:
-            cache_dir = config.get('cache_dir', 'dataset_cache')
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        if data_dir is None:
+            data_dir = config.get('data_dir', 'dataset_cache')
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
         
         self.Total = self._stack_features(features)
         self.F, self.T = self.Total.shape
@@ -522,7 +522,7 @@ class TradingDataset(Dataset):
         self.valid_starts = self._get_valid_starts()
         
         self.cache_key = self._generate_cache_key(config)
-        self.cache_file = self.cache_dir / f"{self.cache_key}.pkl"
+        self.cache_file = self.data_dir / f"labels_{self.cache_key}.pkl"
         
         # Load or compute labels and normalization parameters
         self.label_tensor, self.mean_tensor, self.std_tensor, self.shape_tensor, self.stats = self._load_or_compute_labels()
@@ -936,11 +936,11 @@ class TradingDataset(Dataset):
             print(f"✓ Cache cleared: {self.cache_file}")
     
     @classmethod
-    def clear_all_caches(cls, cache_dir: Optional[str] = None):
-        if cache_dir is None:
+    def clear_all_caches(cls, data_dir: Optional[str] = None):
+        if data_dir is None:
             config = get_config()
-            cache_dir = config.get('cache_dir', 'dataset_cache')
-        cache_path = Path(cache_dir)
+            data_dir = config.get('data_dir', 'dataset_cache')
+        cache_path = Path(data_dir)
         if cache_path.exists():
             import shutil
             shutil.rmtree(cache_path)
@@ -1036,17 +1036,40 @@ class ThreadedDataLoader:
         
         self.current_batch_start = resume_batch_start
         self.running = True
+        
+        # Create iterator BEFORE starting thread
         self._create_iterator()
-        self._start_prefetch()  # ← Start ONCE for the entire epoch
+        
+        # Start prefetch thread
+        self._start_prefetch()
     
     def _create_iterator(self):
+        """Create iterator with safety checks."""
+        if self.current_epoch_indices is None:
+            self.current_epoch_indices = list(range(len(self.dataset)))
+            if self.shuffle:
+                random.seed(42 + self.epoch)
+                random.shuffle(self.current_epoch_indices)
+        
+        # Safety: ensure batch_start is within bounds
         start = self.current_batch_start * self.batch_size
+        if start >= len(self.current_epoch_indices):
+            print(f"⚠ Batch start {start} exceeds indices length {len(self.current_epoch_indices)}. Resetting.")
+            self.current_batch_start = 0
+            start = 0
+        
         remaining_indices = self.current_epoch_indices[start:]
+        
+        if len(remaining_indices) == 0:
+            print(f"⚠ No remaining indices. Resetting to full epoch.")
+            self.current_batch_start = 0
+            remaining_indices = self.current_epoch_indices
+        
         self.iterator = self._batch_generator(remaining_indices)
     
     def _batch_generator(self, indices):
         """Generator that yields batches."""
-        dataset_get = self.dataset.__getitem__
+        # dataset_get = self.dataset.__getitem__
         batch_size = self.batch_size
         
         for i in range(0, len(indices), batch_size):
@@ -1055,12 +1078,16 @@ class ThreadedDataLoader:
             x_list, y_list, mean_list, std_list, shape_list = [], [], [], [], []
             
             for idx in batch_indices:
-                x, y, mean, std, shape = dataset_get(idx)
-                x_list.append(x)
-                y_list.append(y)
-                mean_list.append(mean)
-                std_list.append(std)
-                shape_list.append(shape)
+                try:
+                    x, y, mean, std, shape = self.dataset.__getitem__(idx)
+                    x_list.append(x)
+                    y_list.append(y)
+                    mean_list.append(mean)
+                    std_list.append(std)
+                    shape_list.append(shape)
+                except IndexError as e:
+                    print(f"⚠ IndexError for idx={idx}, dataset length={len(self.dataset)}, indices length={len(self.current_epoch_indices)}")
+                    raise
             
             x_batch = torch.stack(x_list)
             y_batch = torch.stack(y_list)
@@ -1068,13 +1095,13 @@ class ThreadedDataLoader:
             std_batch = torch.stack(std_list)
             shape_batch = torch.stack(shape_list)
             
-            yield x_batch, y_batch, mean_batch, std_batch, shape_batch
+            yield x_batch, y_batch, mean_batch, std_batch, shape_batch      # All normalized and ready for model input
     
     def get_total_batches_in_epoch(self):
         """Get total number of batches in current epoch."""
         if self.current_epoch_indices is None:
             return math.ceil(len(self.dataset) / self.batch_size)
-        return math.ceil(len(self.current_epoch_indices) / self.batch_size)
+        return max(1, math.ceil(len(self.current_epoch_indices) / self.batch_size))
     
     def get_state(self):
         """Get current state for resuming."""
@@ -1097,7 +1124,7 @@ class ThreadedDataLoader:
     def _start_prefetch(self):
         """Start the prefetch thread (only if not already running)."""
         if self.prefetch_thread and self.prefetch_thread.is_alive():
-            return  # ← Don't restart if already running!
+            return
         
         self.load_start_time = time.time()
         self.prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
@@ -1106,20 +1133,31 @@ class ThreadedDataLoader:
     def _prefetch_worker(self):
         """Continuous worker that prefetches ALL batches."""
         try:
+            # Safety: ensure iterator exists
+            if self.iterator is None:
+                print("⚠ Iterator is None in prefetch worker. Creating...")
+                self._create_iterator()
+            
             while self.running:
                 try:
+                    # Safety: check if iterator exists
+                    if self.iterator is None:
+                        print("⚠ Iterator became None. Recreating...")
+                        self._create_iterator()
+                        if self.iterator is None:
+                            self.prefetch_queue.put(('error', RuntimeError("Iterator is None"), 0))
+                            return
+                    
                     batch = next(self.iterator)
                     load_time = time.time() - self.load_start_time
                     self.prefetch_queue.put(('data', batch, load_time))
                     self.load_start_time = time.time()
                 except StopIteration:
-                    # Iterator exhausted - put STOP and exit
                     break
                 except Exception as e:
                     self.prefetch_queue.put(('error', e, 0))
                     return
             
-            # Only put STOP if we're still running (not stopped externally)
             if self.running:
                 self.prefetch_queue.put(('stop', None, 0))
             self.running = False
@@ -1144,7 +1182,9 @@ class ThreadedDataLoader:
     def get_next_batch(self):
         """Get the next batch from the queue."""
         try:
-            status, data, load_time = self.prefetch_queue.get()
+            status, data, load_time = self.prefetch_queue.get(timeout=0.1)
+        except queue.Empty:
+            return None, 0
         except Exception as e:
             print(f"🔍 DEBUG: queue.get() raised: {e}")
             return None, 0

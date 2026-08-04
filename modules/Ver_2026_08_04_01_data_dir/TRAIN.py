@@ -45,15 +45,13 @@ def get_dataset(config):
             print("⚠ Failed to fetch Binance data.")
             sys.exit(1)
 
-    n_market_features = len(market_features)
-
     # Add Financial State Vectors (FSV) to features    
     from fsv_03_query_value_age import get_value_age_array
     macro_features, macro_feature_names = get_value_age_array(config)
     macro_feature_names_full = []
     for name in macro_feature_names:
         macro_feature_names_full.append(name + "_value")
-        macro_feature_names_full.append(name + "_age")
+        macro_feature_names_full.append(name + "_decay")
 
     total_features = np.concat([market_features, macro_features], axis=0)  # Concatenate market and macro features
     
@@ -74,7 +72,7 @@ def get_dataset(config):
         max_horizon=config['max_horizon'],
         device=config['device'],
         normalize=config['normalize'],
-        cache_dir=config.get('cache_dir', 'dataset_cache'),
+        data_dir=config.get('data_dir', 'dataset_cache'),
         force_recompute=config.get('force_recompute', False),
         split_ratios=split_ratios
     )

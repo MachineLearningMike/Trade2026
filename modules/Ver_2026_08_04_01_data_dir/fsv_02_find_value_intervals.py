@@ -212,9 +212,11 @@ if __name__ == "__main__":
     
     import sys
     import os
+    from config import get_config
+    data_dir = get_config().get('data_dir', 'dataset_cache')
     
-    RAW_FILE = "fsv_raw.csv"
-    OUTPUT_FILE = "fsv_value_intervals.csv"
+    RAW_FILE = f"{data_dir}/fsv_raw.csv"
+    OUTPUT_FILE = f"{data_dir}/fsv_value_intervals.csv"
     
     print("\n" + "=" * 60)
     print("FSV Availability Builder")

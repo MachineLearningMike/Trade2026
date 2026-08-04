@@ -1106,6 +1106,7 @@ class ResumableTrainer:
             compute_start = time.perf_counter()
             
             x, y, mean, std, shape = batch   # All normalized and ready for model input
+            # x: (batch_size, F, T), y: (batch_size, output_dim), mean: (batch_size, F, 1), std: (batch_size, F, 1), shape: (batch_size, F, 4)
             
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -1113,7 +1114,7 @@ class ResumableTrainer:
             std = std.to(device, non_blocking=True)
             shape = shape.to(device, non_blocking=True)
             
-            x = x.transpose(1, 2)
+            x = x.transpose(1, 2)   # (batch_size, T, F) for model input
             
             optimizer.zero_grad()
             P = model(x, mean, std, shape)

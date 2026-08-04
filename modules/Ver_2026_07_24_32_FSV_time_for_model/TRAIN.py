@@ -53,7 +53,7 @@ def get_dataset(config):
     macro_feature_names_full = []
     for name in macro_feature_names:
         macro_feature_names_full.append(name + "_value")
-        macro_feature_names_full.append(name + "_age")
+        macro_feature_names_full.append(name + "_decay")
 
     total_features = np.concat([market_features, macro_features], axis=0)  # Concatenate market and macro features
     
