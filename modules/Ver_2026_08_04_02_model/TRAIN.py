@@ -126,7 +126,7 @@ def main(config):
                        help='Number of transformer layers')
     parser.add_argument('--num-heads', type=int, default=config['num_heads'],
                        help='Number of attention heads')
-    parser.add_argument('--ff-dim', type=int, default=config['ff_dim'],
+    parser.add_argument('--ff-dim-multiplier', type=int, default=config['ff_dim_multiplier'],
                        help='Feed-forward dimension')
     parser.add_argument('--dropout', type=float, default=config['dropout'], help='Dropout rate')
     parser.add_argument('--head-hidden-dim', type=int, default=config['head_hidden_dim'],
@@ -174,7 +174,7 @@ def main(config):
     config['patch_size'] = args.patch_size
     config['num_layers'] = args.num_layers
     config['num_heads'] = args.num_heads
-    config['ff_dim'] = args.ff_dim
+    config['ff_dim_multiplier'] = args.ff_dim_multiplier
     config['dropout'] = args.dropout
     config['head_hidden_dim'] = args.head_hidden_dim
     config['causal'] = not args.no_causal
@@ -375,7 +375,7 @@ def main(config):
     print(f"  Max seq len: {config['max_seq_len']}")
     print(f"  Num layers: {config['num_layers']}")
     print(f"  Num heads: {config['num_heads']}")
-    print(f"  FF dim: {config['ff_dim']}")
+    print(f"  FF dim multiplier: {config['ff_dim_multiplier']}")
     print(f"  Causal: {config['causal']}")
     print(f"  Use reconstruction: {config['use_reconstruction']}")
     
@@ -385,7 +385,7 @@ def main(config):
         embed_dim=config['embed_dim'],
         num_layers=config['num_layers'],
         num_heads=config['num_heads'],
-        ff_dim=config['ff_dim'],
+        ff_dim_multiplier=config['ff_dim_multiplier'],
         dropout=config['dropout'],
         max_seq_len=config['max_seq_len'],
         causal=config['causal'],

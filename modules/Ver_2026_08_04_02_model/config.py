@@ -85,7 +85,7 @@ config = {
     'embed_dim': None,  # AUTO-COMPUTED
     'num_layers': 16,
     'num_heads': 8,
-    'ff_dim': 256,
+    'ff_dim_multiplier': 4,
     'dropout': 0.1,
     'causal': False,
     'max_seq_len': None,  # AUTO-COMPUTED

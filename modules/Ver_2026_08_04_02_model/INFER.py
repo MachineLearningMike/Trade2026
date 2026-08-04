@@ -272,7 +272,7 @@ def load_model(
         embed_dim=embed_dim,
         num_layers=config['num_layers'],
         num_heads=config['num_heads'],
-        ff_dim=config['ff_dim'],
+        ff_dim_multiplier=config['ff_dim_multiplier'],
         dropout=config['dropout'],
         max_seq_len=max_seq_len,
         causal=config['causal'],

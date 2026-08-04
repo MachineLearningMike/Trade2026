@@ -34,7 +34,7 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
         'patch_size': config.get('patch_size'),
         'num_layers': config.get('num_layers'),
         'num_heads': config.get('num_heads'),
-        'ff_dim': config.get('ff_dim'),
+        'ff_dim_multiplier': config.get('ff_dim_multiplier'),
         'dropout': config.get('dropout'),
         'head_hidden_dim': config.get('head_hidden_dim'),
         'causal': config.get('causal'),

@@ -108,7 +108,7 @@ class MarketTransformerWithHeads(nn.Module):
         embed_dim: int,
         num_layers: int,
         num_heads: int,
-        ff_dim: int,
+        ff_dim_multiplier: int,
         dropout: float = 0.1,
         max_seq_len: int = 512,
         causal: bool = True,
@@ -134,6 +134,7 @@ class MarketTransformerWithHeads(nn.Module):
         )
 
         # Transformer encoder
+        ff_dim = ff_dim_multiplier * embed_dim
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -288,7 +289,7 @@ if __name__ == "__main__":
         embed_dim=embed_dim,
         num_layers=config['num_layers'],
         num_heads=config['num_heads'],
-        ff_dim=config['ff_dim'],
+        ff_dim_multiplier=config['ff_dim_multiplier'],
         dropout=config['dropout'],
         max_seq_len=max_seq_len,
         causal=config['causal'],
