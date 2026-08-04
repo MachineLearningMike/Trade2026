@@ -366,7 +366,8 @@ def visualize_linear_trends(
         
         y_start = start + past_window
         y_end = y_start + future_window
-        future_prices = total_tensor[price_feature_idx, y_start:y_end].cpu().numpy()
+        # Total is shaped (T, F) — time first, features second
+        future_prices = total_tensor[y_start:y_end, price_feature_idx].cpu().numpy()
         
         time_steps = np.arange(future_window)
         ax.plot(time_steps, future_prices, 'b-', linewidth=2, label='Actual Prices', alpha=0.7)

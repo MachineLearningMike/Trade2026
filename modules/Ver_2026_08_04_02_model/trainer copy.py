@@ -751,7 +751,7 @@ class ResumableTrainer:
                 try:
                     checkpoint = torch.load(latest, map_location='cpu')
                     completed_epochs = checkpoint.get('epoch', 0) + 1
-                    print(f"DEBUG: Found checkpoint {latest.name} with epoch {completed_epochs}")
+                    # print(f"DEBUG: Found checkpoint {latest.name} with epoch {completed_epochs}")
                 except:
                     completed_epochs = self.state_manager.get_completed_epochs()
             else:
@@ -1053,8 +1053,8 @@ class ResumableTrainer:
         total_batches = self.dataloader.get_total_batches_in_epoch()
         total_samples = len(self.dataloader.current_epoch_indices)
 
-        print(f"🔍 DEBUG EPOCH {epoch+1}: total_batches = {total_batches}, total_samples = {total_samples}")
-        print(f"🔍 DEBUG: dataset len = {len(self.dataloader.dataset)}")
+        # print(f"🔍 DEBUG EPOCH {epoch+1}: total_batches = {total_batches}, total_samples = {total_samples}")
+        # print(f"🔍 DEBUG: dataset len = {len(self.dataloader.dataset)}")
             
         pbar = tqdm(total=total_batches, desc=f'Epoch {epoch+1}',
                     initial=resume_batch_start,
@@ -1092,12 +1092,12 @@ class ResumableTrainer:
             
             result = dataloader.get_next_batch()
             if result is None:
-                print(f"🔍 DEBUG: get_next_batch returned None at batch_count={batch_count}")
+                # print(f"🔍 DEBUG: get_next_batch returned None at batch_count={batch_count}")
                 break
             batch, load_time = result
 
             if batch is None:
-                print(f"🔍 DEBUG: batch is None at batch_count={batch_count}")
+                # print(f"🔍 DEBUG: batch is None at batch_count={batch_count}")
                 break
 
             wait_time = time.time() - wait_start
@@ -1107,7 +1107,7 @@ class ResumableTrainer:
             batch_count += 1
 
             if batch_count % 1000 == 0:
-                print(f"🔍 DEBUG: processed {batch_count} batches")
+                # print(f"🔍 DEBUG: processed {batch_count} batches")
                         
             compute_start = time.perf_counter()
             

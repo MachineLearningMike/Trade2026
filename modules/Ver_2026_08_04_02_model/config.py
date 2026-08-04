@@ -60,7 +60,7 @@ config = {
     'binance_datatype': 'klines',
     'binance_interval': '1m',
     'binance_start_date': '2024-01-01 00:00:00',
-    'binance_end_date': '2024-02-01 00:00:00',
+    'binance_end_date': '2026-07-01 00:00:00',
     'binance_symbols': {
         "BTCUSDT": ["Close", "Volume"],
         "ETHUSDT": ["Close", "Volume"],

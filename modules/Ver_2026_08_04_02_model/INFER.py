@@ -371,7 +371,7 @@ if __name__ == "__main__":
     
     if config.get('use_binance_data', False):
         features, T, nForget, target_feature_id = get_binance_data(config)  # ← 4 values
-        print(f"DEBUG: Got Binance data, target_feature_id = {target_feature_id}")
+        # print(f"DEBUG: Got Binance data, target_feature_id = {target_feature_id}")
     
     if features is None:
         T = 60 * 24 * config['total_synthetic_days']
@@ -381,9 +381,9 @@ if __name__ == "__main__":
         print(f"  Price feature index: {price_feature_idx}")
         features = generate_synthetic_data(T, F, price_feature_idx)
         target_feature_id = price_feature_idx
-        print(f"DEBUG: Generated synthetic data, target_feature_id = {target_feature_id}")
+        # print(f"DEBUG: Generated synthetic data, target_feature_id = {target_feature_id}")
     
-    print(f"DEBUG: Final target_feature_id = {target_feature_id}")
+    # print(f"DEBUG: Final target_feature_id = {target_feature_id}")
     
     # Load the dataset
     print("\nLoading dataset...")

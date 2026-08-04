@@ -106,7 +106,6 @@ def main(config):
     parser.add_argument('--future-minutes', type=int, default=config['future_minutes'],
                        help='Future minutes for prediction')
     parser.add_argument('--batch-size', type=int, default=config['batch_size'], help='Batch size')
-    parser.add_argument('--num-features', type=int, default=config['num_features'], help='Number of features')
     parser.add_argument('--total-days', type=int, default=config['total_synthetic_days'], help='Total days of data')
     parser.add_argument('--step', type=int, default=config['step'], help='Step size for start indices')
     parser.add_argument('--max-accum-deviation', type=float, default=config['max_accum_deviation'],
@@ -164,7 +163,6 @@ def main(config):
     config['past_days'] = args.past_days
     config['future_minutes'] = args.future_minutes
     config['batch_size'] = args.batch_size
-    config['num_features'] = args.num_features
     config['total_synthetic_days'] = args.total_days
     config['step'] = args.step
     config['max_accum_deviation'] = args.max_accum_deviation
