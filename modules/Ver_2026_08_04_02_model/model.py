@@ -108,36 +108,36 @@ class MarketTransformerWithHeads(nn.Module):
         n_macro_features: int,
         n_latent_macro_features: int,
         patch_size: int,
-        embed_dim: int,
         num_layers: int,
         num_heads: int,
         ff_dim_multiplier: int,
         dropout: float = 0.1,
         max_seq_len: int = 512,
         causal: bool = True,
-        head_hidden_dim: int = 128,
+        head_hidden_dim_multiplier: int = 4,
         output_dim: int = 3,
         use_reconstruction: bool = True,
     ):
         super().__init__()
         self.patch_size = patch_size
-        self.embed_dim = embed_dim
         self.in_features = in_features
-        self.causal = causal
-        self.max_seq_len = max_seq_len
-        self.use_reconstruction = use_reconstruction
         self.n_market_features = n_market_features
         self.n_macro_features = n_macro_features
         self.n_latent_macro_features = n_latent_macro_features
+        self.causal = causal
+        self.max_seq_len = max_seq_len
+        self.use_reconstruction = use_reconstruction
 
         #--------- get latent macro features --------
         self.latent_macro_transform_x = nn.Linear(n_macro_features, n_latent_macro_features)
-        self.latent_macro_transform_mean = nn.Linear(n_macro_features, n_latent_macro_features)
-        self.latent_macro_transform_std = nn.Linear(n_macro_features, n_latent_macro_features)
-        self.latent_macro_transform_shape = nn.Linear(n_macro_features, n_latent_macro_features)
+        self.latent_macro_transform_mean = nn.Linear(n_market_features+n_macro_features, n_latent_macro_features)
+        self.latent_macro_transform_std = nn.Linear(n_market_features+n_macro_features, n_latent_macro_features)
+        self.latent_macro_transform_shape = nn.Linear(n_market_features+n_macro_features, n_latent_macro_features)
 
         # -------- Encoder --------
-        self.patch_embed = PatchEmbed(in_features, patch_size, embed_dim)
+        n_features_after_latent_macro = n_market_features + n_latent_macro_features
+        embed_dim = n_features_after_latent_macro * patch_size
+        self.patch_embed = PatchEmbed(n_features_after_latent_macro, patch_size, embed_dim)
 
         # Sinusoidal positional encoding
         self.register_buffer(
@@ -164,7 +164,7 @@ class MarketTransformerWithHeads(nn.Module):
         # -------- Prediction Head --------
         self.prediction_head = PredictionHead(
             embed_dim=embed_dim,
-            hidden_dim=head_hidden_dim,
+            hidden_dim=head_hidden_dim_multiplier * embed_dim,
             output_dim=output_dim,
             dropout=dropout
         )
@@ -192,6 +192,14 @@ class MarketTransformerWithHeads(nn.Module):
             std: (B, F, 1)
             shape: (B, F, num_shapes)
         """
+
+        x_macro = x[:, :, self.n_market_features:]  # (B, T, n_macro_features)
+        x_macro = self.latent_macro_transform_x(x_macro)
+        x = torch.cat([x[:, :, :self.n_market_features], x_macro], dim=-1)  # (B, T, n_market_features + n_latent_macro_features)
+        mean = self.latent_macro_transform_mean(mean)
+        std = self.latent_macro_transform_std(std)
+        shape = self.latent_macro_transform_shape(shape)
+
         B, T, F = x.shape
         device = x.device
         P = self.patch_size
@@ -305,7 +313,7 @@ if __name__ == "__main__":
         dropout=config['dropout'],
         max_seq_len=max_seq_len,
         causal=config['causal'],
-        head_hidden_dim=config['head_hidden_dim'],
+        head_hidden_dim_multiplier=config['head_hidden_dim_multiplier'],
         output_dim=config['output_dim'],
         use_reconstruction=config['use_reconstruction']
     ).to(device)

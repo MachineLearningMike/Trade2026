@@ -29,7 +29,7 @@ config = {
     # ============================================================
     'validate': True,
     'validate_every_n_epochs': 1,
-    'validate_batch_size': 64,
+    'validate_batch_size': 16,
     
     # ============================================================
     # HORIZON LABELING CONFIGURATION
@@ -60,7 +60,7 @@ config = {
     'binance_datatype': 'klines',
     'binance_interval': '1m',
     'binance_start_date': '2024-01-01 00:00:00',
-    'binance_end_date': '2026-07-01 00:00:00',
+    'binance_end_date': '2024-02-01 00:00:00',
     'binance_symbols': {
         "BTCUSDT": ["Close", "Volume"],
         "ETHUSDT": ["Close", "Volume"],
@@ -86,7 +86,7 @@ config = {
     'patch_size': 30,
     'embed_dim': None,  # AUTO-COMPUTED
     'num_layers': 16,
-    'num_heads': 8,
+    'num_heads': 6,
     'ff_dim_multiplier': 4,
     'dropout': 0.1,
     'causal': False,
@@ -95,7 +95,7 @@ config = {
     # ============================================================
     # HEAD CONFIGURATION
     # ============================================================
-    'head_hidden_dim': 64,
+    'head_hidden_dim_multiplier': 4,
     'output_dim': 3,  # horizon, slope, intercept
     
     # ============================================================

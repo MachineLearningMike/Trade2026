@@ -407,7 +407,7 @@ def normalize_window(
     Normalize a window and optionally compute higher-order moments.
     
     Args:
-        window: Input window of shape (F, T)
+        window: Input window of shape (T, F)
         compute_moments: If True, compute shape moments (skewness, kurtosis, etc.)
     
     Returns:
@@ -416,38 +416,35 @@ def normalize_window(
         std: Standard deviation of window (None if compute_moments=False)
         shape: Higher-order moments (None if compute_moments=False)
     """
-    mean = window.mean(dim=1, keepdim=True)
-    std = window.std(dim=1, keepdim=True)
+    mean = window.mean(dim=0)     # (F,)
+    std = window.std(dim=0)       # (F,)
     std[std == 0] = 1
     
-    normalized = (window - mean) / std
+    normalized_x = (window - mean) / std          # (T, F)
     
     if not compute_moments:
-        return normalized, None, None, None
+        return normalized_x, None, None, None
+        
+    centered = window - mean   # (T, F)
     
-    mean = mean.squeeze()
-    std = std.squeeze()
-    
-    centered = window - mean.unsqueeze(1)
-    
-    m3 = (centered ** 3).mean(dim=1)
-    m4 = (centered ** 4).mean(dim=1)
-    m5 = (centered ** 5).mean(dim=1)
-    m6 = (centered ** 6).mean(dim=1)
-    
-    std_sq = std.clamp(min=1e-6)
+    m3 = (centered ** 3).mean(dim=0)    # (T, F -> F)
+    m4 = (centered ** 4).mean(dim=0)    # (T, F -> F)
+    m5 = (centered ** 5).mean(dim=0)    # (T, F -> F)
+    m6 = (centered ** 6).mean(dim=0)    # (T, F -> F)
+
+    std_sq = std.clamp(min=1e-6)    # (F,)
     
     def signed_root(x, power):
         return torch.sign(x) * (torch.abs(x) ** (1/power))
     
-    ms3 = signed_root(m3, 3) / std_sq
-    ms4 = signed_root(m4, 4) / std_sq
-    ms5 = signed_root(m5, 5) / std_sq
-    ms6 = signed_root(m6, 6) / std_sq
+    ms3 = signed_root(m3, 3) / std_sq   # (F,)
+    ms4 = signed_root(m4, 4) / std_sq   # (F,)
+    ms5 = signed_root(m5, 5) / std_sq   # (F,)
+    ms6 = signed_root(m6, 6) / std_sq   # (F,)
+
+    shape = torch.stack([ms3, ms4, ms5, ms6], dim=0)    # (4, F)
     
-    shape = torch.stack([ms3, ms4, ms5, ms6], dim=1)
-    
-    return normalized, mean, std, shape
+    return normalized_x, mean, std, shape     # (T, F), (F,), (F,), (4, F)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -511,7 +508,7 @@ class TradingDataset(Dataset):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         
         self.Total = self._stack_features(features)
-        self.F, self.T = self.Total.shape
+        self.T, self.F = self.Total.shape
         
         self.past_window = 60 * 24 * past_days
         self.future_window = future_minutes
@@ -581,7 +578,7 @@ class TradingDataset(Dataset):
         shapes = [arr.shape for arr in features]
         if len(set(shapes)) != 1:
             raise ValueError(f"All features must have the same shape. Got: {shapes}")
-        stacked = np.stack(features, axis=0)
+        stacked = np.stack(features, axis=1)
         return torch.from_numpy(stacked).float()
     
     def _get_valid_starts(self) -> List[int]:
@@ -725,15 +722,15 @@ class TradingDataset(Dataset):
         
         for idx in tqdm(range(len(self)), desc="Computing labels and norm params"):
             start = self.valid_starts[idx]
-            x = self.Total[:, start:start + self.past_window]
+            x = self.Total[start:start + self.past_window, :]
             
             if self.normalize:
-                x_normalized, mean, std, shape = self._normalize_window(x, compute_moments=True)
+                _, mean, std, shape = self._normalize_window(x, compute_moments=True)
                 mean_list.append(mean)
                 std_list.append(std)
                 shape_list.append(shape)
             else:
-                x_normalized = x
+                # x_normalized = x
                 mean = torch.zeros(self.F)
                 std = torch.ones(self.F)
                 shape = torch.zeros(self.F, self.num_shapes)
@@ -743,7 +740,7 @@ class TradingDataset(Dataset):
 
             y_start = start + self.past_window
             y_end = y_start + self.future_window
-            future_prices = self.Total[self.price_feature_idx, y_start:y_end]
+            future_prices = self.Total[y_start:y_end, self.price_feature_idx]
             
             if self.normalize:
                 price_mean = mean[self.price_feature_idx]
@@ -754,7 +751,7 @@ class TradingDataset(Dataset):
             
             best_h, best_slope, best_intercept = find_shortest_horizon(
                 future_prices_normalized,
-                self.Total[self.price_feature_idx, start:start + self.past_window],
+                self.Total[start:start + self.past_window, self.price_feature_idx],
                 min_horizon=self.min_horizon,
                 max_horizon=self.max_horizon,
                 fitness_threshold=0.75,
@@ -954,25 +951,25 @@ class TradingDataset(Dataset):
     
     def __len__(self) -> int:
         return len(self.valid_starts)
-    
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Optimized __getitem__ with cached references and view() instead of unsqueeze()."""
         
         start = self._valid_starts[idx]
-        x = self._Total[:, start:start + self._past_window]
+        x = self._Total[start:start + self._past_window, :]     # assuming self._Total: (T, F)
         
         if self._normalize:
             # Use view() instead of unsqueeze() - no memory allocation
-            mean = self._mean_tensor[idx].view(-1, 1)
-            std = self._std_tensor[idx].view(-1, 1)
+            mean = self._mean_tensor[idx]       # (F,)
+            std = self._std_tensor[idx]         # (F,)
             std[std == 0] = 1
-            x_normalized = (x - mean) / std
-            shape = self._shape_tensor[idx]
+            x_normalized = (x - mean) / std     # (T, F)
+            shape = self._shape_tensor[idx]    # assuming self._shape_tensor: (num_shapes, F)
         else:
             x_normalized = x
             mean = torch.zeros(self._F)
             std = torch.ones(self._F)
-            shape = torch.zeros(self._F, self.num_shapes)
+            shape = torch.zeros(self.num_shapes, self._F)
         
         # Get label
         y = self._label_tensor[idx]
@@ -982,15 +979,54 @@ class TradingDataset(Dataset):
         y_normalized = self.normalize_y(y)
         
         # Mean: (F,)
-        mean_normalized = (mean - self.stats['mean']['mean'].view(-1, 1)) / (self.stats['mean']['std'].view(-1, 1) + 1e-8)
+        mean_normalized = (mean - self.stats['mean']['mean']) / (self.stats['mean']['std'] + 1e-8)
         
         # Std: (F,)
-        std_normalized = (std - self.stats['std']['mean'].view(-1, 1)) / (self.stats['std']['std'].view(-1, 1) + 1e-8)
+        std_normalized = (std - self.stats['std']['mean']) / (self.stats['std']['std'] + 1e-8)
         
-        # Shape: (F, num_shapes)
+        # Shape: (num_shapes, F), assuming self.stats['shape']['mean'] and self.stats['shape']['std'] are (num_shapes, F)
         shape_normalized = (shape - self.stats['shape']['mean']) / (self.stats['shape']['std'] + 1e-8)
         
         return x_normalized, y_normalized, mean_normalized, std_normalized, shape_normalized
+
+
+    
+    # def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    #     """Optimized __getitem__ with cached references and view() instead of unsqueeze()."""
+        
+    #     start = self._valid_starts[idx]
+    #     x = self._Total[:, start:start + self._past_window]
+        
+    #     if self._normalize:
+    #         # Use view() instead of unsqueeze() - no memory allocation
+    #         mean = self._mean_tensor[idx].view(-1, 1)
+    #         std = self._std_tensor[idx].view(-1, 1)
+    #         std[std == 0] = 1
+    #         x_normalized = (x - mean) / std
+    #         shape = self._shape_tensor[idx]
+    #     else:
+    #         x_normalized = x
+    #         mean = torch.zeros(self._F)
+    #         std = torch.ones(self._F)
+    #         shape = torch.zeros(self.num_shapes, self._F)
+        
+    #     # Get label
+    #     y = self._label_tensor[idx]
+        
+    #     # Normalize label, mean, std, and shape using dataset statistics
+    #     # Label: (horizon, slope, intercept)
+    #     y_normalized = self.normalize_y(y)
+        
+    #     # Mean: (F,)
+    #     mean_normalized = (mean - self.stats['mean']['mean'].view(-1, 1)) / (self.stats['mean']['std'].view(-1, 1) + 1e-8)
+        
+    #     # Std: (F,)
+    #     std_normalized = (std - self.stats['std']['mean'].view(-1, 1)) / (self.stats['std']['std'].view(-1, 1) + 1e-8)
+        
+    #     # Shape: (F, num_shapes)
+    #     shape_normalized = (shape - self.stats['shape']['mean']) / (self.stats['shape']['std'] + 1e-8)
+        
+    #     return x_normalized, y_normalized, mean_normalized, std_normalized, shape_normalized
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1099,7 +1135,7 @@ class ThreadedDataLoader:
             std_batch = torch.stack(std_list)
             shape_batch = torch.stack(shape_list)
             
-            yield x_batch, y_batch, mean_batch, std_batch, shape_batch      # All normalized and ready for model input
+            yield x_batch, y_batch, mean_batch, std_batch, shape_batch      # (B, T, F), (3,), (B, F), (B, F), (B, 4, F). All normalized and ready for model input
     
     def get_total_batches_in_epoch(self):
         """Get total number of batches in current epoch."""

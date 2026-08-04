@@ -276,7 +276,7 @@ def load_model(
         dropout=config['dropout'],
         max_seq_len=max_seq_len,
         causal=config['causal'],
-        head_hidden_dim=config['head_hidden_dim'],
+        head_hidden_dim_multiplier=config['head_hidden_dim_multiplier'],
         output_dim=config['output_dim'],
         use_reconstruction=config['use_reconstruction']
     )

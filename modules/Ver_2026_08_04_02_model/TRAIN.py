@@ -132,8 +132,8 @@ def main(config):
     parser.add_argument('--ff-dim-multiplier', type=int, default=config['ff_dim_multiplier'],
                        help='Feed-forward dimension')
     parser.add_argument('--dropout', type=float, default=config['dropout'], help='Dropout rate')
-    parser.add_argument('--head-hidden-dim', type=int, default=config['head_hidden_dim'],
-                       help='Hidden dimension for prediction heads')
+    parser.add_argument('--head-hidden-dim-multiplier', type=int, default=config['head_hidden_dim_multiplier'],
+                       help='Hidden dimension multiplier for prediction heads')
     parser.add_argument('--no-causal', action='store_true', default=not config['causal'],
                        help='Disable causal attention')
     parser.add_argument('--no-reconstruction', action='store_true', default=not config['use_reconstruction'],
@@ -179,7 +179,7 @@ def main(config):
     config['num_heads'] = args.num_heads
     config['ff_dim_multiplier'] = args.ff_dim_multiplier
     config['dropout'] = args.dropout
-    config['head_hidden_dim'] = args.head_hidden_dim
+    config['head_hidden_dim_multiplier'] = args.head_hidden_dim_multiplier
     config['causal'] = not args.no_causal
     config['use_reconstruction'] = not args.no_reconstruction
     config['use_binance_data'] = args.use_binance
@@ -390,14 +390,13 @@ def main(config):
         n_macro_features=dataset.n_macro_features,
         n_latent_macro_features=config['n_latent_macro_features'],
         patch_size=config['patch_size'],
-        embed_dim=config['embed_dim'],
         num_layers=config['num_layers'],
         num_heads=config['num_heads'],
         ff_dim_multiplier=config['ff_dim_multiplier'],
         dropout=config['dropout'],
         max_seq_len=config['max_seq_len'],
         causal=config['causal'],
-        head_hidden_dim=config['head_hidden_dim'],
+        head_hidden_dim_multiplier=config['head_hidden_dim_multiplier'],
         output_dim=config['output_dim'],
         use_reconstruction=config['use_reconstruction']
     )

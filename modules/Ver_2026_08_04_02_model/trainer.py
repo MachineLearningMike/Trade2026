@@ -37,7 +37,7 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
         'n_latent_macro_features': config.get('n_latent_macro_features'),
         'ff_dim_multiplier': config.get('ff_dim_multiplier'),
         'dropout': config.get('dropout'),
-        'head_hidden_dim': config.get('head_hidden_dim'),
+        'head_hidden_dim_multiplier': config.get('head_hidden_dim_multiplier'),
         'causal': config.get('causal'),
         'use_reconstruction': config.get('use_reconstruction'),
         'past_days': config.get('past_days'),
@@ -690,15 +690,22 @@ class ResumableTrainer:
         total_batches = loader.get_total_batches_in_epoch()
         
         with torch.no_grad():
-            pbar = tqdm(total=total_batches, desc=desc, mininterval=0.5, miniters=5)
+            # Create progress bar with proper settings
+            pbar = tqdm(total=total_batches, desc=desc, 
+                        mininterval=0.5, miniters=1,  # Update more frequently
+                        smoothing=0.1)  # Smooth the rate calculation
+            
             while True:
                 batch, load_time = loader.get_next_batch()
                 if batch is None:
                     break
                 
                 x, y, mean, std, shape = batch
-                x, y = x.to(self.device), y.to(self.device)
-                x = x.transpose(1, 2)
+                x = x.to(self.device, non_blocking=True)
+                y = y.to(self.device, non_blocking=True)
+                mean = mean.to(self.device, non_blocking=True)
+                std = std.to(self.device, non_blocking=True)
+                shape = shape.to(self.device, non_blocking=True)
                 
                 P = self.model(x, mean, std, shape)
                 L = self.loss_fn(P, x, y)
@@ -706,15 +713,17 @@ class ResumableTrainer:
                 total_loss += L.item()
                 num_batches += 1
                 
-                update_cycle = 5
-                if num_batches % update_cycle == 0 or num_batches == 1:
-                    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-                    pbar.set_postfix({'loss': f'{avg_loss:.4f}'})
-                if num_batches % update_cycle == 0:
-                    pbar.update(update_cycle if num_batches > update_cycle else 1)
-                    pbar.set_postfix({'loss': f'{L.item():.4f}'})
+                # Update progress bar every batch
+                avg_loss = total_loss / num_batches
+                pbar.update(1)  # Always update by 1 batch
+                pbar.set_postfix({
+                    'loss': f'{avg_loss:.4f}',
+                    'batch': f'{num_batches}/{total_batches}'
+                })
             
-            pbar.update(total_batches - pbar.n)
+            # Ensure progress bar reaches 100%
+            if pbar.n < total_batches:
+                pbar.update(total_batches - pbar.n)
             pbar.close()
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
@@ -1057,6 +1066,8 @@ class ResumableTrainer:
                     initial=resume_batch_start,
                     mininterval=0.5,
                     miniters=5)
+
+        if resume_batch_start > 0: pbar.refresh()
         
         batch_idx = resume_batch_start
         total_loss = 0.0
@@ -1114,8 +1125,6 @@ class ResumableTrainer:
             mean = mean.to(device, non_blocking=True)
             std = std.to(device, non_blocking=True)
             shape = shape.to(device, non_blocking=True)
-            
-            x = x.transpose(1, 2)   # (batch_size, T, F) for model input
             
             optimizer.zero_grad()
             P = model(x, mean, std, shape)
