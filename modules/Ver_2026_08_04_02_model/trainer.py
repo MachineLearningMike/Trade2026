@@ -40,12 +40,6 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
         'head_hidden_dim_multiplier': config.get('head_hidden_dim_multiplier'),
         'causal': config.get('causal'),
         'use_reconstruction': config.get('use_reconstruction'),
-        'past_days': config.get('past_days'),
-        'future_minutes': config.get('future_minutes'),
-        'step': config.get('step'),
-        'max_accum_deviation': config.get('max_accum_deviation'),
-        'min_horizon': config.get('min_horizon'),
-        'max_horizon': config.get('max_horizon'),
         'normalize': config.get('normalize'),
         'horizon_mode': config.get('horizon_mode'),
         'weight_type': config.get('weight_type'),
@@ -53,8 +47,6 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
         'slope_loss_weight': config.get('slope_loss_weight'),
         'intercept_loss_weight': config.get('intercept_loss_weight'),
         'reconstruction_loss_weight': config.get('reconstruction_loss_weight'),
-        'learning_rate': config.get('learning_rate'),
-        'device': config.get('device', 'cpu'),
     }
     
     param_string = json.dumps(key_params, sort_keys=True)
@@ -1112,8 +1104,8 @@ class ResumableTrainer:
 
             batch_count += 1
 
-            if batch_count % 1000 == 0:
-                print(f"🔍 DEBUG: processed {batch_count} batches")
+            # if batch_count % 1000 == 0:
+            #     print(f"🔍 DEBUG: processed {batch_count} batches")
                         
             compute_start = time.perf_counter()
             

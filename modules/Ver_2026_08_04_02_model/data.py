@@ -595,99 +595,58 @@ class TradingDataset(Dataset):
         return starts
     
     def _generate_cache_key(self, config) -> str:
+        """
+        Hash everything that changes the contents of labels_*.pkl.
+
+        Cache stores: per-sample labels/mean/std/shape + train-split stats.
+        Do NOT put model/training hyperparams here (those belong in the
+        checkpoint key, which already embeds this signature).
+        """
         import hashlib
-        
-        # ==========================================================
-        # 1. DATA SOURCE PARAMETERS
-        # ==========================================================
-        
-        # Binance data settings
-        use_binance = config.get('use_binance_data', False)
-        binance_datatype = config.get('binance_datatype', 'klines')
-        binance_interval = config.get('binance_interval', '1m')
-        binance_start = config.get('binance_start_date', '2024-01-01')
-        binance_end = config.get('binance_end_date', '2026-06-30')
-                
-        # ==========================================================
-        # 2. TARGET PARAMETERS
-        # ==========================================================
-        
-        pred_target = config.get('prediction_target', ('UNKNOWN', 'UNKNOWN'))
-        pred_symbol, pred_feature = pred_target
-        price_idx = config.get('price_feature_idx', 0)
-        
-        # ==========================================================
-        # 3. FSV FEATURES (from TradingDataset instance)
-        # ==========================================================
-        
-        # Get features_to_include from self (TradingDataset instance)
-        features_to_include = getattr(self, 'feature_names', [])
-        include_str = ",".join(sorted(features_to_include)) if features_to_include else "all"
-        
-        # ==========================================================
-        # 4. DATASET STRUCTURE
-        # ==========================================================
-        
-        past_days = config.get('past_days', 7)
-        future_minutes = config.get('future_minutes', 60)
-        step = config.get('step', 1)
-        
-        # ==========================================================
-        # 5. FILTERS
-        # ==========================================================
-        
-        max_accum_deviation = config.get('max_accum_deviation', 12.0)
-        min_horizon = config.get('min_horizon', 3)
-        max_horizon = config.get('max_horizon', None)
-        
-        # ==========================================================
-        # 6. SPLITS
-        # ==========================================================
-        
-        train_ratio = config.get('train_ratio', 0.70)
-        val_ratio = config.get('val_ratio', 0.20)
-        
-        # ==========================================================
-        # 7. PROCESSING
-        # ==========================================================
-        
-        normalize = config.get('normalize', True)
-        
-        # ==========================================================
-        # 8. F, T DIMENSIONS (from data, not config)
-        # ==========================================================
-        
-        # These come from the actual data, but affect the cache
-        F = self.F if hasattr(self, 'F') else 0
-        T = self.T if hasattr(self, 'T') else 0
-        
-        # ==========================================================
-        # 9. BUILD HASH STRING
-        # ==========================================================
-        
-        params = (
-            f"{use_binance}"
-            f"{binance_datatype}"
-            f"{binance_interval}"
-            f"{binance_start}"
-            f"{binance_end}"
-            f"{pred_symbol}.{pred_feature}"
-            f"{price_idx}"
-            f"{include_str}"
-            f"{past_days}"
-            f"{future_minutes}"
-            f"{step}"
-            f"{max_accum_deviation}"
-            f"{min_horizon}"
-            f"{max_horizon}"
-            f"{train_ratio}"
-            f"{val_ratio}"
-            f"{normalize}"
-            f"{F}"
-            f"{T}"
-        )
-        
-        return hashlib.md5(params.encode()).hexdigest()[:12]
+        import json
+
+        # Label fitness threshold is currently hardcoded in
+        # _compute_labels_and_norm_params; keep it in the key so a code
+        # change there invalidates old caches.
+        fitness_threshold = 0.75
+
+        key_params = {
+            # --- data identity ---
+            'use_binance_data': config.get('use_binance_data', False),
+            'binance_datatype': config.get('binance_datatype', 'klines'),
+            'binance_interval': config.get('binance_interval', '1m'),
+            'binance_start_date': config.get('binance_start_date'),
+            'binance_end_date': config.get('binance_end_date'),
+            'binance_symbols': config.get('binance_symbols'),
+            'features_to_exclude': sorted(config.get('features_to_exclude', [])),
+            'prediction_target': list(config.get('prediction_target', ('UNKNOWN', 'UNKNOWN'))),
+            # Actual target column used for labels (not config default)
+            'price_feature_idx': self.price_feature_idx,
+            # Resolved feature set + shapes (catches load-time differences)
+            'feature_names': list(self.feature_names),
+            'T': self.T,
+            'F': self.F,
+            'num_shapes': self.num_shapes,
+
+            # --- windowing / sampling ---
+            'past_days': self.past_days,
+            'future_minutes': self.future_minutes,
+            'step': self.step,
+
+            # --- label algorithm (only params that currently affect labels) ---
+            'min_horizon': self.min_horizon,
+            'max_horizon': self.max_horizon,
+            'fitness_threshold': fitness_threshold,
+            'normalize': self.normalize,
+
+            # --- train-split stats only (labels themselves ignore splits) ---
+            'train_ratio': self.split_ratios[0],
+            'val_ratio': self.split_ratios[1],
+            'shuffle_split': self.shuffle_split,
+        }
+
+        param_string = json.dumps(key_params, sort_keys=True, default=str)
+        return hashlib.md5(param_string.encode()).hexdigest()[:12]
     
     def _normalize_window(
         self, 
