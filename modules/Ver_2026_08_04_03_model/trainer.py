@@ -25,12 +25,16 @@ from config import get_config
 
 def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
     """
-    Generate a unique key for checkpoints based on config parameters
-    that affect training output.
+    Hash everything that makes model weights / optimizer state non-transferable.
+
+    `dataset_signature` already covers data source, windows, labels, splits,
+    and normalization — do not re-list those here.
     """
-    
     key_params = {
+        # Data + labels (from TradingDataset._generate_cache_key)
         'dataset_signature': dataset_signature,
+
+        # Architecture (changes weight shapes / forward pass)
         'patch_size': config.get('patch_size'),
         'num_layers': config.get('num_layers'),
         'num_heads': config.get('num_heads'),
@@ -38,29 +42,20 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
         'ff_dim_multiplier': config.get('ff_dim_multiplier'),
         'dropout': config.get('dropout'),
         'head_hidden_dim_multiplier': config.get('head_hidden_dim_multiplier'),
+        'output_dim': config.get('output_dim', 3),
         'causal': config.get('causal'),
         'use_reconstruction': config.get('use_reconstruction'),
-        'past_days': config.get('past_days'),
-        'future_minutes': config.get('future_minutes'),
-        'step': config.get('step'),
-        'max_accum_deviation': config.get('max_accum_deviation'),
-        'min_horizon': config.get('min_horizon'),
-        'max_horizon': config.get('max_horizon'),
-        'normalize': config.get('normalize'),
-        'horizon_mode': config.get('horizon_mode'),
-        'weight_type': config.get('weight_type'),
-        'weight_decay': config.get('weight_decay'),
+
+        # Objective + optimizer (same weights, different training meaning)
         'slope_loss_weight': config.get('slope_loss_weight'),
         'intercept_loss_weight': config.get('intercept_loss_weight'),
         'reconstruction_loss_weight': config.get('reconstruction_loss_weight'),
         'learning_rate': config.get('learning_rate'),
-        'device': config.get('device', 'cpu'),
+        'batch_size': config.get('batch_size'),
     }
-    
-    param_string = json.dumps(key_params, sort_keys=True)
-    key = hashlib.md5(param_string.encode()).hexdigest()[:16]
-    
-    return key
+
+    param_string = json.dumps(key_params, sort_keys=True, default=str)
+    return hashlib.md5(param_string.encode()).hexdigest()[:16]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -83,6 +78,7 @@ class TrainingState:
         
         self.state_file = self.save_dir / 'training_state.json'
         self.checkpoint_key = checkpoint_key
+        self.planned_total_epochs = None  # preserved across checkpoint saves
     
     def _cleanup_old_checkpoints(self):
         """Clean up old checkpoint files, keeping only the most recent ones."""
@@ -103,8 +99,21 @@ class TrainingState:
         
     def save_checkpoint(self, model, optimizer, dataloader_state, epoch, batch_idx, 
                         total_minibatches_processed, loss, is_emergency=False, training_finished=False,
-                        val_loss=None, history=None, embed_dim=None, max_seq_len=None):
+                        val_loss=None, history=None, embed_dim=None, max_seq_len=None,
+                        total_epochs=None):
         """Save checkpoint with atomic write to prevent corruption."""
+        # Preserve planned total_epochs across saves (was previously wiped every checkpoint).
+        preserved_total = total_epochs
+        if preserved_total is None and self.state_file.exists():
+            try:
+                with open(self.state_file, 'r') as f:
+                    prev = json.load(f)
+                preserved_total = prev.get('total_epochs')
+            except Exception:
+                preserved_total = None
+        if preserved_total is None:
+            preserved_total = getattr(self, 'planned_total_epochs', None)
+
         checkpoint = {
             'version': 4,
             'epoch': epoch,
@@ -122,6 +131,7 @@ class TrainingState:
             'checkpoint_key': self.checkpoint_key,
             'embed_dim': embed_dim,
             'max_seq_len': max_seq_len,
+            'total_epochs': preserved_total,
         }
         
         timestamp = time.strftime('%Y%m%d_%H%M%S')
@@ -160,7 +170,11 @@ class TrainingState:
             'timestamp': time.time(),
             'is_emergency': is_emergency,
             'checkpoint_key': self.checkpoint_key,
+            'total_epochs': preserved_total,
         }
+        if training_finished:
+            # epoch is 0-based index of last trained epoch
+            state_info['completed_epochs'] = int(epoch) + 1
         
         temp_state = self.state_file.with_suffix('.tmp')
         with open(temp_state, 'w') as f:
@@ -272,48 +286,84 @@ class TrainingState:
         except Exception as e:
             print(f"⚠ Failed to clear finished flag: {e}")
     
+    def get_progress_epochs(
+        self,
+        total_batches_in_epoch: Optional[int] = None,
+        continuous: bool = False,
+    ) -> float:
+        """
+        Training progress from training_state.json.
+
+        Checkpoint fields:
+          epoch     — 0-based index of the epoch being trained when saved
+          batch_idx — number of batches already finished in that epoch
+
+        continuous=False: fully completed whole epochs.
+        continuous=True:  epoch + batch_idx/total_batches (for --extend clamp).
+        """
+        if not self.state_file.exists():
+            return 0.0
+
+        try:
+            with open(self.state_file, "r") as f:
+                state_info = json.load(f)
+        except Exception:
+            return 0.0
+
+        if state_info.get("training_finished", False):
+            return float(state_info.get(
+                "completed_epochs",
+                int(state_info.get("epoch", 0)) + 1,
+            ))
+
+        epoch = int(state_info.get("epoch", 0))
+        batch_idx = int(state_info.get("batch_idx", 0))
+        if total_batches_in_epoch is not None and total_batches_in_epoch > 0:
+            if batch_idx >= total_batches_in_epoch:
+                return float(epoch + 1)
+            if continuous:
+                return float(epoch) + float(batch_idx) / float(total_batches_in_epoch)
+            return float(epoch)
+        return float(epoch)
+
     def get_completed_epochs(self):
-        """Get the number of completed epochs from the state file."""
-        if not self.state_file.exists():
-            return 0
-        
-        try:
-            with open(self.state_file, 'r') as f:
-                state_info = json.load(f)
-            if state_info.get('training_finished', False):
-                return state_info.get('completed_epochs', state_info.get('epoch', 0) + 1)
-            else:
-                return state_info.get('epoch', 0) + 1
-        except:
-            return 0
+        """Backward-compatible alias for get_progress_epochs(). """
+        return self.get_progress_epochs()
     
-    def get_total_epochs(self):
-        """Get the total epochs from the state file."""
+    def get_total_epochs(self) -> float:
+        """Get the planned total epochs from the state file (0 if unknown)."""
         if not self.state_file.exists():
-            return 0
+            return 0.0
         
         try:
-            with open(self.state_file, 'r') as f:
+            with open(self.state_file, "r") as f:
                 state_info = json.load(f)
-            return state_info.get('total_epochs', state_info.get('epoch', 0) + 1)
-        except:
-            return 0
+            te = state_info.get("total_epochs")
+            return float(te) if te is not None else 0.0
+        except Exception:
+            return 0.0
     
     def update_total_epochs(self, total_epochs):
-        """Update the total epochs in the state file."""
-        if not self.state_file.exists():
-            return
-        
+        """Update the total epochs in the state file (create file if missing)."""
+        total_epochs = float(total_epochs)
+        self.planned_total_epochs = total_epochs
+
+        state_info = {}
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, "r") as f:
+                    state_info = json.load(f)
+            except Exception:
+                state_info = {}
+
+        state_info["total_epochs"] = total_epochs
+        state_info["checkpoint_key"] = self.checkpoint_key
+
         try:
-            with open(self.state_file, 'r') as f:
-                state_info = json.load(f)
-            
-            state_info['total_epochs'] = total_epochs
-            
-            temp_state = self.state_file.with_suffix('.tmp')
-            with open(temp_state, 'w') as f:
+            temp_state = self.state_file.with_suffix(".tmp")
+            with open(temp_state, "w") as f:
                 json.dump(state_info, f, indent=2, default=str)
-            
+
             for attempt in range(5):
                 try:
                     os.replace(temp_state, self.state_file)
@@ -323,8 +373,8 @@ class TrainingState:
                         time.sleep(0.1 * (2 ** attempt))
                     else:
                         raise
-            
-            print(f"✓ Updated total_epochs to {total_epochs} (Key: {self.checkpoint_key}).")
+
+            print(f"✓ Updated total_epochs to {total_epochs:g} (Key: {self.checkpoint_key}).")
         except Exception as e:
             print(f"⚠ Failed to update total_epochs: {e}")
     
@@ -690,14 +740,19 @@ class ResumableTrainer:
         total_batches = loader.get_total_batches_in_epoch()
         
         with torch.no_grad():
-            pbar = tqdm(total=total_batches, desc=desc, mininterval=0.5, miniters=5)
+            # Create progress bar with proper settings
+            pbar = tqdm(total=total_batches, desc=desc, 
+                        mininterval=0.5, miniters=1,  # Update more frequently
+                        smoothing=0.1)  # Smooth the rate calculation
+            
             while True:
                 batch, load_time = loader.get_next_batch()
                 if batch is None:
                     break
                 
                 x, y, mean, std, shape = batch
-                x, y = x.to(self.device), y.to(self.device)
+                x = x.to(self.device, non_blocking=True)
+                y = y.to(self.device, non_blocking=True)
                 mean = mean.to(self.device, non_blocking=True)
                 std = std.to(self.device, non_blocking=True)
                 shape = shape.to(self.device, non_blocking=True)
@@ -708,16 +763,17 @@ class ResumableTrainer:
                 total_loss += L.item()
                 num_batches += 1
                 
-                update_cycle = 5
-                if num_batches % update_cycle == 0 or num_batches == 1:
-                    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-                    pbar.set_postfix({'loss': f'{avg_loss:.4f}'})
-                if num_batches % update_cycle == 0:
-                    pbar.update(update_cycle if num_batches > update_cycle else 1)
-                    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-                    pbar.set_postfix({'loss': f'{avg_loss:.4f}'})
+                # Update progress bar every batch
+                avg_loss = total_loss / num_batches
+                pbar.update(1)  # Always update by 1 batch
+                pbar.set_postfix({
+                    'loss': f'{avg_loss:.4f}',
+                    'batch': f'{num_batches}/{total_batches}'
+                })
             
-            pbar.update(total_batches - pbar.n)
+            # Ensure progress bar reaches 100%
+            if pbar.n < total_batches:
+                pbar.update(total_batches - pbar.n)
             pbar.close()
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
@@ -734,68 +790,140 @@ class ResumableTrainer:
             return True
         return False
     
-    def handle_extension(self, extend_epochs: int) -> int:
+    @staticmethod
+    def _batches_for_epoch(epoch: int, num_epochs: float, total_batches: int) -> int:
+        """How many batches to run in 0-based `epoch` given a (possibly fractional) plan."""
+        if total_batches <= 0:
+            return 0
+        if num_epochs >= float(epoch + 1):
+            return total_batches
+        if num_epochs <= float(epoch):
+            return 0
+        frac = float(num_epochs) - float(epoch)
+        return max(1, min(total_batches, int(math.ceil(frac * total_batches - 1e-12))))
+
+    def handle_extension(self, extend_epochs: float, original_num_epochs: float) -> float:
         """
-        Handle extension logic. Returns the new total epochs.
+        Adjust the planned epoch budget by `extend_epochs` (float, may be negative).
+
+        new_total = max(original_plan, stored_plan, progress) + extend_epochs
+        then clamp to >= continuous progress (cannot untrain).
+
+        Examples (plan 200):
+          at epoch 50, --extend 10   → 210
+          at epoch 50, --extend -10  → 190
+          at epoch 50, --extend -200 → 50 (clamped to progress)
+          --extend 1.5               → fractional final epoch allowed
         """
-        if extend_epochs <= 0:
-            return self.state_manager.get_total_epochs()
-        
-        completed_epochs = self.state_manager.get_completed_epochs()
-        total_epochs = self.state_manager.get_total_epochs()
-        
-        if completed_epochs == 0:
-            checkpoint_files = list(self.state_manager.save_dir.glob('checkpoint_minibatch*.pt'))
+        extend_epochs = float(extend_epochs)
+        original_num_epochs = float(original_num_epochs)
+
+        if abs(extend_epochs) < 1e-15:
+            stored = self.state_manager.get_total_epochs()
+            return stored if stored > 0 else original_num_epochs
+
+        try:
+            total_batches = self.dataloader.get_total_batches_in_epoch()
+        except Exception:
+            total_batches = None
+
+        progress = float(self.state_manager.get_progress_epochs(total_batches, continuous=False))
+        progress_cont = float(self.state_manager.get_progress_epochs(total_batches, continuous=True))
+
+        if progress == 0 and progress_cont == 0:
+            checkpoint_files = (
+                list(self.state_manager.save_dir.glob("checkpoint_minibatch*.pt"))
+                + list(self.state_manager.save_dir.glob("emergency_minibatch*.pt"))
+            )
             if checkpoint_files:
                 latest = max(checkpoint_files, key=lambda f: f.stat().st_mtime)
                 try:
-                    checkpoint = torch.load(latest, map_location='cpu')
-                    completed_epochs = checkpoint.get('epoch', 0) + 1
-                    # print(f"DEBUG: Found checkpoint {latest.name} with epoch {completed_epochs}")
-                except:
-                    completed_epochs = self.state_manager.get_completed_epochs()
-            else:
-                completed_epochs = self.state_manager.get_completed_epochs()
-        
-        new_total = completed_epochs + extend_epochs
-        
+                    checkpoint = torch.load(latest, map_location="cpu", weights_only=False)
+                    ep = int(checkpoint.get("epoch", 0))
+                    bi = int(checkpoint.get("batch_idx", 0))
+                    if total_batches and bi >= total_batches:
+                        progress = float(ep + 1)
+                        progress_cont = float(ep + 1)
+                    else:
+                        progress = float(ep)
+                        if total_batches and total_batches > 0:
+                            progress_cont = float(ep) + float(bi) / float(total_batches)
+                        else:
+                            progress_cont = float(ep)
+                    print(f"  (progress from checkpoint {latest.name}: {progress_cont:g})")
+                except Exception:
+                    pass
+
+        stored_total = float(self.state_manager.get_total_epochs())
+        base = max(float(original_num_epochs), stored_total, progress)
+        new_total = base + extend_epochs
+
+        clamped = False
+        if new_total < progress_cont:
+            new_total = progress_cont
+            clamped = True
+
+        # Avoid negative / zero empty plans when nothing trained yet
+        if new_total < 0:
+            new_total = 0.0
+            clamped = True
+
+        label = "EXTENDING" if extend_epochs > 0 else "SHORTENING"
         print(f"\n{'='*60}")
-        print(f"⚠ EXTENDING TRAINING BY {extend_epochs} EPOCHS")
+        print(f"⚠ {label} TRAINING PLAN BY {extend_epochs:g} EPOCHS")
         print(f"{'='*60}")
-        print(f"  Completed epochs: {completed_epochs}")
-        print(f"  Adding: {extend_epochs} epochs")
-        print(f"  New total epochs: {new_total}")
+        print(f"  Original plan (--epochs): {original_num_epochs:g}")
+        print(f"  Stored plan (state):      {stored_total:g}" if stored_total else "  Stored plan (state):      (none)")
+        print(f"  Progress (full epochs):   {progress:g}")
+        print(f"  Progress (continuous):    {progress_cont:g}")
+        print(f"  Base target:              {base:g}")
+        print(f"  Delta:                    {extend_epochs:g}")
+        print(f"  New total epochs:         {new_total:g}" + ("  (clamped to progress)" if clamped else ""))
         print(f"{'='*60}\n")
-        
+
         self.state_manager.update_total_epochs(new_total)
-        
+        if self.state_manager.is_training_finished() and new_total > progress_cont + 1e-12:
+            self.state_manager.clear_finished_flag()
         return new_total
     
     def train(self, num_epochs, resume=True, extend=False, extend_epochs=0):
         """Train the model with robust checkpointing."""
-        
+        original_num_epochs = float(num_epochs)
+        extend_epochs = float(extend_epochs) if extend_epochs else 0.0
+        extend = bool(extend) or abs(extend_epochs) > 1e-15
+        eps = 1e-9
+
         # ============================================================
-        # STEP 1: Handle extension logic
+        # STEP 1: Handle extension / persist planned total
         # ============================================================
-        if extend_epochs > 0:
-            num_epochs = self.handle_extension(extend_epochs)
-            if self.state_manager.is_training_finished():
-                self.state_manager.clear_finished_flag()
-            extend = True
-        
-        if extend:
-            self.state_manager.clear_finished_flag()
+        if abs(extend_epochs) > eps:
+            num_epochs = float(self.handle_extension(extend_epochs, original_num_epochs))
+        else:
+            stored_total = float(self.state_manager.get_total_epochs())
+            if stored_total > original_num_epochs + eps:
+                print(
+                    f"⚠ Using stored total_epochs={stored_total:g} "
+                    f"(config --epochs={original_num_epochs:g})."
+                )
+                num_epochs = stored_total
+            else:
+                num_epochs = original_num_epochs
+                self.state_manager.update_total_epochs(num_epochs)
+
+        if extend and abs(extend_epochs) > eps:
             print(f"\n{'='*60}")
-            print(f"⚠ EXTENDING TRAINING")
+            print(f"⚠ PLAN ADJUSTMENT MODE")
             print(f"{'='*60}")
             print(f"  Key: {self.checkpoint_key}")
-            print(f"  Extending to {num_epochs} total epochs.")
+            print(f"  Delta: {extend_epochs:g}")
+            print(f"  Training until epoch {num_epochs:g} (total).")
             print(f"{'='*60}\n")
+
+        self.state_manager.planned_total_epochs = num_epochs
         
         # ============================================================
         # STEP 2: Load checkpoint if resuming
         # ============================================================
-        training_complete = False
         skip_first_validation = False
         start_epoch_for_loop = 0
         
@@ -805,69 +933,90 @@ class ResumableTrainer:
             )
             
             if result:
-                # Always have all the data available
-                self.start_epoch = result['epoch']
-                self.start_batch = result['batch_idx']
-                self.total_minibatches_processed = result['total_minibatches']
-                self.current_val_loss = result['val_loss']
-                if result['history']:
-                    self.history.from_dict(result['history'])
+                self.start_epoch = result["epoch"]
+                self.start_batch = result["batch_idx"]
+                self.total_minibatches_processed = result["total_minibatches"]
+                self.current_val_loss = result["val_loss"]
+                if result["history"]:
+                    self.history.from_dict(result["history"])
                     print(f"✓ Loaded training history ({len(self.history.epochs)} epochs)")
-                
-                if result['status'] == 'finished':
-                    if extend:
-                        print("⚠ Training was finished, but --extend was provided.")
-                        self.state_manager.clear_finished_flag()
-                        # Continue training from the last completed epoch
-                    else:
+
+                total_batches_in_epoch = self.dataloader.get_total_batches_in_epoch()
+
+                if result["status"] == "finished":
+                    if not (extend and extend_epochs > eps):
+                        # finished + negative/zero extend → nothing to do
                         print("\n" + "=" * 60)
                         print("✓ TRAINING ALREADY FINISHED")
                         print("=" * 60)
                         print(f"Key: {self.checkpoint_key}")
                         print(f"All {self.start_epoch + 1} epochs completed in previous run.")
-                        print("Nothing to train.")
-                        print("Use --clean to start fresh, or --extend N to add N more epochs.")
+                        print(f"Current plan: {num_epochs:g}")
+                        if extend and extend_epochs < 0:
+                            print("  (--extend negative cannot untrain finished work; plan clamped.)")
+                        print("Use --extend +N to train more epochs.")
                         print("=" * 60)
                         self._show_history_if_available()
                         return
-                
-                elif result['status'] == 'checkpoint':
-                    # Normal checkpoint loading
-                    self.start_epoch = result['epoch']
-                    self.start_batch = result['batch_idx']
-                    self.total_minibatches_processed = result['total_minibatches']
-                    self.current_val_loss = result['val_loss']
-                    if result['history']:
-                        self.history.from_dict(result['history'])
-                        print(f"✓ Loaded training history ({len(self.history.epochs)} epochs)")
-                    
-                    total_batches_in_epoch = self.dataloader.get_total_batches_in_epoch()
-                    
-                    # Check if training is actually complete
-                    training_complete = False
-                    if self.start_epoch >= num_epochs - 1:
-                        if self.start_epoch > num_epochs - 1:
-                            training_complete = True
-                        elif self.start_epoch == num_epochs - 1 and self.start_batch >= total_batches_in_epoch:
-                            training_complete = True
-                    
-                    # If extending and training_complete is True, override it
-                    if extend and training_complete:
-                        print(f"\n⚠ Training was complete at epoch {self.start_epoch+1}, but extending.")
-                        print(f"  ✅ Resetting to continue training.")
-                        training_complete = False
-                        self.start_epoch = self.start_epoch - 1 if self.start_epoch > 0 else 0
+
+                    print("⚠ Training was finished; positive --extend continues past the last epoch.")
+                    self.state_manager.clear_finished_flag()
+                    start_epoch_for_loop = self.start_epoch + 1
+                    self.start_batch = 0
+                    if start_epoch_for_loop >= num_epochs - eps:
+                        print(
+                            f"\n⚠ Plan {num_epochs:g} does not go past progress "
+                            f"({start_epoch_for_loop})."
+                        )
+                        print("  Use a larger positive --extend value.")
+                        return
+                    print(
+                        f"✓ Extension resume: starting at epoch {start_epoch_for_loop + 1} "
+                        f"/ {num_epochs:g}"
+                    )
+
+                elif result["status"] == "checkpoint":
+                    epoch_complete = (
+                        total_batches_in_epoch > 0
+                        and self.start_batch >= total_batches_in_epoch
+                    )
+
+                    if epoch_complete:
+                        start_epoch_for_loop = self.start_epoch + 1
                         self.start_batch = 0
-                        self.state_manager.clear_finished_flag()
-                    
-                    if training_complete:
-                        if extend:
-                            print(f"\n⚠ WARNING: Training already complete at epoch {self.start_epoch+1}")
-                            print(f"  Key: {self.checkpoint_key}")
-                            print(f"  --extend={num_epochs - (self.start_epoch + 1)} was not enough.")
-                            print(f"  Use a larger --extend value.")
+                        skip_first_validation = not (extend and extend_epochs > eps)
+                        print(
+                            f"⚠ Resuming after completed epoch {self.start_epoch + 1} "
+                            f"→ next epoch {start_epoch_for_loop + 1}"
+                        )
+                    else:
+                        start_epoch_for_loop = self.start_epoch
+                        skip_first_validation = False
+                        print(
+                            f"⚠ Resuming mid-epoch {self.start_epoch + 1}, "
+                            f"batch {self.start_batch}/{total_batches_in_epoch}"
+                        )
+
+                    if result.get("is_emergency"):
+                        print(f"\n⚠ Resuming from emergency save at batch {self.start_batch}.")
+
+                    # Continuous progress vs plan
+                    if epoch_complete:
+                        cont = float(start_epoch_for_loop)
+                    else:
+                        cont = float(self.start_epoch) + (
+                            float(self.start_batch) / float(total_batches_in_epoch)
+                            if total_batches_in_epoch else 0.0
+                        )
+
+                    if cont >= num_epochs - eps:
+                        if extend and extend_epochs > eps:
+                            print(
+                                f"\n⚠ Progress {cont:g} already at/past plan {num_epochs:g}."
+                            )
+                            print("  Use a larger positive --extend value.")
                             return
-                        
+                        # Plan shortened to current progress (or already done)
                         self.state_manager.mark_training_finished(
                             model=self.model,
                             optimizer=self.optimizer,
@@ -878,43 +1027,18 @@ class ResumableTrainer:
                             loss=self.current_loss if self.current_loss != 0 else 0,
                             val_loss=self.current_val_loss,
                             history=self.history.to_dict(),
-                            embed_dim=getattr(self, 'embed_dim', None),
-                            max_seq_len=getattr(self, 'max_seq_len', None),
+                            embed_dim=getattr(self, "embed_dim", None),
+                            max_seq_len=getattr(self, "max_seq_len", None),
                         )
                         print("\n" + "=" * 60)
-                        print("✓ TRAINING ALREADY FINISHED")
+                        print("✓ TRAINING COMPLETE FOR CURRENT PLAN")
                         print("=" * 60)
                         print(f"Key: {self.checkpoint_key}")
-                        print(f"All {num_epochs} epochs completed in previous run.")
-                        print("Nothing to train.")
-                        print("Use --clean to start fresh, or --extend N to add N more epochs.")
+                        print(f"Progress {cont:g} >= plan {num_epochs:g}.")
+                        print("Use --extend +N to train further.")
                         print("=" * 60)
                         self._show_history_if_available()
                         return
-                    
-                    # Determine where to start the training loop
-                    if self.start_batch >= total_batches_in_epoch:
-                        # The epoch is fully completed - start from the next one
-                        start_epoch_for_loop = self.start_epoch + 1
-                        
-                        if extend:
-                            skip_first_validation = False
-                            print(f"⚠ Extending: starting from epoch {self.start_epoch + 2}")
-                        else:
-                            skip_first_validation = True
-                            print(f"⚠ Resuming from completed epoch {self.start_epoch+1}")
-                            print(f"  Skipping validation for epoch {self.start_epoch+1}")
-                    else:
-                        # Partial epoch - resume normally
-                        start_epoch_for_loop = self.start_epoch
-                        skip_first_validation = False
-                        print(f"⚠ Resuming from epoch {self.start_epoch+1}, batch {self.start_batch}")
-                    
-                    if result['is_emergency']:
-                        print(f"\n⚠ Resuming from emergency save.")
-                        print(f"  Batch {self.start_batch} was completed before save.")
-                        print(f"  Starting from batch {self.start_batch}.")
-                        start_epoch_for_loop = self.start_epoch
             else:
                 print("\nStarting fresh training.")
         else:
@@ -925,14 +1049,15 @@ class ResumableTrainer:
         # ============================================================
         self.is_running = True
         self.ctrl_c_count = 0
+        self._target_num_epochs = float(num_epochs)
         
         print(f"\n{'='*60}")
         print(f"TRAINING STARTED")
         print(f"{'='*60}")
         print(f"Key: {self.checkpoint_key}")
-        print(f"Epochs: {num_epochs} (starting from {start_epoch_for_loop+1})")
-        if extend:
-            print(f"  (Extension mode: continuing from checkpoint)")
+        print(f"Epochs: {num_epochs:g} (starting from {start_epoch_for_loop + 1})")
+        if extend and abs(extend_epochs) > eps:
+            print(f"  (Plan adjustment: {extend_epochs:+g} epochs)")
         print(f"Total minibatches processed so far: {self.total_minibatches_processed}")
         print(f"Save checkpoint every: {self.state_manager.save_every_n_minibatches} minibatches")
         print(f"Checkpoint directory: {self.state_manager.save_dir}/")
@@ -948,37 +1073,66 @@ class ResumableTrainer:
         print(f"  Power failure → Emergency save on exit")
         print(f"{'='*60}\n")
         
+        train_loss = 0.0
         try:
-            for epoch in range(start_epoch_for_loop, num_epochs):
+            epoch = int(start_epoch_for_loop)
+            while float(epoch) < float(num_epochs) - eps:
                 if not self.is_running:
+                    break
+
+                total_batches = self.dataloader.get_total_batches_in_epoch()
+                max_batches = self._batches_for_epoch(epoch, num_epochs, total_batches)
+                if max_batches <= 0:
+                    break
+                # If resuming mid-epoch past the new partial limit, stop
+                if epoch == self.start_epoch and self.start_batch >= max_batches:
+                    print(
+                        f"⚠ Already at/ past partial limit for epoch {epoch + 1} "
+                        f"({self.start_batch}/{max_batches})."
+                    )
                     break
                     
                 self.current_epoch = epoch
-                avg_loss = self.train_epoch(epoch)
+                avg_loss = self.train_epoch(epoch, max_batches=max_batches)
                 
                 if not self.is_running:
                     break
                 
                 train_loss = avg_loss if avg_loss is not None else 0
                 val_loss = None
-                
+                epoch_fully_done = (self.current_batch >= total_batches)
+
                 if self.enable_validation and self.val_loader is not None:
                     if skip_first_validation and epoch == start_epoch_for_loop:
-                        print(f'Epoch {epoch+1}/{num_epochs} - Loss: {train_loss:.4f} (Validation skipped - epoch already complete)')
+                        print(
+                            f"Epoch {epoch + 1}/{num_epochs:g} - Loss: {train_loss:.4f} "
+                            f"(Validation skipped - epoch already complete)"
+                        )
                         skip_first_validation = False
-                    elif (epoch + 1) % self.validate_every_n_epochs == 0:
+                    elif epoch_fully_done and (epoch + 1) % self.validate_every_n_epochs == 0:
                         self.current_val_loss = self.run_validation(
                             loader=self.val_loader,
-                            desc=f"Validation Epoch {epoch+1}"
+                            desc=f"Validation Epoch {epoch + 1}"
                         )
                         val_loss = self.current_val_loss
-                        print(f'Epoch {epoch+1}/{num_epochs} - Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+                        print(
+                            f"Epoch {epoch + 1}/{num_epochs:g} - Loss: {train_loss:.4f}, "
+                            f"Val Loss: {val_loss:.4f}"
+                        )
                     else:
-                        print(f'Epoch {epoch+1}/{num_epochs} - Loss: {train_loss:.4f}')
+                        partial_tag = "" if epoch_fully_done else " (partial)"
+                        print(
+                            f"Epoch {epoch + 1}/{num_epochs:g} - Loss: {train_loss:.4f}"
+                            f"{partial_tag}"
+                        )
                 else:
-                    print(f'Epoch {epoch+1}/{num_epochs} - Loss: {train_loss:.4f}')
+                    partial_tag = "" if epoch_fully_done else " (partial)"
+                    print(
+                        f"Epoch {epoch + 1}/{num_epochs:g} - Loss: {train_loss:.4f}"
+                        f"{partial_tag}"
+                    )
                 
-                # Update history
+                # Update history (use integer epoch id)
                 epoch_num = epoch + 1
                 if epoch_num in self.history.epochs:
                     idx = self.history.epochs.index(epoch_num)
@@ -988,6 +1142,10 @@ class ResumableTrainer:
                     self.history.timestamps[idx] = time.time()
                 else:
                     self.history.add_epoch(epoch_num, train_loss, val_loss)
+
+                epoch += 1
+                # After first loop iteration, resume batch only applies once
+                self.start_batch = 0
                         
         except KeyboardInterrupt:
             self._emergency_save()
@@ -1003,37 +1161,51 @@ class ResumableTrainer:
             if self.stop_requested:
                 print(f"\n⏸ Training stopped at minibatch {self.total_minibatches_processed}")
                 print(f"   Key: {self.checkpoint_key}")
-                print(f"   Epoch {self.current_epoch+1}, batch {self.current_batch}")
+                print(f"   Epoch {self.current_epoch + 1}, batch {self.current_batch}")
                 print(f"   Resume with: python train.py")
-            elif self.current_epoch + 1 >= num_epochs:
-                final_epoch = num_epochs - 1
-                self.state_manager.mark_training_finished(
-                    model=self.model,
-                    optimizer=self.optimizer,
-                    dataloader_state=self.dataloader.get_state(),
-                    epoch=final_epoch,
-                    batch_idx=self.current_batch,
-                    total_minibatches_processed=self.total_minibatches_processed,
-                    loss=train_loss if 'train_loss' in locals() else 0,
-                    val_loss=self.current_val_loss,
-                    history=self.history.to_dict(),
-                    embed_dim=getattr(self, 'embed_dim', None),
-                    max_seq_len=getattr(self, 'max_seq_len', None),
-                )
-                print(f"\n✓ Training complete!")
-                print(f"   Key: {self.checkpoint_key}")
-                print(f"   Total minibatches: {self.total_minibatches_processed}")
-                print(f"   All {num_epochs} epochs finished.")
-                if self.current_val_loss is not None:
-                    print(f"   Final Val Loss: {self.current_val_loss:.4f}")
-                self._show_history_if_available()
             else:
-                print(f"\n⚠ Training ended unexpectedly at minibatch {self.total_minibatches_processed}")
-                print(f"   Key: {self.checkpoint_key}")
-                print(f"   Epoch {self.current_epoch+1}/{num_epochs}")
+                # Continuous progress after loop
+                try:
+                    tb = self.dataloader.get_total_batches_in_epoch()
+                except Exception:
+                    tb = 0
+                if tb > 0:
+                    cont = float(self.current_epoch) + float(self.current_batch) / float(tb)
+                else:
+                    cont = float(self.current_epoch + 1)
+
+                if cont >= float(num_epochs) - 1e-6 or float(self.current_epoch) + 1 >= float(num_epochs) - 1e-6:
+                    final_epoch = self.current_epoch
+                    self.state_manager.mark_training_finished(
+                        model=self.model,
+                        optimizer=self.optimizer,
+                        dataloader_state=self.dataloader.get_state(),
+                        epoch=final_epoch,
+                        batch_idx=self.current_batch,
+                        total_minibatches_processed=self.total_minibatches_processed,
+                        loss=train_loss if "train_loss" in locals() else 0,
+                        val_loss=self.current_val_loss,
+                        history=self.history.to_dict(),
+                        embed_dim=getattr(self, "embed_dim", None),
+                        max_seq_len=getattr(self, "max_seq_len", None),
+                    )
+                    print(f"\n✓ Training complete!")
+                    print(f"   Key: {self.checkpoint_key}")
+                    print(f"   Total minibatches: {self.total_minibatches_processed}")
+                    print(f"   Plan {num_epochs:g} epochs finished.")
+                    if self.current_val_loss is not None:
+                        print(f"   Final Val Loss: {self.current_val_loss:.4f}")
+                    self._show_history_if_available()
+                else:
+                    print(f"\n⚠ Training ended at minibatch {self.total_minibatches_processed}")
+                    print(f"   Key: {self.checkpoint_key}")
+                    print(f"   Epoch {self.current_epoch + 1}/{num_epochs:g}")
     
-    def train_epoch(self, epoch):
-        """Train one epoch with optimized timing and reduced overhead."""
+    def train_epoch(self, epoch, max_batches: Optional[int] = None):
+        """Train one epoch with optimized timing and reduced overhead.
+        
+        max_batches: optional cap (for fractional --extend plans).
+        """
         self.model.train()
         
         if epoch == self.start_epoch and self.start_batch > 0:
@@ -1051,13 +1223,20 @@ class ResumableTrainer:
         )
         
         total_batches = self.dataloader.get_total_batches_in_epoch()
+        if max_batches is None:
+            target_batches = total_batches
+        else:
+            target_batches = min(int(max_batches), total_batches)
         total_samples = len(self.dataloader.current_epoch_indices)
 
-        # print(f"🔍 DEBUG EPOCH {epoch+1}: total_batches = {total_batches}, total_samples = {total_samples}")
-        # print(f"🔍 DEBUG: dataset len = {len(self.dataloader.dataset)}")
+        print(
+            f"🔍 DEBUG EPOCH {epoch+1}: target_batches = {target_batches}/"
+            f"{total_batches}, total_samples = {total_samples}"
+        )
+        print(f"🔍 DEBUG: dataset len = {len(self.dataloader.dataset)}")
             
-        pbar = tqdm(total=total_batches, desc=f'Epoch {epoch+1}',
-                    initial=resume_batch_start,
+        pbar = tqdm(total=target_batches, desc=f'Epoch {epoch+1}',
+                    initial=min(resume_batch_start, target_batches),
                     mininterval=0.5,
                     miniters=5)
 
@@ -1090,14 +1269,17 @@ class ResumableTrainer:
                 self.is_running = False
                 return total_loss / batches_in_epoch if batches_in_epoch > 0 else 0
             
+            if batch_idx >= target_batches:
+                break
+
             result = dataloader.get_next_batch()
             if result is None:
-                # print(f"🔍 DEBUG: get_next_batch returned None at batch_count={batch_count}")
+                print(f"🔍 DEBUG: get_next_batch returned None at batch_count={batch_count}")
                 break
             batch, load_time = result
 
             if batch is None:
-                # print(f"🔍 DEBUG: batch is None at batch_count={batch_count}")
+                print(f"🔍 DEBUG: batch is None at batch_count={batch_count}")
                 break
 
             wait_time = time.time() - wait_start
@@ -1106,8 +1288,8 @@ class ResumableTrainer:
 
             batch_count += 1
 
-            if batch_count % 1000 == 0:
-                # print(f"🔍 DEBUG: processed {batch_count} batches")
+            # if batch_count % 1000 == 0:
+            #     print(f"🔍 DEBUG: processed {batch_count} batches")
                         
             compute_start = time.perf_counter()
             

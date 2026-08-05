@@ -18,21 +18,197 @@ from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
 import pickle
 import hashlib
+import json
 import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
 from config import get_config
 from datetime import datetime
 
 from Binance import Binance
+
+# Label fitness threshold used in _compute_labels_and_norm_params.
+# Keep in the dataset signature so code changes invalidate caches.
+LABEL_FITNESS_THRESHOLD = 0.75
+
+
+# ═══════════════════════════════════════════════════════════
+# CONFIG-ONLY FEATURE LAYOUT + DATASET SIGNATURE
+# (no Binance download / no FSV time-series materialization)
+# ═══════════════════════════════════════════════════════════
+
+def _interval_to_minutes(interval: str) -> int:
+    """Parse Binance-style interval strings: 1m, 3m, 5m, 15m, 1h, 4h, 1d, ..."""
+    if not interval:
+        return 1
+    s = str(interval).strip().lower()
+    units = {'m': 1, 'h': 60, 'd': 60 * 24, 'w': 60 * 24 * 7}
+    if s[-1] in units:
+        return int(s[:-1]) * units[s[-1]]
+    # bare integer → minutes
+    return int(s)
+
+
+def estimate_T_from_config(config: dict) -> int:
+    """
+    Nominal series length T from config alone (no Binance download).
+
+    - Binance/FSV path: floor((end - start) / interval), same rule as
+      fsv_03_query_value_age total_minutes for 1m bars.
+    - Synthetic path: 60 * 24 * total_synthetic_days.
+
+    Note: actual downloaded T can still differ slightly (gaps, fills,
+    market/macro alignment). Label pickle continues to validate real T on load.
+    """
+    if not config.get('use_binance_data', False):
+        days = int(config.get('total_synthetic_days', 30))
+        return 60 * 24 * days
+
+    start_s = config.get('binance_start_date')
+    end_s = config.get('binance_end_date')
+    if not start_s or not end_s:
+        return 0
+
+    # Accept "YYYY-MM-DD HH:MM:SS" or date-only
+    def _parse(s: str) -> datetime:
+        s = str(s).strip()
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+            try:
+                return datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        return datetime.fromisoformat(s)
+
+    start = _parse(start_s)
+    end = _parse(end_s)
+    interval_min = _interval_to_minutes(config.get('binance_interval', '1m'))
+    if interval_min <= 0:
+        interval_min = 1
+
+    total_minutes = int((end - start).total_seconds() / 60)
+    if total_minutes <= 0:
+        return 0
+    return total_minutes // interval_min
+
+
+def resolve_feature_layout(config: dict) -> Dict[str, Any]:
+    """
+    Derive market/macro feature names and price_feature_idx from config alone.
+
+    Mirrors TRAIN.get_dataset naming conventions without loading any series data.
+    """
+    if config.get('use_binance_data', False):
+        symbol_dict = config.get('binance_symbols') or {}
+        market_feature_names: List[str] = []
+        price_feature_idx = None
+        target = config.get('prediction_target', ('UNKNOWN', 'UNKNOWN'))
+        target_symbol, target_feature = target[0], target[1]
+
+        for symbol, features in symbol_dict.items():
+            for feature in features:
+                if symbol == target_symbol and feature == target_feature:
+                    price_feature_idx = len(market_feature_names)
+                market_feature_names.append(f"{symbol}_{feature}")
+
+        if price_feature_idx is None:
+            price_feature_idx = int(config.get('price_feature_idx', 0))
+    else:
+        n = int(config.get('num_features', 5))
+        market_feature_names = [f'feature_{i}' for i in range(n)]
+        price_feature_idx = int(config.get('price_feature_idx', 0))
+
+    # Macro base names: FEATURES dict order minus excludes (deterministic, no CSV I/O)
+    from fsv_dictionary import FEATURES
+    exclude = set(config.get('features_to_exclude') or [])
+    macro_base_names = [name for name in FEATURES.keys() if name not in exclude]
+    macro_feature_names_full: List[str] = []
+    for name in macro_base_names:
+        macro_feature_names_full.append(name + "_value")
+        macro_feature_names_full.append(name + "_decay")
+
+    feature_names = market_feature_names + macro_feature_names_full
+    return {
+        'market_feature_names': market_feature_names,
+        'macro_base_names': macro_base_names,
+        'macro_feature_names_full': macro_feature_names_full,
+        'feature_names': feature_names,
+        'price_feature_idx': price_feature_idx,
+        'n_market_features': len(market_feature_names),
+        'n_macro_features': len(macro_feature_names_full),
+        'F': len(feature_names),
+    }
+
+
+def generate_dataset_signature(config: dict) -> str:
+    """
+    Hash everything that defines label-cache / dataset identity from config alone.
+
+    Safe to call without downloading Binance data or materializing FSV arrays.
+    Used by --history, checkpoint keys, and TradingDataset label cache.
+    """
+    layout = resolve_feature_layout(config)
+    T = estimate_T_from_config(config)
+
+    past_days = config.get('past_days', 7)
+    future_minutes = config.get('future_minutes', 60)
+    max_horizon = config.get('max_horizon', None)
+    if max_horizon is None:
+        max_horizon = future_minutes
+
+    train_ratio = config.get('train_ratio', 0.70)
+    val_ratio = config.get('val_ratio', 0.20)
+
+    key_params = {
+        # --- data identity ---
+        'use_binance_data': config.get('use_binance_data', False),
+        'binance_datatype': config.get('binance_datatype', 'klines'),
+        'binance_interval': config.get('binance_interval', '1m'),
+        'binance_start_date': config.get('binance_start_date'),
+        'binance_end_date': config.get('binance_end_date'),
+        'binance_symbols': config.get('binance_symbols'),
+        'total_synthetic_days': config.get('total_synthetic_days'),
+        'features_to_exclude': sorted(config.get('features_to_exclude', [])),
+        'prediction_target': list(config.get('prediction_target', ('UNKNOWN', 'UNKNOWN'))),
+        'price_feature_idx': layout['price_feature_idx'],
+        'feature_names': list(layout['feature_names']),
+        'F': layout['F'],
+        'T': T,  # nominal length from config (see estimate_T_from_config)
+        'num_shapes': config.get('num_shapes', 4),
+
+        # --- windowing / sampling ---
+        'past_days': past_days,
+        'future_minutes': future_minutes,
+        'step': config.get('step', 1),
+
+        # --- label algorithm ---
+        'min_horizon': config.get('min_horizon', 3),
+        'max_horizon': max_horizon,
+        'fitness_threshold': LABEL_FITNESS_THRESHOLD,
+        'normalize': config.get('normalize', True),
+
+        # --- train-split stats ---
+        'train_ratio': train_ratio,
+        'val_ratio': val_ratio,
+        'shuffle_split': config.get('shuffle_split', True),
+    }
+
+    param_string = json.dumps(key_params, sort_keys=True, default=str)
+    return hashlib.md5(param_string.encode()).hexdigest()[:12]
+
 
 # ═══════════════════════════════════════════════════════════
 # BINANCE DATA LOADER
 # ═══════════════════════════════════════════════════════════
 
 def get_binance_data(config):
-    """Get data from Binance using the configured parameters."""
+    """Get data from Binance using the configured parameters.
+
+    Returns:
+        features, T, nForget, target_feature_id, feature_names
+        On failure all five values are None.
+    """
     if Binance is None:
         print("⚠ Binance not available.")
-        return None, None, None, None
+        return None, None, None, None, None
     
     try:
         bn = Binance.instantiate(connect=False)
@@ -318,81 +494,149 @@ def visualize_linear_trends(
     future_window: int,
     mode: str = 'anchored',
     num_samples: int = 6,
-    figsize: Tuple[int, int] = (15, 10)
+    figsize: Tuple[int, int] = (15, 10),
+    interactive: bool = True,
 ):
-    """Visualize linear trends for randomly selected samples."""
+    """
+    Visualize linear trends for randomly selected samples.
+
+    When interactive=True (default), shows Next / Quit buttons so you can
+    page through unlimited random batches without reloading data.
+    Keyboard: N / Right / Space = Next, Q / Escape = Quit.
+    """
     if total_tensor.is_cuda:
         total_tensor = total_tensor.cpu()
-    
-    num_available = label_tensor.shape[0]
+
+    num_available = int(label_tensor.shape[0])
+    if num_available == 0:
+        print("⚠ No samples available for trend visualization.")
+        return
+
     num_samples = min(num_samples, num_available)
-    if num_samples % 2 != 0:
+    if num_samples < 1:
+        num_samples = 1
+    # Prefer a full 2x3 grid when possible
+    if num_samples % 2 != 0 and num_samples >= 6:
         num_samples = 6
 
-    # Set seed based on current second from epoch
-    seed = int(time.time())  # Current second
-    random.seed(seed)
-    
-    indices = random.sample(range(num_available), num_samples)
-    n_cols = 3
-    n_rows = (num_samples + n_cols - 1) // n_cols
-    
+    n_cols = 3 if num_samples > 1 else 1
+    n_rows = max(1, (num_samples + n_cols - 1) // n_cols)
+
     fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
-    axes = axes.flatten() if num_samples > 1 else [axes]
-    
-    for i, idx in enumerate(indices):
-        if i >= len(axes):
-            break
-        
-        ax = axes[i]
-        start = valid_starts[idx]
-        label = label_tensor[idx]
-        mean = mean_tensor[idx]
-        std = std_tensor[idx]
-        
-        # Ensure mean and std are 1D
-        mean = mean.flatten()
-        std = std.flatten()
-        
-        horizon = int(label[0].item())
-        slope_norm = label[1].item()
-        intercept_norm = label[2].item()
-        
-        price_mean = mean[price_feature_idx].item()
-        price_std = std[price_feature_idx].item()
-        
-        slope_original = slope_norm * price_std
-        intercept_original = intercept_norm * price_std + price_mean
-        
-        y_start = start + past_window
-        y_end = y_start + future_window
-        future_prices = total_tensor[price_feature_idx, y_start:y_end].cpu().numpy()
-        
-        time_steps = np.arange(future_window)
-        ax.plot(time_steps, future_prices, 'b-', linewidth=2, label='Actual Prices', alpha=0.7)
-        
-        if horizon > 0:
-            trend_t = np.arange(horizon)
-            trend_prices = slope_original * trend_t + intercept_original
-            ax.plot(trend_t, trend_prices, 'r-', linewidth=2.5,
-                    label=f'Trend: y={slope_original:.4f}t+{intercept_original:.2f}')
-            ax.axvline(x=horizon - 1, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
-            ax.axvline(x=0, color='green', linestyle=':', linewidth=1.5, alpha=0.5)
-            ax.axvspan(0, horizon - 1, alpha=0.15, color='orange')
-        
-        ax.set_title(f'Sample {idx+1}: H={horizon}, m={slope_original:.4f}, b={intercept_original:.2f}\n', fontsize=10)
-        ax.set_xlabel('Time (minutes)')
-        ax.set_ylabel('Price')
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8, loc='best')
-    
-    for i in range(len(indices), len(axes)):
-        axes[i].set_visible(False)
-    
-    plt.suptitle(f'Linear Trend Visualization - Mode: {mode.upper()}', 
-                 fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.show()
+    axes = np.atleast_1d(axes).ravel()
+
+    # Room for buttons at the bottom in interactive mode
+    if interactive:
+        fig.subplots_adjust(left=0.07, right=0.98, top=0.90, bottom=0.14, hspace=0.45, wspace=0.25)
+    else:
+        fig.subplots_adjust(left=0.07, right=0.98, top=0.90, bottom=0.08, hspace=0.45, wspace=0.25)
+
+    page_num = [0]
+    # Keep button refs alive (matplotlib GC otherwise disconnects them)
+    _widgets: List[Any] = []
+
+    def _draw_page():
+        page_num[0] += 1
+        # Fresh RNG per page so consecutive Next draws differ
+        rng = random.Random(int(time.time() * 1000) + page_num[0])
+        k = min(num_samples, num_available)
+        indices = rng.sample(range(num_available), k)
+
+        for ax in axes:
+            ax.clear()
+            ax.set_visible(True)
+
+        for i, idx in enumerate(indices):
+            if i >= len(axes):
+                break
+            ax = axes[i]
+            start = valid_starts[idx]
+            label = label_tensor[idx]
+            mean = mean_tensor[idx].flatten()
+            std = std_tensor[idx].flatten()
+
+            horizon = int(label[0].item())
+            slope_norm = float(label[1].item())
+            intercept_norm = float(label[2].item())
+
+            price_mean = float(mean[price_feature_idx].item())
+            price_std = float(std[price_feature_idx].item())
+            if price_std == 0:
+                price_std = 1.0
+
+            slope_original = slope_norm * price_std
+            intercept_original = intercept_norm * price_std + price_mean
+
+            y_start = start + past_window
+            y_end = y_start + future_window
+            # Total is (T, F)
+            future_prices = total_tensor[y_start:y_end, price_feature_idx].cpu().numpy()
+
+            time_steps = np.arange(len(future_prices))
+            ax.plot(time_steps, future_prices, 'b-', linewidth=2, label='Actual Prices', alpha=0.7)
+
+            if horizon > 0:
+                trend_t = np.arange(horizon)
+                trend_prices = slope_original * trend_t + intercept_original
+                ax.plot(
+                    trend_t, trend_prices, 'r-', linewidth=2.5,
+                    label=f'Trend: y={slope_original:.4f}t+{intercept_original:.2f}',
+                )
+                ax.axvline(x=horizon - 1, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+                ax.axvline(x=0, color='green', linestyle=':', linewidth=1.5, alpha=0.5)
+                ax.axvspan(0, max(horizon - 1, 0), alpha=0.15, color='orange')
+
+            ax.set_title(
+                f'Sample {idx}: H={horizon}, m={slope_original:.4f}, b={intercept_original:.2f}',
+                fontsize=10,
+            )
+            ax.set_xlabel('Time (minutes)')
+            ax.set_ylabel('Price')
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=8, loc='best')
+
+        for i in range(len(indices), len(axes)):
+            axes[i].clear()
+            axes[i].set_visible(False)
+
+        fig.suptitle(
+            f'Linear Trend Visualization — Mode: {mode.upper()}  |  Page {page_num[0]}'
+            + ('  |  [Next] / [Quit]' if interactive else ''),
+            fontsize=13,
+            fontweight='bold',
+        )
+        fig.canvas.draw_idle()
+        print(f"  Page {page_num[0]}: samples {indices}")
+
+    if interactive:
+        ax_next = fig.add_axes([0.55, 0.02, 0.18, 0.055])
+        ax_quit = fig.add_axes([0.76, 0.02, 0.18, 0.055])
+        btn_next = Button(ax_next, 'Next')
+        btn_quit = Button(ax_quit, 'Quit')
+        _widgets.extend([btn_next, btn_quit, ax_next, ax_quit])
+
+        def _on_next(_event):
+            _draw_page()
+
+        def _on_quit(_event):
+            print("  Quit — closing trend browser.")
+            plt.close(fig)
+
+        btn_next.on_clicked(_on_next)
+        btn_quit.on_clicked(_on_quit)
+
+        def _on_key(event):
+            if event.key in ('n', 'right', ' '):
+                _draw_page()
+            elif event.key in ('q', 'escape'):
+                print("  Quit — closing trend browser.")
+                plt.close(fig)
+
+        fig.canvas.mpl_connect('key_press_event', _on_key)
+        print("Trend browser: [Next] or N/Space = next page · [Quit] or Q = exit")
+
+    _draw_page()
+    plt.show(block=True)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -594,99 +838,11 @@ class TradingDataset(Dataset):
         return starts
     
     def _generate_cache_key(self, config) -> str:
-        import hashlib
-        
-        # ==========================================================
-        # 1. DATA SOURCE PARAMETERS
-        # ==========================================================
-        
-        # Binance data settings
-        use_binance = config.get('use_binance_data', False)
-        binance_datatype = config.get('binance_datatype', 'klines')
-        binance_interval = config.get('binance_interval', '1m')
-        binance_start = config.get('binance_start_date', '2024-01-01')
-        binance_end = config.get('binance_end_date', '2026-06-30')
-                
-        # ==========================================================
-        # 2. TARGET PARAMETERS
-        # ==========================================================
-        
-        pred_target = config.get('prediction_target', ('UNKNOWN', 'UNKNOWN'))
-        pred_symbol, pred_feature = pred_target
-        price_idx = config.get('price_feature_idx', 0)
-        
-        # ==========================================================
-        # 3. FSV FEATURES (from TradingDataset instance)
-        # ==========================================================
-        
-        # Get features_to_include from self (TradingDataset instance)
-        features_to_include = getattr(self, 'feature_names', [])
-        include_str = ",".join(sorted(features_to_include)) if features_to_include else "all"
-        
-        # ==========================================================
-        # 4. DATASET STRUCTURE
-        # ==========================================================
-        
-        past_days = config.get('past_days', 7)
-        future_minutes = config.get('future_minutes', 60)
-        step = config.get('step', 1)
-        
-        # ==========================================================
-        # 5. FILTERS
-        # ==========================================================
-        
-        max_accum_deviation = config.get('max_accum_deviation', 12.0)
-        min_horizon = config.get('min_horizon', 3)
-        max_horizon = config.get('max_horizon', None)
-        
-        # ==========================================================
-        # 6. SPLITS
-        # ==========================================================
-        
-        train_ratio = config.get('train_ratio', 0.70)
-        val_ratio = config.get('val_ratio', 0.20)
-        
-        # ==========================================================
-        # 7. PROCESSING
-        # ==========================================================
-        
-        normalize = config.get('normalize', True)
-        
-        # ==========================================================
-        # 8. F, T DIMENSIONS (from data, not config)
-        # ==========================================================
-        
-        # These come from the actual data, but affect the cache
-        F = self.F if hasattr(self, 'F') else 0
-        T = self.T if hasattr(self, 'T') else 0
-        
-        # ==========================================================
-        # 9. BUILD HASH STRING
-        # ==========================================================
-        
-        params = (
-            f"{use_binance}"
-            f"{binance_datatype}"
-            f"{binance_interval}"
-            f"{binance_start}"
-            f"{binance_end}"
-            f"{pred_symbol}.{pred_feature}"
-            f"{price_idx}"
-            f"{include_str}"
-            f"{past_days}"
-            f"{future_minutes}"
-            f"{step}"
-            f"{max_accum_deviation}"
-            f"{min_horizon}"
-            f"{max_horizon}"
-            f"{train_ratio}"
-            f"{val_ratio}"
-            f"{normalize}"
-            f"{F}"
-            f"{T}"
-        )
-        
-        return hashlib.md5(params.encode()).hexdigest()[:12]
+        """
+        Dataset / label-cache identity. Config-only so callers like --history
+        can recompute the same key without downloading data.
+        """
+        return generate_dataset_signature(config)
     
     def _normalize_window(
         self, 
@@ -721,6 +877,8 @@ class TradingDataset(Dataset):
         label_list, mean_list, std_list, shape_list = [], [], [], []
         
         for idx in tqdm(range(len(self)), desc="Computing labels and norm params"):
+            # It traverses all samples.
+
             start = self.valid_starts[idx]
             x = self.Total[start:start + self.past_window, :]
             
@@ -733,7 +891,8 @@ class TradingDataset(Dataset):
                 # x_normalized = x
                 mean = torch.zeros(self.F)
                 std = torch.ones(self.F)
-                shape = torch.zeros(self.F, self.num_shapes)
+                # Must match normalize_window: shape is (num_shapes, F)
+                shape = torch.zeros(self.num_shapes, self.F)
                 mean_list.append(mean)
                 std_list.append(std)
                 shape_list.append(shape)
@@ -754,13 +913,14 @@ class TradingDataset(Dataset):
                 self.Total[start:start + self.past_window, self.price_feature_idx],
                 min_horizon=self.min_horizon,
                 max_horizon=self.max_horizon,
-                fitness_threshold=0.75,
+                fitness_threshold=LABEL_FITNESS_THRESHOLD,
             )
 
             label = torch.tensor([best_h, best_slope, best_intercept], dtype=torch.float32)
 
             label_list.append(label)
-        
+
+        # Unnormalized labels and x's properties of all data samples - train, validation, and test
         label_tensor = torch.stack(label_list)
         mean_tensor = torch.stack(mean_list)
         std_tensor = torch.stack(std_list)
@@ -859,22 +1019,30 @@ class TradingDataset(Dataset):
         
         return label_tensor, mean_tensor, std_tensor, shape_tensor, stats
     
-    def visualize_trends(self, num_samples: int = 6, figsize: Tuple[int, int] = (15, 10)):
+    def visualize_trends(
+        self,
+        num_samples: int = 6,
+        figsize: Tuple[int, int] = (15, 10),
+        interactive: bool = True,
+    ):
         """
         Explicitly visualize linear trends for the dataset.
-        
+
         Args:
-            num_samples: Number of samples to visualize
+            num_samples: Samples per page
             figsize: Figure size
+            interactive: If True, Next/Quit buttons page through unlimited batches
         """
         if self.label_tensor.shape[0] == 0:
             print("⚠ No labels available for visualization.")
             return
-        
-        print("\n" + "="*60)
+
+        print("\n" + "=" * 60)
         print("VISUALIZING LINEAR TRENDS")
-        print("="*60)
-        
+        if interactive:
+            print("  Interactive: Next = new random page, Quit = exit")
+        print("=" * 60)
+
         visualize_linear_trends(
             total_tensor=self.Total,
             valid_starts=self.valid_starts,
@@ -886,7 +1054,8 @@ class TradingDataset(Dataset):
             future_window=self.future_window,
             mode=self.horizon_mode,
             num_samples=num_samples,
-            figsize=figsize
+            figsize=figsize,
+            interactive=interactive,
         )
 
     def visualize_feature(self, fid, feature, feature_name, time_interval_minutes=1):
@@ -959,12 +1128,11 @@ class TradingDataset(Dataset):
         x = self._Total[start:start + self._past_window, :]     # assuming self._Total: (T, F)
         
         if self._normalize:
-            # Use view() instead of unsqueeze() - no memory allocation
             mean = self._mean_tensor[idx]       # (F,)
-            std = self._std_tensor[idx]         # (F,)
+            std = self._std_tensor[idx].clone()  # clone: do not mutate cache
             std[std == 0] = 1
             x_normalized = (x - mean) / std     # (T, F)
-            shape = self._shape_tensor[idx]    # assuming self._shape_tensor: (num_shapes, F)
+            shape = self._shape_tensor[idx]     # (num_shapes, F)
         else:
             x_normalized = x
             mean = torch.zeros(self._F)
@@ -984,7 +1152,7 @@ class TradingDataset(Dataset):
         # Std: (F,)
         std_normalized = (std - self.stats['std']['mean']) / (self.stats['std']['std'] + 1e-8)
         
-        # Shape: (num_shapes, F), assuming self.stats['shape']['mean'] and self.stats['shape']['std'] are (num_shapes, F)
+        # Shape: (num_shapes, F)
         shape_normalized = (shape - self.stats['shape']['mean']) / (self.stats['shape']['std'] + 1e-8)
         
         return x_normalized, y_normalized, mean_normalized, std_normalized, shape_normalized
