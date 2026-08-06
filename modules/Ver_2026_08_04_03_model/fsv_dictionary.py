@@ -1,44 +1,92 @@
 """
 fsv_dictionary.py
 
-Feature Dictionary with Release Metadata.
+Feature Dictionary with Release Metadata
+========================================
 
-Each feature includes:
-    - source: Data source (FRED, TwelveData, etc.)
-    - series/symbol: Series ID or symbol
-    - category: Feature category
-    - units: Units of measurement
-    - timezone: Source timezone
-    - release_timeframe: How often data is released (minute, hourly, daily, weekly, biweekly, monthly, quarterly)
-    - release_lag_days: Fixed calendar days added after release_timeframe
-    - release_time: Theoretical time of day data is released (HH:MM in local time)
-    - fill_policy: Forward fill policy (none, forward)
-    - description: Human-readable description
-    - use_vintage_data: Whether historical actual release dates are available
-    - vintage_source: Source of vintage data (FRED, etc.)
+Consumed by:
+    fsv_01_downloader.py     — which series to pull (source / series / symbol)
+    fsv_02_find_value_intervals.py — when a value becomes public (lag + time)
+    fsv_03_query_value_age.py      — decay half-life from release_timeframe
+
+How availability is computed (fsv_02)
+-------------------------------------
+    release_datetime ≈ observation_date + release_lag_days  at  release_time
+                       (in feature timezone; US business-day adjust unless
+                        continuous_market / non-US)
+
+    next_release_datetime = release of the following observation
+                            (last obs → open-ended far-future sentinel)
+
+    If use_vintage_data and ``{feature}__first_release`` exists in raw CSV,
+    that first-publication date OVERRIDES release_lag_days (clock still from
+    release_time when the vintage stamp is date-only).
+
+Field reference
+---------------
+    source              "FRED" | "TwelveData" | …
+    series              FRED series id (FRED only)
+    symbol              Market symbol (TwelveData only)
+    category            Logical group (rate, treasury, credit, …)
+    units               percent | index | million_usd | …
+    timezone            IANA tz for release_time (usually America/New_York)
+    release_timeframe   daily | weekly | monthly | quarterly | continuous_market
+                        → also drives decay half-life minutes in fsv_03
+    release_lag_days    Calendar days after observation/period date before
+                        the value is treated as known (heuristic fallback)
+    release_time        HH:MM local wall clock of official/conservative print
+    fill_policy         "none" | "forward" — documentation only today;
+                        interval model already holds value until next_release
+    description         Human-readable note (source + schedule rationale)
+    use_vintage_data    If True, fsv_01 fetches ALFRED first-release dates
+    vintage_source      "FRED" when ALFRED applies
+
+Caveats
+-------
+    * Times/lags are best-effort official alignments, NOT a full econ calendar
+      (no "last Tuesday of month", limited holiday logic).
+    * Prefer slightly LATER availability when uncertain → less lookahead risk.
+    * FRED can lag the primary source by minutes–hours; some entries pad for that.
 """
 
 FEATURES = {
 
-    # ==========================================================
+    # ==================================================================
     # Interest Rates
-    # ==========================================================
+    # ==================================================================
 
+    # ------------------------------------------------------------------
+    # fed_funds  |  FRED:DFF  |  Effective federal funds rate
+    # Primary public path on FRED is Board H.15 (~16:15 ET), not NY Fed
+    # EFFR (~09:00 ET). Observation date T is typically first on H.15 at T+1.
+    # lag=1, time=16:15  →  available T+1 16:15 ET
+    # ------------------------------------------------------------------
     "fed_funds": {
         "source": "FRED",
-        "series": "DFF",
+        "series": "DFF",                    # H.15 effective funds (daily)
         "category": "rate",
         "units": "percent",
         "timezone": "America/New_York",
         "release_timeframe": "daily",
-        "release_lag_days": 1,
-        "release_time": "08:00",
+        "release_lag_days": 1,              # T+1 vs observation date
+        "release_time": "16:15",            # H.15 post time (ET)
         "fill_policy": "none",
-        "description": "Effective Federal Funds Rate",
-        "use_vintage_data": True,
+        "description": (
+            "Effective Federal Funds Rate (H.15/DFF). "
+            "Public ~T+1 at 16:15 ET via H.15 (NY Fed EFFR is ~09:00 ET)."
+        ),
+        "use_vintage_data": True,           # ALFRED first-release preferred
         "vintage_source": "FRED",
     },
 
+    # ------------------------------------------------------------------
+    # Treasury constant-maturity yields (DGS*) — Fed H.15
+    # Same-day print ~16:15 ET for the trade/observation date.
+    # lag=0, time=16:15 for all tenors below.
+    # Underlying quotes ~15:30 ET; H.15 is the standardized public release.
+    # ------------------------------------------------------------------
+
+    # 1y_treasury | FRED:DGS1 | 1-Year CMT
     "1y_treasury": {
         "source": "FRED",
         "series": "DGS1",
@@ -46,14 +94,15 @@ FEATURES = {
         "units": "percent",
         "timezone": "America/New_York",
         "release_timeframe": "daily",
-        "release_lag_days": 0,
-        "release_time": "16:15",
+        "release_lag_days": 0,              # same calendar day as obs date
+        "release_time": "16:15",            # H.15
         "fill_policy": "none",
-        "description": "1-Year Treasury Constant Maturity Rate",
+        "description": "1-Year Treasury Constant Maturity (H.15 ~16:15 ET)",
         "use_vintage_data": True,
         "vintage_source": "FRED",
     },
 
+    # 2y_treasury | FRED:DGS2 | 2-Year CMT
     "2y_treasury": {
         "source": "FRED",
         "series": "DGS2",
@@ -64,11 +113,12 @@ FEATURES = {
         "release_lag_days": 0,
         "release_time": "16:15",
         "fill_policy": "none",
-        "description": "2-Year Treasury Constant Maturity Rate",
+        "description": "2-Year Treasury Constant Maturity (H.15 ~16:15 ET)",
         "use_vintage_data": True,
         "vintage_source": "FRED",
     },
 
+    # 5y_treasury | FRED:DGS5 | 5-Year CMT
     "5y_treasury": {
         "source": "FRED",
         "series": "DGS5",
@@ -79,11 +129,12 @@ FEATURES = {
         "release_lag_days": 0,
         "release_time": "16:15",
         "fill_policy": "none",
-        "description": "5-Year Treasury Constant Maturity Rate",
+        "description": "5-Year Treasury Constant Maturity (H.15 ~16:15 ET)",
         "use_vintage_data": True,
         "vintage_source": "FRED",
     },
 
+    # 10y_treasury | FRED:DGS10 | 10-Year CMT (common macro factor)
     "10y_treasury": {
         "source": "FRED",
         "series": "DGS10",
@@ -94,11 +145,12 @@ FEATURES = {
         "release_lag_days": 0,
         "release_time": "16:15",
         "fill_policy": "none",
-        "description": "10-Year Treasury Constant Maturity Rate",
+        "description": "10-Year Treasury Constant Maturity (H.15 ~16:15 ET)",
         "use_vintage_data": True,
         "vintage_source": "FRED",
     },
 
+    # 30y_treasury | FRED:DGS30 | 30-Year CMT
     "30y_treasury": {
         "source": "FRED",
         "series": "DGS30",
@@ -109,15 +161,17 @@ FEATURES = {
         "release_lag_days": 0,
         "release_time": "16:15",
         "fill_policy": "none",
-        "description": "30-Year Treasury Constant Maturity Rate",
+        "description": "30-Year Treasury Constant Maturity (H.15 ~16:15 ET)",
         "use_vintage_data": True,
         "vintage_source": "FRED",
     },
 
-    # ==========================================================
+    # ==================================================================
     # Real Rates
-    # ==========================================================
+    # ==================================================================
 
+    # tips10y | FRED:DFII10 | 10Y TIPS real yield (also H.15 family)
+    # Same schedule as nominal CMT: lag=0, 16:15 ET
     "tips10y": {
         "source": "FRED",
         "series": "DFII10",
@@ -128,15 +182,19 @@ FEATURES = {
         "release_lag_days": 0,
         "release_time": "16:15",
         "fill_policy": "none",
-        "description": "10-Year Treasury Inflation-Indexed Security",
+        "description": "10-Year TIPS constant maturity (H.15 ~16:15 ET)",
         "use_vintage_data": True,
         "vintage_source": "FRED",
     },
 
-    # ==========================================================
-    # Corporate Credit
-    # ==========================================================
+    # ==================================================================
+    # Corporate Credit — ICE BofA Option-Adjusted Spreads (via FRED)
+    # End-of-day vendor construction; FRED ingest timing is not a hard
+    # official clock. Conservative no-lookahead: T+1 09:00 ET.
+    # use_vintage_data=False (no reliable ALFRED path for these).
+    # ==================================================================
 
+    # aaa_oas | FRED:BAMLC0A1CAAA | ICE BofA AAA US Corporate OAS
     "aaa_oas": {
         "source": "FRED",
         "series": "BAMLC0A1CAAA",
@@ -144,14 +202,15 @@ FEATURES = {
         "units": "percent",
         "timezone": "America/New_York",
         "release_timeframe": "daily",
-        "release_lag_days": 0,
-        "release_time": "17:00",
+        "release_lag_days": 1,              # conservative vs same-day EOD
+        "release_time": "09:00",
         "fill_policy": "none",
-        "description": "ICE BofA AAA Option-Adjusted Spread",
+        "description": "ICE BofA AAA OAS (conservative: T+1 09:00 ET on FRED)",
         "use_vintage_data": False,
         "vintage_source": None,
     },
 
+    # aa_oas | FRED:BAMLC0A2CAA
     "aa_oas": {
         "source": "FRED",
         "series": "BAMLC0A2CAA",
@@ -159,14 +218,15 @@ FEATURES = {
         "units": "percent",
         "timezone": "America/New_York",
         "release_timeframe": "daily",
-        "release_lag_days": 0,
-        "release_time": "17:00",
+        "release_lag_days": 1,
+        "release_time": "09:00",
         "fill_policy": "none",
-        "description": "ICE BofA AA Option-Adjusted Spread",
+        "description": "ICE BofA AA OAS (conservative: T+1 09:00 ET on FRED)",
         "use_vintage_data": False,
         "vintage_source": None,
     },
 
+    # a_oas | FRED:BAMLC0A3CA
     "a_oas": {
         "source": "FRED",
         "series": "BAMLC0A3CA",
@@ -174,14 +234,15 @@ FEATURES = {
         "units": "percent",
         "timezone": "America/New_York",
         "release_timeframe": "daily",
-        "release_lag_days": 0,
-        "release_time": "17:00",
+        "release_lag_days": 1,
+        "release_time": "09:00",
         "fill_policy": "none",
-        "description": "ICE BofA A Option-Adjusted Spread",
+        "description": "ICE BofA A OAS (conservative: T+1 09:00 ET on FRED)",
         "use_vintage_data": False,
         "vintage_source": None,
     },
 
+    # bbb_oas | FRED:BAMLC0A4CBBB
     "bbb_oas": {
         "source": "FRED",
         "series": "BAMLC0A4CBBB",
@@ -189,14 +250,15 @@ FEATURES = {
         "units": "percent",
         "timezone": "America/New_York",
         "release_timeframe": "daily",
-        "release_lag_days": 0,
-        "release_time": "17:00",
+        "release_lag_days": 1,
+        "release_time": "09:00",
         "fill_policy": "none",
-        "description": "ICE BofA BBB Option-Adjusted Spread",
+        "description": "ICE BofA BBB OAS (conservative: T+1 09:00 ET on FRED)",
         "use_vintage_data": False,
         "vintage_source": None,
     },
 
+    # hy_oas | FRED:BAMLH0A0HYM2 | High yield OAS (risk-sentiment proxy)
     "hy_oas": {
         "source": "FRED",
         "series": "BAMLH0A0HYM2",
@@ -204,18 +266,23 @@ FEATURES = {
         "units": "percent",
         "timezone": "America/New_York",
         "release_timeframe": "daily",
-        "release_lag_days": 0,
-        "release_time": "17:00",
+        "release_lag_days": 1,
+        "release_time": "09:00",
         "fill_policy": "none",
-        "description": "ICE BofA High Yield Option-Adjusted Spread",
+        "description": "ICE BofA HY OAS (conservative: T+1 09:00 ET on FRED)",
         "use_vintage_data": False,
         "vintage_source": None,
     },
 
-    # ==========================================================
-    # Funding
-    # ==========================================================
+    # ==================================================================
+    # Funding / money markets
+    # ==================================================================
 
+    # ------------------------------------------------------------------
+    # sofr | FRED:SOFR | Secured Overnight Financing Rate
+    # NY Fed publishes rate for prior business day ~08:00 ET each morning.
+    # lag=1, time=08:00
+    # ------------------------------------------------------------------
     "sofr": {
         "source": "FRED",
         "series": "SOFR",
@@ -224,13 +291,19 @@ FEATURES = {
         "timezone": "America/New_York",
         "release_timeframe": "daily",
         "release_lag_days": 1,
-        "release_time": "08:00",
+        "release_time": "08:00",            # NY Fed SOFR print
         "fill_policy": "none",
-        "description": "Secured Overnight Financing Rate",
+        "description": "SOFR (NY Fed ~08:00 ET for prior business day)",
         "use_vintage_data": True,
         "vintage_source": "FRED",
     },
 
+    # ------------------------------------------------------------------
+    # ted_spread | FRED:TEDRATE
+    # Historically LIBOR–T-bill; series is legacy / often sparse on FRED.
+    # Excluded by default in config features_to_exclude — kept for completeness.
+    # Conservative T+1 afternoon.
+    # ------------------------------------------------------------------
     "ted_spread": {
         "source": "FRED",
         "series": "TEDRATE",
@@ -238,14 +311,19 @@ FEATURES = {
         "units": "percent",
         "timezone": "America/New_York",
         "release_timeframe": "daily",
-        "release_lag_days": 0,
-        "release_time": "16:00",
+        "release_lag_days": 1,
+        "release_time": "16:15",
         "fill_policy": "none",
-        "description": "TED Spread",
+        "description": "TED Spread (legacy/sparse on FRED; conservative T+1 H.15-like)",
         "use_vintage_data": False,
         "vintage_source": None,
     },
 
+    # ------------------------------------------------------------------
+    # commercial_paper_3m | FRED:CPF3M | 3M AA financial CP
+    # Short FRED publication lag; treat as T+1 ~16:15.
+    # Often excluded in config (features_to_exclude).
+    # ------------------------------------------------------------------
     "commercial_paper_3m": {
         "source": "FRED",
         "series": "CPF3M",
@@ -253,18 +331,24 @@ FEATURES = {
         "units": "percent",
         "timezone": "America/New_York",
         "release_timeframe": "daily",
-        "release_lag_days": 0,
-        "release_time": "16:00",
+        "release_lag_days": 1,
+        "release_time": "16:15",
         "fill_policy": "none",
-        "description": "3-Month Commercial Paper Rate",
+        "description": "3-Month AA Financial Commercial Paper (conservative T+1 ~16:15 ET)",
         "use_vintage_data": False,
         "vintage_source": None,
     },
 
-    # ==========================================================
-    # Liquidity
-    # ==========================================================
+    # ==================================================================
+    # Liquidity / money stock / USD
+    # ==================================================================
 
+    # ------------------------------------------------------------------
+    # fed_assets | FRED:WALCL | Fed total assets
+    # H.4.1 weekly: Thursday ~16:30 ET, Wednesday close levels.
+    # Obs date is typically Wednesday → lag_days=1, time=16:30.
+    # (Weekday-of-week is NOT encoded — only lag+clock.)
+    # ------------------------------------------------------------------
     "fed_assets": {
         "source": "FRED",
         "series": "WALCL",
@@ -272,14 +356,19 @@ FEATURES = {
         "units": "million_usd",
         "timezone": "America/New_York",
         "release_timeframe": "weekly",
-        "release_lag_days": 1,
-        "release_time": "16:30",
-        "fill_policy": "forward",
-        "description": "Federal Reserve Total Assets (Weekly)",
+        "release_lag_days": 1,              # Wed level → Thu print
+        "release_time": "16:30",            # H.4.1
+        "fill_policy": "forward",           # hold between weekly prints
+        "description": "Fed total assets WALCL (H.4.1 Thu ~16:30 ET; Wed levels)",
         "use_vintage_data": True,
         "vintage_source": "FRED",
     },
 
+    # ------------------------------------------------------------------
+    # bank_reserves | FRED:TOTRESNS | Depository institution reserves
+    # Monthly; lag varies. ~35 calendar days is a mid-range heuristic.
+    # Prefer ALFRED first-release when downloaded.
+    # ------------------------------------------------------------------
     "bank_reserves": {
         "source": "FRED",
         "series": "TOTRESNS",
@@ -287,14 +376,19 @@ FEATURES = {
         "units": "million_usd",
         "timezone": "America/New_York",
         "release_timeframe": "monthly",
-        "release_lag_days": 30,
-        "release_time": "08:30",
+        "release_lag_days": 35,             # heuristic after month label date
+        "release_time": "16:00",
         "fill_policy": "forward",
-        "description": "Depository Institution Reserves (Monthly)",
+        "description": "Reserves of depository institutions (monthly; ~35d lag heuristic)",
         "use_vintage_data": True,
         "vintage_source": "FRED",
     },
 
+    # ------------------------------------------------------------------
+    # m2 | FRED:M2SL | M2 money stock
+    # H.6 release: often ~3–4 weeks after month-end, afternoon ET.
+    # lag≈25d, time=16:30 heuristic (vintage preferred).
+    # ------------------------------------------------------------------
     "m2": {
         "source": "FRED",
         "series": "M2SL",
@@ -302,14 +396,18 @@ FEATURES = {
         "units": "billion_usd",
         "timezone": "America/New_York",
         "release_timeframe": "monthly",
-        "release_lag_days": 30,
-        "release_time": "16:30",
+        "release_lag_days": 25,
+        "release_time": "16:30",            # typical H.6 afternoon window
         "fill_policy": "forward",
-        "description": "M2 Money Stock (Monthly)",
+        "description": "M2 money stock (H.6; ~25d lag / 16:30 ET heuristic)",
         "use_vintage_data": True,
         "vintage_source": "FRED",
     },
 
+    # ------------------------------------------------------------------
+    # dollar_index | FRED:DTWEXBGS | Trade-weighted broad USD (goods)
+    # Fed series; FRED often delayed vs trade date. Conservative T+1 10:00.
+    # ------------------------------------------------------------------
     "dollar_index": {
         "source": "FRED",
         "series": "DTWEXBGS",
@@ -317,18 +415,23 @@ FEATURES = {
         "units": "index",
         "timezone": "America/New_York",
         "release_timeframe": "daily",
-        "release_lag_days": 0,
-        "release_time": "17:00",
+        "release_lag_days": 1,
+        "release_time": "10:00",
         "fill_policy": "none",
-        "description": "Trade Weighted US Dollar Index",
+        "description": "Trade-weighted USD broad (goods); conservative T+1 10:00 ET",
         "use_vintage_data": False,
         "vintage_source": None,
     },
 
-    # ==========================================================
-    # Equity / Market
-    # ==========================================================
+    # ==================================================================
+    # Equity / volatility
+    # ==================================================================
 
+    # ------------------------------------------------------------------
+    # sp500 | FRED:SP500
+    # Cash session closes 16:00 ET; FRED update often later same evening.
+    # lag=0, time=18:00 pads FRED ingest without waiting until T+1.
+    # ------------------------------------------------------------------
     "sp500": {
         "source": "FRED",
         "series": "SP500",
@@ -337,13 +440,17 @@ FEATURES = {
         "timezone": "America/New_York",
         "release_timeframe": "daily",
         "release_lag_days": 0,
-        "release_time": "16:15",
+        "release_time": "18:00",            # conservative same-day FRED time
         "fill_policy": "none",
-        "description": "S&P 500 Index",
+        "description": "S&P 500 (cash close 16:00; FRED often ~18:00 ET same day)",
         "use_vintage_data": False,
         "vintage_source": None,
     },
 
+    # ------------------------------------------------------------------
+    # vix | FRED:VIXCLS | CBOE Volatility Index
+    # Settlement / close around 16:00–16:15 ET window.
+    # ------------------------------------------------------------------
     "vix": {
         "source": "FRED",
         "series": "VIXCLS",
@@ -354,15 +461,20 @@ FEATURES = {
         "release_lag_days": 0,
         "release_time": "16:15",
         "fill_policy": "none",
-        "description": "CBOE Volatility Index (VIX)",
+        "description": "CBOE VIX close (~16:15 ET settlement window)",
         "use_vintage_data": False,
         "vintage_source": None,
     },
 
-    # ==========================================================
+    # ==================================================================
     # Commodities
-    # ==========================================================
+    # ==================================================================
 
+    # ------------------------------------------------------------------
+    # wti_oil | FRED:DCOILWTICO | WTI spot Cushing (EIA)
+    # Often public next business morning (~10:30 ET), not same-day close.
+    # lag=1, time=10:30
+    # ------------------------------------------------------------------
     "wti_oil": {
         "source": "FRED",
         "series": "DCOILWTICO",
@@ -370,14 +482,18 @@ FEATURES = {
         "units": "usd_per_barrel",
         "timezone": "America/New_York",
         "release_timeframe": "daily",
-        "release_lag_days": 0,
-        "release_time": "17:00",
+        "release_lag_days": 1,
+        "release_time": "10:30",            # EIA-style morning window
         "fill_policy": "none",
-        "description": "WTI Spot Crude Oil Price",
+        "description": "WTI spot Cushing (EIA; conservative T+1 ~10:30 ET)",
         "use_vintage_data": False,
         "vintage_source": None,
     },
 
+    # ------------------------------------------------------------------
+    # brent_oil | FRED:DCOILBRENTEU | Brent spot Europe
+    # Same conservative next-morning treatment as WTI.
+    # ------------------------------------------------------------------
     "brent_oil": {
         "source": "FRED",
         "series": "DCOILBRENTEU",
@@ -385,33 +501,43 @@ FEATURES = {
         "units": "usd_per_barrel",
         "timezone": "America/New_York",
         "release_timeframe": "daily",
-        "release_lag_days": 0,
-        "release_time": "17:00",
+        "release_lag_days": 1,
+        "release_time": "10:30",
         "fill_policy": "none",
-        "description": "Brent Spot Crude Oil Price",
+        "description": "Brent spot (EIA Europe; conservative T+1 ~10:30 ET)",
         "use_vintage_data": False,
         "vintage_source": None,
     },
 
+    # ------------------------------------------------------------------
+    # gold_spot | TwelveData:XAU/USD | Continuous spot FX-style gold
+    # No official daily "print". continuous_market → fsv_02 skips US
+    # business-day shifting; release_time 00:00 UTC = daily bar boundary.
+    # ------------------------------------------------------------------
     "gold_spot": {
         "source": "TwelveData",
-        "symbol": "XAU/USD",
+        "symbol": "XAU/USD",                # not a FRED series
         "category": "commodity",
         "units": "usd_per_oz",
         "timezone": "UTC",
-        "release_timeframe": "daily",
+        "release_timeframe": "continuous_market",
         "release_lag_days": 0,
-        "release_time": "17:00",
+        "release_time": "00:00",            # daily bar end (UTC)
         "fill_policy": "none",
-        "description": "Gold Spot Price (24/7 Market)",
+        "description": "Gold spot XAU/USD (continuous; daily bar available at 00:00 UTC next)",
         "use_vintage_data": False,
         "vintage_source": None,
     },
 
-    # ==========================================================
+    # ==================================================================
     # Housing / Real Estate
-    # ==========================================================
+    # ==================================================================
 
+    # ------------------------------------------------------------------
+    # case_shiller | FRED:CSUSHPINSA | S&P CoreLogic Case-Shiller NSA
+    # ~2-month publication lag; 09:00 ET (often last Tuesday — not encoded).
+    # lag=60, time=09:00
+    # ------------------------------------------------------------------
     "case_shiller": {
         "source": "FRED",
         "series": "CSUSHPINSA",
@@ -419,14 +545,18 @@ FEATURES = {
         "units": "index",
         "timezone": "America/New_York",
         "release_timeframe": "monthly",
-        "release_lag_days": 60,
+        "release_lag_days": 60,             # ~2 calendar months
         "release_time": "09:00",
         "fill_policy": "forward",
-        "description": "Case-Shiller Home Price Index (Monthly)",
+        "description": "Case-Shiller NSA national HPI (~2-month lag, 09:00 ET)",
         "use_vintage_data": True,
         "vintage_source": "FRED",
     },
 
+    # ------------------------------------------------------------------
+    # fhfa_price | FRED:USSTHPI | FHFA house price index
+    # Quarterly; roughly ~2 months after quarter. Often excluded in config.
+    # ------------------------------------------------------------------
     "fhfa_price": {
         "source": "FRED",
         "series": "USSTHPI",
@@ -437,11 +567,15 @@ FEATURES = {
         "release_lag_days": 60,
         "release_time": "09:00",
         "fill_policy": "forward",
-        "description": "FHFA House Price Index (Quarterly)",
+        "description": "FHFA US house price index (quarterly; ~60d / 09:00 heuristic)",
         "use_vintage_data": True,
         "vintage_source": "FRED",
     },
 
+    # ------------------------------------------------------------------
+    # housing_starts | FRED:HOUST | Census housing starts
+    # New Residential Construction: usually mid-month ~08:30 ET (~16–18 days).
+    # ------------------------------------------------------------------
     "housing_starts": {
         "source": "FRED",
         "series": "HOUST",
@@ -449,14 +583,18 @@ FEATURES = {
         "units": "thousands",
         "timezone": "America/New_York",
         "release_timeframe": "monthly",
-        "release_lag_days": 21,
-        "release_time": "08:30",
+        "release_lag_days": 18,             # mid-month heuristic
+        "release_time": "08:30",            # Census standard print
         "fill_policy": "forward",
-        "description": "Housing Starts (Monthly)",
+        "description": "Housing starts (Census ~08:30 ET, ~mid-month / 18d lag)",
         "use_vintage_data": True,
         "vintage_source": "FRED",
     },
 
+    # ------------------------------------------------------------------
+    # building_permits | FRED:PERMIT | Census building permits
+    # Same Census release family / schedule as housing starts.
+    # ------------------------------------------------------------------
     "building_permits": {
         "source": "FRED",
         "series": "PERMIT",
@@ -464,14 +602,19 @@ FEATURES = {
         "units": "thousands",
         "timezone": "America/New_York",
         "release_timeframe": "monthly",
-        "release_lag_days": 21,
+        "release_lag_days": 18,
         "release_time": "08:30",
         "fill_policy": "forward",
-        "description": "Building Permits (Monthly)",
+        "description": "Building permits (Census ~08:30 ET, ~mid-month / 18d lag)",
         "use_vintage_data": True,
         "vintage_source": "FRED",
     },
 
+    # ------------------------------------------------------------------
+    # mortgage_30y | FRED:MORTGAGE30US | Freddie Mac PMMS 30Y fixed
+    # Official: Thursdays 12:00 ET (week ends prior Wednesday).
+    # lag=0 on the survey week date + 12:00; weekday rule not encoded.
+    # ------------------------------------------------------------------
     "mortgage_30y": {
         "source": "FRED",
         "series": "MORTGAGE30US",
@@ -480,9 +623,9 @@ FEATURES = {
         "timezone": "America/New_York",
         "release_timeframe": "weekly",
         "release_lag_days": 0,
-        "release_time": "12:00",
+        "release_time": "12:00",            # Freddie Mac PMMS noon ET
         "fill_policy": "forward",
-        "description": "30-Year Fixed Mortgage Rate (Weekly)",
+        "description": "30Y fixed mortgage (Freddie PMMS Thu 12:00 ET)",
         "use_vintage_data": True,
         "vintage_source": "FRED",
     },
