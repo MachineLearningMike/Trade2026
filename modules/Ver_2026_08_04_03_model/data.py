@@ -1432,10 +1432,13 @@ class ThreadedDataLoader:
                             self.prefetch_queue.put(('error', RuntimeError("Iterator is None"), 0))
                             return
                     
+                    # Measure only batch assembly — NOT queue.put() blocking
+                    # (put blocks when the queue is full; that is consumer backpressure,
+                    # not data-loading cost, and must not be counted as load_time).
+                    t_build0 = time.perf_counter()
                     batch = next(self.iterator)
-                    load_time = time.time() - self.load_start_time
+                    load_time = time.perf_counter() - t_build0
                     self.prefetch_queue.put(('data', batch, load_time))
-                    self.load_start_time = time.time()
                 except StopIteration:
                     break
                 except Exception as e:
@@ -1464,22 +1467,44 @@ class ThreadedDataLoader:
                 break
     
     def get_next_batch(self):
-        """Get the next batch from the queue."""
-        try:
-            status, data, load_time = self.prefetch_queue.get(timeout=0.1)
-        except queue.Empty:
-            return None, 0
-        except Exception as e:
-            print(f"🔍 DEBUG: queue.get() raised: {e}")
-            return None, 0
-        
-        if status == 'stop':
-            self.running = False
-            return None, load_time
-        elif status == 'error':
-            raise data
-        
-        return data, load_time
+        """
+        Get the next batch from the prefetch queue.
+
+        Blocks until a batch is ready, the epoch ends, or the worker errors.
+
+        Returns:
+            (batch, wait_time_s, load_time_s)
+            batch is None at end of epoch.
+            wait_time_s: time this call blocked on the queue (consumer stall).
+            load_time_s: producer-side batch build time only (not put-wait).
+        """
+        wait_start = time.perf_counter()
+        while True:
+            try:
+                status, data, load_time = self.prefetch_queue.get(timeout=0.5)
+            except queue.Empty:
+                if self.running or (
+                    self.prefetch_thread is not None and self.prefetch_thread.is_alive()
+                ):
+                    continue
+                wait_time = time.perf_counter() - wait_start
+                return None, wait_time, 0.0
+            except Exception as e:
+                print(f"🔍 DEBUG: queue.get() raised: {e}")
+                wait_time = time.perf_counter() - wait_start
+                return None, wait_time, 0.0
+
+            wait_time = time.perf_counter() - wait_start
+
+            if status == 'stop':
+                self.running = False
+                return None, wait_time, float(load_time or 0.0)
+            if status == 'error':
+                raise data
+
+            # Track resume position (batches consumed this epoch)
+            self.current_batch_start += 1
+            return data, wait_time, float(load_time or 0.0)
     
     def __del__(self):
         """Cleanup on deletion."""

@@ -114,6 +114,23 @@ class TrainingState:
         if preserved_total is None:
             preserved_total = getattr(self, 'planned_total_epochs', None)
 
+        # Do NOT embed the full per-minibatch loss curve in the .pt payload on
+        # every save — at ~30k batches it is tens of MB and dominates I/O.
+        # It is written separately to latest_epoch_loss.json (compact).
+        # Keep a tiny summary in the checkpoint for debugging.
+        le_summary = None
+        if isinstance(latest_epoch_loss, dict) and latest_epoch_loss:
+            le_summary = {
+                'epoch': latest_epoch_loss.get('epoch'),
+                'num_batches': latest_epoch_loss.get('num_batches')
+                    or len(latest_epoch_loss.get('batch_losses') or []),
+                'avg_loss': latest_epoch_loss.get('avg_loss'),
+                'complete': latest_epoch_loss.get('complete'),
+                'total_minibatches_processed': latest_epoch_loss.get(
+                    'total_minibatches_processed'
+                ),
+            }
+
         checkpoint = {
             'version': 4,
             'epoch': epoch,
@@ -122,7 +139,7 @@ class TrainingState:
             'loss': loss,
             'val_loss': val_loss,
             'history': history,
-            'latest_epoch_loss': latest_epoch_loss,
+            'latest_epoch_loss_summary': le_summary,
             'training_finished': training_finished,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -134,6 +151,9 @@ class TrainingState:
             'max_seq_len': max_seq_len,
             'total_epochs': preserved_total,
         }
+        # Emergency / final: also embed full curve for standalone recovery
+        if latest_epoch_loss is not None and (is_emergency or training_finished):
+            checkpoint['latest_epoch_loss'] = latest_epoch_loss
         
         timestamp = time.strftime('%Y%m%d_%H%M%S')
         prefix = 'emergency' if is_emergency else 'checkpoint'
@@ -167,7 +187,8 @@ class TrainingState:
             'loss': loss,
             'val_loss': val_loss,
             'history': history,
-            'latest_epoch_loss': latest_epoch_loss,
+            # Summary only — full curve lives in latest_epoch_loss.json
+            'latest_epoch_loss_summary': le_summary,
             'training_finished': training_finished,
             'timestamp': time.time(),
             'is_emergency': is_emergency,
@@ -178,13 +199,15 @@ class TrainingState:
             # epoch is 0-based index of last trained epoch
             state_info['completed_epochs'] = int(epoch) + 1
 
-        # Persist per-minibatch curve of the latest epoch for --loss
+        # Persist per-minibatch curve for --loss (compact JSON, no indent).
+        # This used to use indent=2 and was also duplicated into training_state
+        # and the .pt file — at ~30k batches that alone could exceed train step time.
         if latest_epoch_loss is not None:
             try:
                 loss_path = self.save_dir / LATEST_EPOCH_LOSS_FILENAME
                 temp_loss = loss_path.with_suffix('.tmp')
                 with open(temp_loss, 'w') as f:
-                    json.dump(latest_epoch_loss, f, indent=2, default=str)
+                    json.dump(latest_epoch_loss, f, separators=(',', ':'), default=str)
                 os.replace(temp_loss, loss_path)
             except Exception as e:
                 print(f"⚠ Failed to save {LATEST_EPOCH_LOSS_FILENAME}: {e}")
@@ -433,6 +456,17 @@ class TrainingState:
         latest_epoch_loss = checkpoint.get('latest_epoch_loss', None)
         if latest_epoch_loss is None:
             latest_epoch_loss = state_info.get('latest_epoch_loss')
+        # Preferred: compact curve file (no longer embedded in every .pt / state)
+        if latest_epoch_loss is None or (
+            isinstance(latest_epoch_loss, dict)
+            and not latest_epoch_loss.get('batch_losses')
+        ):
+            try:
+                loaded_le = LatestEpochLoss.load(self.save_dir)
+                if loaded_le is not None and loaded_le.batch_losses:
+                    latest_epoch_loss = loaded_le.to_dict()
+            except Exception:
+                pass
         is_emergency = checkpoint.get('is_emergency', False)
         dataloader_state = checkpoint.get('dataloader_state', None)
         
@@ -961,7 +995,14 @@ class ResumableTrainer:
             )
             
             while True:
-                batch, load_time = loader.get_next_batch()
+                result = loader.get_next_batch()
+                # Support (batch, load) and (batch, wait, load) return shapes
+                if result is None:
+                    break
+                if len(result) == 2:
+                    batch, _load_time = result
+                else:
+                    batch, _wait_time, _load_time = result
                 if batch is None:
                     break
                 
@@ -981,7 +1022,7 @@ class ResumableTrainer:
                 avg_loss = total_loss / num_batches
                 pbar.update(1)
                 # batch count is already in n/total; keep postfix short
-                pbar.set_postfix_str(f', loss={avg_loss:.4f}', refresh=False)
+                pbar.set_postfix_str(f'loss={avg_loss:.4f}', refresh=False)
             
             if pbar.n < total_batches:
                 pbar.update(total_batches - pbar.n)
@@ -1525,10 +1566,20 @@ class ResumableTrainer:
                 resume_batch_start=resume_batch_start,
             )
         
+        # Timing model (per batch averages over THIS session only):
+        #   wait  = consumer blocked on prefetch queue
+        #   data  = producer batch-build time (overlaps with prior compute; do NOT
+        #           add data+comp for wall time)
+        #   comp  = train step (forward/backward/optim)
+        #   step  = wait+comp+small host overhead  (one train iteration)
+        #   save  = checkpoint I/O amortized per batch  ← was the "missing" time
+        #   eff   = step + save  (true wall ms/batch; should match 1000/it/s)
         total_wait_time = 0.0
         total_load_time = 0.0
         total_compute_time = 0.0
         total_cycle_time = 0.0
+        total_save_time = 0.0
+        timed_batches = 0
         
         model = self.model
         optimizer = self.optimizer
@@ -1537,7 +1588,6 @@ class ResumableTrainer:
         dataloader = self.dataloader
 
         cycle_start = time.perf_counter()
-        wait_start = time.time()
 
         batch_count = 0
         while True:
@@ -1555,13 +1605,16 @@ class ResumableTrainer:
             if result is None:
                 print(f"🔍 DEBUG: get_next_batch returned None at batch_count={batch_count}")
                 break
-            batch, load_time = result
+            if len(result) == 2:
+                batch, load_time = result
+                wait_time = 0.0
+            else:
+                batch, wait_time, load_time = result
 
             if batch is None:
                 print(f"🔍 DEBUG: batch is None at batch_count={batch_count}")
                 break
 
-            wait_time = time.time() - wait_start
             total_wait_time += wait_time
             total_load_time += load_time
 
@@ -1596,6 +1649,7 @@ class ResumableTrainer:
             cycle_time = time.perf_counter() - cycle_start
             cycle_start = time.perf_counter()
             total_cycle_time += cycle_time
+            timed_batches += 1
             
             batch_idx += 1
             batches_in_epoch += 1
@@ -1612,15 +1666,26 @@ class ResumableTrainer:
             
             update_cycle = 10
             if batch_idx % update_cycle == 0 or batch_idx == 1:
-                avg_wait = total_wait_time / batches_in_epoch * 1000
-                avg_comp = total_compute_time / batches_in_epoch * 1000
+                denom = max(timed_batches, 1)
+                avg_wait = total_wait_time / denom * 1000.0
+                avg_data = total_load_time / denom * 1000.0
+                avg_comp = total_compute_time / denom * 1000.0
+                avg_step = total_cycle_time / denom * 1000.0
+                # Amortized checkpoint I/O — this is the usual "missing" wall time
+                avg_save = total_save_time / denom * 1000.0
+                avg_eff = avg_step + avg_save
 
                 pbar.update(batch_idx - pbar.n)
-                # Leading ", " matches tqdm's default set_postfix spacing in bar_format.
+                # tqdm already prefixes postfix with ", ".
+                # data is producer-side (overlaps); do not expect wait+data+comp=step.
                 pbar.set_postfix_str(
-                    f', loss={avg_loss:.4f}, '
+                    f'loss={avg_loss:.4f}, '
                     f'wait={avg_wait:.0f}ms, '
-                    f'comp={avg_comp:.0f}ms',
+                    f'data={avg_data:.0f}ms, '
+                    f'comp={avg_comp:.0f}ms, '
+                    f'step={avg_step:.0f}ms, '
+                    f'save={avg_save:.0f}ms, '
+                    f'eff={avg_eff:.0f}ms',
                     refresh=False,
                 )
 
@@ -1632,6 +1697,7 @@ class ResumableTrainer:
                 # Clear the live bar before multi-line checkpoint logs so the
                 # bar is not interleaved/corrupted by print() output.
                 pbar.clear()
+                save_t0 = time.perf_counter()
                 self.state_manager.save_checkpoint(
                     model=model,
                     optimizer=optimizer,
@@ -1648,10 +1714,25 @@ class ResumableTrainer:
                     embed_dim=getattr(self, 'embed_dim', None),
                     max_seq_len=getattr(self, 'max_seq_len', None),
                 )
+                save_dt = time.perf_counter() - save_t0
+                total_save_time += save_dt
+                # Keep tqdm rate based on train throughput, not checkpoint stalls.
+                pbar.last_print_t += save_dt
+                print(f"  (checkpoint I/O took {save_dt:.1f}s)", flush=True)
+                # Don't fold save into the next batch's step timer.
+                cycle_start = time.perf_counter()
                 pbar.refresh()
-            wait_start = time.time()
 
         print(f"🔍 DEBUG: Epoch {epoch+1} completed. Processed {batch_count}/{total_batches} batches")
+        if timed_batches > 0:
+            print(
+                f"  Timing avg: wait={total_wait_time/timed_batches*1000:.0f}ms  "
+                f"comp={total_compute_time/timed_batches*1000:.0f}ms  "
+                f"step={total_cycle_time/timed_batches*1000:.0f}ms  "
+                f"save={total_save_time/timed_batches*1000:.0f}ms/batch  "
+                f"eff={(total_cycle_time+total_save_time)/timed_batches*1000:.0f}ms  "
+                f"(total save I/O {total_save_time:.1f}s)"
+            )
         
         pbar.close()
 
