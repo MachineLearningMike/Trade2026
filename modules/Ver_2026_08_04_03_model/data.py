@@ -483,6 +483,18 @@ def find_power_regime(
 # VISUALIZATION FUNCTION
 # ═══════════════════════════════════════════════════════════
 
+def _trend_to_price_space(h_s_b, price_mean: float, price_std: float):
+    """Map (horizon, slope, intercept) from price-normalized space to price space."""
+    horizon = max(0, int(round(float(h_s_b[0].item() if hasattr(h_s_b[0], 'item') else h_s_b[0]))))
+    slope_norm = float(h_s_b[1].item() if hasattr(h_s_b[1], 'item') else h_s_b[1])
+    intercept_norm = float(h_s_b[2].item() if hasattr(h_s_b[2], 'item') else h_s_b[2])
+    if price_std == 0:
+        price_std = 1.0
+    slope = slope_norm * price_std
+    intercept = intercept_norm * price_std + price_mean
+    return horizon, slope, intercept
+
+
 def visualize_linear_trends(
     total_tensor: torch.Tensor,
     valid_starts: List[int],
@@ -496,31 +508,59 @@ def visualize_linear_trends(
     num_samples: int = 6,
     figsize: Tuple[int, int] = (15, 10),
     interactive: bool = True,
+    pred_tensor: Optional[torch.Tensor] = None,
+    fixed_order: bool = False,
+    sample_ids: Optional[List[int]] = None,
 ):
     """
-    Visualize linear trends for randomly selected samples.
+    Visualize linear trends over future prices.
 
-    When interactive=True (default), shows Next / Quit buttons so you can
-    page through unlimited random batches without reloading data.
+    Plots for each panel:
+      - actual future prices
+      - label linear trend (from label_tensor)
+      - inferred linear trend (from pred_tensor), if provided
+
+    label_tensor / pred_tensor are in price-normalized (horizon, slope, intercept)
+    space — the same space as dataset.label_tensor / denormalize_y outputs.
+
+    When fixed_order=True, pages sequentially through the provided samples only
+    (no random re-sampling). Otherwise interactive Next draws random batches.
+
+    sample_ids: optional dataset indices for titles (aligned with label_tensor rows).
     Keyboard: N / Right / Space = Next, Q / Escape = Quit.
     """
     if total_tensor.is_cuda:
         total_tensor = total_tensor.cpu()
+    if pred_tensor is not None and pred_tensor.is_cuda:
+        pred_tensor = pred_tensor.cpu()
+    if label_tensor.is_cuda:
+        label_tensor = label_tensor.cpu()
+    if mean_tensor.is_cuda:
+        mean_tensor = mean_tensor.cpu()
+    if std_tensor.is_cuda:
+        std_tensor = std_tensor.cpu()
 
     num_available = int(label_tensor.shape[0])
     if num_available == 0:
         print("⚠ No samples available for trend visualization.")
         return
 
+    if pred_tensor is not None and pred_tensor.shape[0] != num_available:
+        raise ValueError(
+            f"pred_tensor length ({pred_tensor.shape[0]}) must match "
+            f"label_tensor length ({num_available})"
+        )
+
     num_samples = min(num_samples, num_available)
     if num_samples < 1:
         num_samples = 1
-    # Prefer a full 2x3 grid when possible
-    if num_samples % 2 != 0 and num_samples >= 6:
+    # Prefer a full 2x3 grid when possible (only for random browsing)
+    if not fixed_order and num_samples % 2 != 0 and num_samples >= 6:
         num_samples = 6
 
     n_cols = 3 if num_samples > 1 else 1
     n_rows = max(1, (num_samples + n_cols - 1) // n_cols)
+    n_pages = max(1, (num_available + num_samples - 1) // num_samples) if fixed_order else None
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
     axes = np.atleast_1d(axes).ravel()
@@ -531,16 +571,26 @@ def visualize_linear_trends(
     else:
         fig.subplots_adjust(left=0.07, right=0.98, top=0.90, bottom=0.08, hspace=0.45, wspace=0.25)
 
-    page_num = [0]
+    page_num = [0]  # 1-based after first draw
     # Keep button refs alive (matplotlib GC otherwise disconnects them)
     _widgets: List[Any] = []
 
+    def _page_indices(page: int) -> List[int]:
+        """0-based row indices into label/pred tensors for this page."""
+        k = min(num_samples, num_available)
+        if fixed_order:
+            start_i = (page - 1) * num_samples
+            if start_i >= num_available:
+                start_i = 0
+            return list(range(start_i, min(start_i + num_samples, num_available)))
+        rng = random.Random(int(time.time() * 1000) + page)
+        return rng.sample(range(num_available), k)
+
     def _draw_page():
         page_num[0] += 1
-        # Fresh RNG per page so consecutive Next draws differ
-        rng = random.Random(int(time.time() * 1000) + page_num[0])
-        k = min(num_samples, num_available)
-        indices = rng.sample(range(num_available), k)
+        if fixed_order and n_pages is not None and page_num[0] > n_pages:
+            page_num[0] = 1  # wrap
+        indices = _page_indices(page_num[0])
 
         for ax in axes:
             ax.clear()
@@ -551,21 +601,15 @@ def visualize_linear_trends(
                 break
             ax = axes[i]
             start = valid_starts[idx]
-            label = label_tensor[idx]
             mean = mean_tensor[idx].flatten()
             std = std_tensor[idx].flatten()
-
-            horizon = int(label[0].item())
-            slope_norm = float(label[1].item())
-            intercept_norm = float(label[2].item())
 
             price_mean = float(mean[price_feature_idx].item())
             price_std = float(std[price_feature_idx].item())
             if price_std == 0:
                 price_std = 1.0
 
-            slope_original = slope_norm * price_std
-            intercept_original = intercept_norm * price_std + price_mean
+            h_lbl, m_lbl, b_lbl = _trend_to_price_space(label_tensor[idx], price_mean, price_std)
 
             y_start = start + past_window
             y_end = y_start + future_window
@@ -573,40 +617,66 @@ def visualize_linear_trends(
             future_prices = total_tensor[y_start:y_end, price_feature_idx].cpu().numpy()
 
             time_steps = np.arange(len(future_prices))
-            ax.plot(time_steps, future_prices, 'b-', linewidth=2, label='Actual Prices', alpha=0.7)
+            ax.plot(time_steps, future_prices, 'b-', linewidth=2, label='Actual prices', alpha=0.75)
 
-            if horizon > 0:
-                trend_t = np.arange(horizon)
-                trend_prices = slope_original * trend_t + intercept_original
+            # Label trend
+            if h_lbl > 0:
+                t_lbl = np.arange(h_lbl)
                 ax.plot(
-                    trend_t, trend_prices, 'r-', linewidth=2.5,
-                    label=f'Trend: y={slope_original:.4f}t+{intercept_original:.2f}',
+                    t_lbl, m_lbl * t_lbl + b_lbl, 'r-', linewidth=2.5,
+                    label=f'Label: H={h_lbl}, m={m_lbl:.4f}, b={b_lbl:.2f}',
                 )
-                ax.axvline(x=horizon - 1, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
-                ax.axvline(x=0, color='green', linestyle=':', linewidth=1.5, alpha=0.5)
-                ax.axvspan(0, max(horizon - 1, 0), alpha=0.15, color='orange')
+                ax.axvline(x=h_lbl - 1, color='red', linestyle='--', linewidth=1.3, alpha=0.65)
 
+            # Inferred trend
+            if pred_tensor is not None:
+                h_prd, m_prd, b_prd = _trend_to_price_space(pred_tensor[idx], price_mean, price_std)
+                if h_prd > 0:
+                    t_prd = np.arange(h_prd)
+                    ax.plot(
+                        t_prd, m_prd * t_prd + b_prd, 'g-', linewidth=2.5,
+                        label=f'Inferred: H={h_prd}, m={m_prd:.4f}, b={b_prd:.2f}',
+                    )
+                    ax.axvline(x=h_prd - 1, color='green', linestyle='--', linewidth=1.3, alpha=0.65)
+                title_extra = f' | pred H={h_prd}'
+            else:
+                title_extra = ''
+
+            ax.axvline(x=0, color='gray', linestyle=':', linewidth=1.2, alpha=0.5)
+            if h_lbl > 0:
+                ax.axvspan(0, max(h_lbl - 1, 0), alpha=0.10, color='orange')
+
+            display_id = sample_ids[idx] if sample_ids is not None else idx
             ax.set_title(
-                f'Sample {idx}: H={horizon}, m={slope_original:.4f}, b={intercept_original:.2f}',
-                fontsize=10,
+                f'Sample {display_id}: label H={h_lbl}, m={m_lbl:.4f}, b={b_lbl:.2f}{title_extra}',
+                fontsize=9,
             )
             ax.set_xlabel('Time (minutes)')
             ax.set_ylabel('Price')
             ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=8, loc='best')
+            ax.legend(fontsize=7, loc='best')
 
         for i in range(len(indices), len(axes)):
             axes[i].clear()
             axes[i].set_visible(False)
 
+        page_label = f'Page {page_num[0]}'
+        if fixed_order and n_pages is not None:
+            page_label = f'Page {page_num[0]}/{n_pages}'
+        has_pred = '  |  red=label  green=inferred' if pred_tensor is not None else ''
+        order_note = '  |  chosen samples only' if fixed_order else ''
         fig.suptitle(
-            f'Linear Trend Visualization — Mode: {mode.upper()}  |  Page {page_num[0]}'
+            f'Linear Trend Visualization — Mode: {mode.upper()}  |  {page_label}'
+            f'{has_pred}{order_note}'
             + ('  |  [Next] / [Quit]' if interactive else ''),
-            fontsize=13,
+            fontsize=12,
             fontweight='bold',
         )
         fig.canvas.draw_idle()
-        print(f"  Page {page_num[0]}: samples {indices}")
+        shown_ids = (
+            [sample_ids[i] for i in indices] if sample_ids is not None else list(indices)
+        )
+        print(f"  {page_label}: samples {shown_ids}")
 
     if interactive:
         ax_next = fig.add_axes([0.55, 0.02, 0.18, 0.055])
@@ -633,7 +703,13 @@ def visualize_linear_trends(
                 plt.close(fig)
 
         fig.canvas.mpl_connect('key_press_event', _on_key)
-        print("Trend browser: [Next] or N/Space = next page · [Quit] or Q = exit")
+        if fixed_order:
+            print(
+                f"Trend browser ({num_available} chosen samples): "
+                f"[Next] or N/Space = next page · [Quit] or Q = exit"
+            )
+        else:
+            print("Trend browser: [Next] or N/Space = next page · [Quit] or Q = exit")
 
     _draw_page()
     plt.show(block=True)

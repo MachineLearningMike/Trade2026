@@ -5,12 +5,14 @@
 # With ~430k samples, past_window=10080, F≈56, the test split alone is ~90+ GB
 # if stacked. Always stream samples in small batches.
 
-import torch
-import torch.nn as nn
-import numpy as np
 import json
+import random
 from pathlib import Path
 from typing import Optional, Tuple, List
+
+import numpy as np
+import torch
+import torch.nn as nn
 
 from config import get_config
 from model import MarketTransformerWithHeads
@@ -148,6 +150,8 @@ def run_inference_on_test_set(
     device: str = 'cuda',
     batch_size: int = 8,
     max_samples: Optional[int] = None,
+    shuffle: bool = True,
+    seed: int = 42,
 ):
     """
     Stream the test split in batches. Never stacks the full test windows.
@@ -166,9 +170,15 @@ def run_inference_on_test_set(
     model.eval()
 
     test_indices = list(dataset.test_indices)
+    if shuffle:
+        rng = random.Random(seed)
+        rng.shuffle(test_indices)
+
     if max_samples is not None and max_samples < len(test_indices):
         test_indices = test_indices[:max_samples]
-        print(f"  (capped to first {max_samples} test samples)", flush=True)
+        print(f"  (using {max_samples} shuffled test samples)", flush=True)
+    else:
+        print(f"  (using all {len(test_indices)} shuffled test samples)", flush=True)
 
     n = len(test_indices)
     if n == 0:
@@ -226,15 +236,35 @@ def run_inference_on_test_set(
 
 
 # ═══════════════════════════════════════════════════════════
-# MAIN
+# FULL TEST PIPELINE (shared by INFER.py and TRAIN.py --test)
 # ═══════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
-    config = get_config()
+def run_test(
+    config: dict,
+    max_samples: Optional[int] = None,
+    visualize: bool = True,
+):
+    """
+    Load the dataset + checkpoint matching `config`, run batched test-set
+    inference, print metrics, and optionally visualize a few true trends.
+
+    Args:
+        config: Full training/inference config (same as TRAIN).
+        max_samples: If set, evaluate this many shuffled test samples;
+                     otherwise evaluate the full shuffled test split.
+        visualize: If True, plot a few labeled future trends after metrics.
+
+    Batch size always comes from config['test_batch_size']
+    (falls back to validate_batch_size, then batch_size).
+
+    Returns:
+        dict with preds, labels, used_indices, metrics, checkpoint_path, checkpoint_key
+    """
     device = config['device']
-    batch_size = config.get('batch_size', 8)
-    # Optional cap for quick smoke tests (None = full test split)
-    max_test_samples = config.get('infer_max_samples', None)
+    batch_size = config.get(
+        'test_batch_size',
+        config.get('validate_batch_size', config.get('batch_size', 8)),
+    )
 
     print("\nLoading dataset (same path as TRAIN)...", flush=True)
     dataset, total_features = get_dataset(config)
@@ -242,11 +272,15 @@ if __name__ == "__main__":
     checkpoint_key = generate_checkpoint_key(config, dataset.cache_key)
     print(f"🔑 Generated Checkpoint Key: {checkpoint_key}", flush=True)
 
-    result = find_checkpoint_by_key(config.get('checkpoint_dir', 'trading_checkpoints'), checkpoint_key)
+    result = find_checkpoint_by_key(
+        config.get('checkpoint_dir', 'trading_checkpoints'), checkpoint_key
+    )
     if result is None:
         print(f"⚠ No checkpoint found for key: {checkpoint_key}")
         print("  Looking for latest checkpoint instead...")
-        result = find_checkpoint_by_key(config.get('checkpoint_dir', 'trading_checkpoints'), None)
+        result = find_checkpoint_by_key(
+            config.get('checkpoint_dir', 'trading_checkpoints'), None
+        )
         if result is None:
             print("No checkpoint found. Exiting.")
             raise SystemExit(1)
@@ -255,6 +289,11 @@ if __name__ == "__main__":
 
     print(f"\nLoading model from: {checkpoint_path}", flush=True)
     print(f"Checkpoint Key: {checkpoint_key}", flush=True)
+    print(f"Test batch size: {batch_size}", flush=True)
+    if max_samples is not None:
+        print(f"Test sample cap: {max_samples}", flush=True)
+    else:
+        print("Test sample cap: all", flush=True)
 
     model = load_model(checkpoint_path, config, dataset, device)
     print("✓ Model loaded successfully", flush=True)
@@ -265,7 +304,8 @@ if __name__ == "__main__":
         dataset,
         device=device,
         batch_size=batch_size,
-        max_samples=max_test_samples,
+        max_samples=max_samples,
+        shuffle=True,
     )
     print(f"✓ Finished inference on {len(preds)} test samples", flush=True)
 
@@ -288,26 +328,46 @@ if __name__ == "__main__":
             f"{test_labels[i, 2].item():<14.2f} {preds[i, 2].item():<14.2f}"
         )
 
-    # Visualization only needs a handful of raw (unnormalized) labels + window stats
-    print("\n📈 Visualizing true linear trends...", flush=True)
-    viz_n = min(6, len(used_indices))
-    viz_indices = used_indices[:viz_n]
-    valid_starts = [dataset.valid_starts[i] for i in viz_indices]
-    raw_means = torch.stack([dataset.mean_tensor[i] for i in viz_indices])
-    raw_stds = torch.stack([dataset.std_tensor[i] for i in viz_indices])
-    raw_labels = torch.stack([dataset.label_tensor[i] for i in viz_indices])
+    if visualize:
+        # Plot only the chosen test samples: actual prices + label trend + inferred trend.
+        # preds / test_labels are already denormalized to label_tensor (price-norm) space.
+        print("\n📈 Visualizing label vs inferred trends on chosen test samples...", flush=True)
+        n_viz = len(used_indices)
+        valid_starts = [dataset.valid_starts[i] for i in used_indices]
+        raw_means = torch.stack([dataset.mean_tensor[i] for i in used_indices])
+        raw_stds = torch.stack([dataset.std_tensor[i] for i in used_indices])
 
-    visualize_linear_trends(
-        total_tensor=dataset.Total,
-        valid_starts=valid_starts,
-        label_tensor=raw_labels,
-        mean_tensor=raw_means,
-        std_tensor=raw_stds,
-        price_feature_idx=dataset.price_feature_idx,
-        past_window=dataset.past_window,
-        future_window=dataset.future_window,
-        mode=config.get('horizon_mode', 'anchored'),
-        num_samples=viz_n,
-    )
+        visualize_linear_trends(
+            total_tensor=dataset.Total,
+            valid_starts=valid_starts,
+            label_tensor=test_labels.detach().cpu(),
+            mean_tensor=raw_means,
+            std_tensor=raw_stds,
+            price_feature_idx=dataset.price_feature_idx,
+            past_window=dataset.past_window,
+            future_window=dataset.future_window,
+            mode=config.get('horizon_mode', 'anchored'),
+            num_samples=min(6, n_viz),
+            pred_tensor=preds.detach().cpu(),
+            fixed_order=True,
+            sample_ids=list(used_indices),
+        )
 
     print(f"\n✓ Inference complete!", flush=True)
+
+    return {
+        'preds': preds,
+        'labels': test_labels,
+        'used_indices': used_indices,
+        'metrics': {
+            'horizon_mse': horizon_mse,
+            'slope_mse': slope_mse,
+            'intercept_mse': intercept_mse,
+        },
+        'checkpoint_path': checkpoint_path,
+        'checkpoint_key': checkpoint_key,
+    }
+
+
+if __name__ == "__main__":
+    run_test(get_config())

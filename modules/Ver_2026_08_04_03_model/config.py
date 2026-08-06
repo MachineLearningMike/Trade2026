@@ -30,6 +30,11 @@ config = {
     'validate': True,
     'validate_every_n_epochs': 1,
     'validate_batch_size': 16,
+
+    # ============================================================
+    # TEST / INFERENCE CONFIGURATION
+    # ============================================================
+    'test_batch_size': 16,
     
     # ============================================================
     # HORIZON LABELING CONFIGURATION

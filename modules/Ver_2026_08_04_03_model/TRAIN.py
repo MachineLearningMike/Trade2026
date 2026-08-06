@@ -163,6 +163,14 @@ def main(config):
     )
     parser.add_argument('--features', action='store_true', default=False,
                        help='Visualize total_features without training')
+    parser.add_argument(
+        '--test', nargs='?', const=-1, default=None, type=int, metavar='N',
+        help=(
+            'Run test-set evaluation without training (same as INFER.py). '
+            '--test uses all shuffled test samples; --test N uses N shuffled '
+            'test samples. Batch size is config test_batch_size.'
+        ),
+    )
     parser.add_argument('--past-days', type=int, default=config['past_days'], help='Past days for input')
     parser.add_argument('--future-minutes', type=int, default=config['future_minutes'],
                        help='Future minutes for prediction')
@@ -568,7 +576,32 @@ def main(config):
         print("\n✅ Features visualization completed!")
         return
 
-    
+    # ============================================================
+    # STEP 3b: Handle --test / --test N (test-set eval like INFER.py)
+    # ============================================================
+    if args.test is not None:
+        # const=-1 means bare --test → all samples; --test N → N samples
+        max_samples = None if args.test < 0 else args.test
+        test_bs = config.get(
+            'test_batch_size',
+            config.get('validate_batch_size', config.get('batch_size', 8)),
+        )
+
+        print("\n" + "=" * 60)
+        print("🧪 TEST / INFERENCE MODE")
+        print("=" * 60)
+        print("Loads dataset + checkpoint, streams shuffled test samples.")
+        print(f"  Samples: {'all' if max_samples is None else max_samples}")
+        print(f"  Batch size (config test_batch_size): {test_bs}")
+        print("=" * 60 + "\n")
+
+        # Lazy import: INFER imports get_dataset from this module.
+        from INFER import run_test
+
+        run_test(config, max_samples=max_samples, visualize=True)
+        print("\n✅ Test evaluation completed!")
+        return
+
     # ============================================================
     # STEP 4: Get data (Binance or Synthetic)
     # ============================================================
