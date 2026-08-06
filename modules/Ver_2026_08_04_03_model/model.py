@@ -70,6 +70,160 @@ class Depatch(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════
+# MODEL INSPECTION UTILITIES
+# ═══════════════════════════════════════════════════════════
+
+def report_model_size(model: nn.Module, name: str = "Model") -> dict:
+    """
+    Compute and display model size (parameter counts + memory footprint).
+
+    Returns a dict with total/trainable/frozen counts and byte sizes.
+    """
+    total_params = 0
+    trainable_params = 0
+    frozen_params = 0
+    param_bytes = 0
+    trainable_bytes = 0
+
+    for p in model.parameters():
+        n = p.numel()
+        b = n * p.element_size()
+        total_params += n
+        param_bytes += b
+        if p.requires_grad:
+            trainable_params += n
+            trainable_bytes += b
+        else:
+            frozen_params += n
+
+    buffer_bytes = sum(b.numel() * b.element_size() for b in model.buffers())
+    total_bytes = param_bytes + buffer_bytes
+
+    def _fmt_bytes(n: int) -> str:
+        for unit in ("B", "KB", "MB", "GB"):
+            if n < 1024.0:
+                return f"{n:.2f} {unit}"
+            n /= 1024.0
+        return f"{n:.2f} TB"
+
+    info = {
+        "total_params": total_params,
+        "trainable_params": trainable_params,
+        "frozen_params": frozen_params,
+        "param_bytes": param_bytes,
+        "trainable_bytes": trainable_bytes,
+        "buffer_bytes": buffer_bytes,
+        "total_bytes": total_bytes,
+    }
+
+    print(f"\n{name} size:")
+    print(f"  Parameters total:     {total_params:,}")
+    print(f"  Parameters trainable: {trainable_params:,}")
+    print(f"  Parameters frozen:    {frozen_params:,}")
+    print(f"  Param memory:         {_fmt_bytes(param_bytes)}")
+    print(f"  Buffer memory:        {_fmt_bytes(buffer_bytes)}")
+    print(f"  Total footprint:      {_fmt_bytes(total_bytes)}")
+    return info
+
+
+def check_all_weights_updated(
+    model: nn.Module,
+    sample_batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    loss_fn=None,
+    name: str = "Model",
+) -> bool:
+    """
+    Run one forward + backward and verify every trainable parameter gets a gradient.
+
+    Args:
+        model:        module under test
+        sample_batch: (x, mean, std, shape) matching model.forward
+        loss_fn:      optional callable(P, X, Y) -> scalar; if None, uses
+                      predictions.sum() (+ recon.sum() if present)
+        name:         label for log lines
+
+    Returns:
+        True if all trainable weights received a non-None gradient.
+    """
+    was_training = model.training
+    model.train()
+
+    # Snapshot so this diagnostic does not permanently alter weights
+    snapped = {n: p.detach().clone() for n, p in model.named_parameters()}
+
+    model.zero_grad(set_to_none=True)
+    x, mean, std, shape = sample_batch
+    device = next(model.parameters()).device
+    x = x.to(device)
+    mean = mean.to(device)
+    std = std.to(device)
+    shape = shape.to(device)
+
+    P = model(x, mean, std, shape)
+    predictions, patch_map, recon = P
+
+    if loss_fn is not None:
+        # Dummy targets for a real loss path (horizon, slope, intercept)
+        Y = torch.zeros(predictions.shape[0], predictions.shape[1], device=device)
+        loss = loss_fn(P, x, Y)
+    else:
+        loss = predictions.sum()
+        if recon is not None:
+            loss = loss + recon.sum()
+
+    loss.backward()
+
+    missing = []
+    zero_grad = []
+    updated = 0
+    trainable = 0
+
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        trainable += 1
+        if p.grad is None:
+            missing.append(n)
+        elif torch.count_nonzero(p.grad).item() == 0:
+            zero_grad.append(n)
+        else:
+            updated += 1
+
+    # Restore original weights (grads are left for inspection if needed)
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            p.copy_(snapped[n])
+    model.zero_grad(set_to_none=True)
+
+    if not was_training:
+        model.eval()
+
+    print(f"\n{name} weight-update check (one backward pass):")
+    print(f"  Trainable tensors: {trainable}")
+    print(f"  Received grad:     {updated}")
+    print(f"  Missing grad:      {len(missing)}")
+    print(f"  All-zero grad:     {len(zero_grad)}")
+
+    if missing:
+        print("  ⚠ Parameters with NO gradient (not on the loss path):")
+        for n in missing:
+            print(f"      - {n}")
+    if zero_grad:
+        print("  ⚠ Parameters with all-zero gradient:")
+        for n in zero_grad:
+            print(f"      - {n}")
+
+    ok = len(missing) == 0
+    if ok and len(zero_grad) == 0:
+        print("  ✓ All trainable weights received a non-zero gradient.")
+    elif ok:
+        print("  ~ All trainable weights received a gradient (some were zero this step).")
+    else:
+        print("  ✗ Some trainable weights were NOT updated (missing gradient).")
+    return ok
+
+
+# ═══════════════════════════════════════════════════════════
 # PREDICTION HEADS
 # ═══════════════════════════════════════════════════════════
 
@@ -119,6 +273,7 @@ class MarketTransformerWithHeads(nn.Module):
         head_hidden_dim_multiplier: int = 4,
         output_dim: int = 3,
         use_reconstruction: bool = True,
+        num_shapes: int = 4,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -129,19 +284,23 @@ class MarketTransformerWithHeads(nn.Module):
         self.causal = causal
         self.max_seq_len = max_seq_len
         self.use_reconstruction = use_reconstruction
+        self.num_shapes = num_shapes
+        # x_stat tokens: mean (1) + std (1) + shape moments (num_shapes)
+        self.n_stat_tokens = 1 + 1 + num_shapes
 
         F = n_market_features + n_macro_features
         L = n_latent_macro_features
+        self.F = F
 
         # ---- compress raw macro time series ----
         self.latent_macro_transform_x = nn.Linear(n_macro_features, L)
 
-        # ---- project window stats into latent space ----
+        # ---- project window stats into latent space (used by forward / _encode_stats) ----
         # mean/std: (B, F) → (B, L)
         # shape:    (B, num_shapes, F) → (B, num_shapes, L), then pooled
-        self.latent_macro_transform_mean = nn.Linear(F, L)
-        self.latent_macro_transform_std = nn.Linear(F, L)
-        self.latent_macro_transform_shape = nn.Linear(F, L)
+        # self.latent_macro_transform_mean = nn.Linear(F, L)
+        # self.latent_macro_transform_std = nn.Linear(F, L)
+        # self.latent_macro_transform_shape = nn.Linear(F, L)
 
         # ---- Encoder ----
         n_features_after_latent_macro = n_market_features + L
@@ -150,13 +309,13 @@ class MarketTransformerWithHeads(nn.Module):
         self.patch_embed = PatchEmbed(n_features_after_latent_macro, patch_size, embed_dim)
 
         # Fuse mean+std+shape latents → embed_dim, then residual-add to all patches
-        self.stats_to_embed = nn.Sequential(
-            nn.Linear(3 * L, embed_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim, embed_dim),
-        )
-        self.stats_norm = nn.LayerNorm(embed_dim)
+        # self.stats_to_embed = nn.Sequential(
+        #     nn.Linear(3 * L, embed_dim),
+        #     nn.GELU(),
+        #     nn.Dropout(dropout),
+        #     nn.Linear(embed_dim, embed_dim),
+        # )
+        # self.stats_norm = nn.LayerNorm(embed_dim)
 
         self.register_buffer(
             'pos_embed',
@@ -178,9 +337,35 @@ class MarketTransformerWithHeads(nn.Module):
         )
         self.norm = nn.LayerNorm(embed_dim)
 
+        # ---- Encoder–decoder: x patches as memory, x_stat tokens as tgt ----
+        # memory = encoder(x)  → Key & Value for decoder cross-attn
+        # tgt    = x_stat      → decoder self-attn; Query for cross-attn
+        # After decode: flatten (B, N_stat, D) → FFN → (B, 3)
+        self.stat_token_proj = nn.Linear(F, embed_dim)
+        self.stat_pos_embed = nn.Parameter(
+            torch.zeros(1, self.n_stat_tokens, embed_dim)
+        )
+        nn.init.normal_(self.stat_pos_embed, std=0.02)
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+        )
+        self.transformer_decoder = nn.TransformerDecoder(
+            decoder_layer,
+            num_layers=num_layers,
+        )
+        self.decoder_norm = nn.LayerNorm(embed_dim)
+
         # ---- Prediction Head ----
+        # Flatten decoder tokens (B, N_stat, D) → (B, N_stat * D) then FFN → (B, 3)
+        pred_in_dim = self.n_stat_tokens * embed_dim
         self.prediction_head = PredictionHead(
-            embed_dim=embed_dim,
+            embed_dim=pred_in_dim,
             hidden_dim=head_hidden_dim_multiplier * embed_dim,
             output_dim=output_dim,
             dropout=dropout
@@ -225,25 +410,120 @@ class MarketTransformerWithHeads(nn.Module):
         stats = torch.cat([mean_lat, std_lat, shape_lat], dim=-1)  # (B, 3L)
         return self.stats_norm(self.stats_to_embed(stats))         # (B, D)
 
-    def forward(self, x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor, shape: torch.Tensor):
+    # def forward(self, x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor, shape: torch.Tensor):
+    #     """
+    #     Args:
+    #         x:     (B, T, F) — window features. T must be divisible by patch_size.
+    #                 x = normalize(feature_window, stat(feature_window))
+    #         mean:  (B, F).  mean = normalize(mean_feature_window, stat({mean_feature_window | feature}) )
+    #         std:   (B, F).  std = normalize(std_feature_window, stat({std_feature_window | feature}) )
+    #                 NOTE: Do NOT multiply x with std or mean, as some of them are zero (nearly, at least)
+    #         shape: (B, num_shapes, F)
+    #     """
+    #     # ---- 0. Compress macro channels over time ----
+    #     x_market = x[:, : :self.n_market_features]
+    #     x_macro = x[:, :, self.n_market_features:]                 # (B, T, n_macro)
+    #     x_macro = self.latent_macro_transform_x(x_macro)           # (B, T, L)
+    #     x = torch.cat(
+    #         [x[:, :, :self.n_market_features], x_macro], dim=-1
+    #     )                                                          # (B, T, n_market + L)
+
+    #     # ---- 0b. Encode window stats for global conditioning ----
+    #     stats_embed = self._encode_stats(mean, std, shape)         # (B, D)
+
+    #     B, T, _ = x.shape
+    #     device = x.device
+    #     P = self.patch_size
+
+    #     assert T % P == 0, f"T ({T}) must be divisible by patch_size ({P})"
+    #     N = T // P
+
+    #     if N > self.max_seq_len:
+    #         raise ValueError(f"N ({N}) exceeds max_seq_len ({self.max_seq_len})")
+
+    #     # ---- 1. Patch Embedding ----
+    #     x = self.patch_embed(x)                                    # (B, N, D)
+
+    #     # ---- 2. Positional encoding + stats conditioning ----
+    #     x = x + self.pos_embed[:, :N, :]
+    #     x = x + stats_embed.unsqueeze(1)                           # broadcast to all patches
+
+    #     # ---- 3. Transformer ----
+    #     if self.causal:
+    #         if self.causal_mask is None or self.causal_mask.shape[0] != N:
+    #             self.causal_mask = self._create_causal_mask(N).to(device)
+    #         attn_mask = self.causal_mask
+    #     else:
+    #         attn_mask = None
+
+    #     x = self.transformer(x, mask=attn_mask)                    # (B, N, D)
+    #     patch_map = self.norm(x)                                   # (B, N, D)
+
+    #     # ---- 4. Aggregate for prediction (last patch; causal-friendly) ----
+    #     aggregated = patch_map[:, -1, :]                           # (B, D)
+
+    #     # ---- 5. Prediction Head ----
+    #     predictions = self.prediction_head(aggregated)             # (B, 3)
+
+    #     # ---- 6. Reconstruction (sequence only; no stats fusion) ----
+    #     if self.use_reconstruction:
+    #         recon = self.depatch(patch_map)                        # (B, T, F_in)
+    #     else:
+    #         recon = None
+
+    #     return predictions, patch_map, recon
+
+    # ───────────────────────────────────────────────────────
+    # forward2 helpers
+    # ───────────────────────────────────────────────────────
+
+    def _build_x_stat(
+        self,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        shape: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Args:
-            x:     (B, T, F) — window features. T must be divisible by patch_size.
-                    x = normalize(feature_window, stat(feature_window))
-            mean:  (B, F).  mean = normalize(mean_feature_window, stat({mean_feature_window | feature}) )
-            std:   (B, F).  std = normalize(std_feature_window, stat({std_feature_window | feature}) )
-                    NOTE: Do NOT multiply x with std or mean, as some of them are zero (nearly, at least)
-            shape: (B, num_shapes, F)
+        Stack window statistics into a short token sequence.
+
+        mean:  (B, F)            → token 0
+        std:   (B, F)            → token 1
+        shape: (B, num_shapes, F) → tokens 2 .. 1+num_shapes
+
+        Returns:
+            x_stat: (B, N_stat, F) with N_stat = 1 + 1 + num_shapes
         """
-        # ---- 0. Compress macro channels over time ----
+        if mean.dim() != 2 or std.dim() != 2:
+            raise ValueError(f"mean/std must be (B, F); got {tuple(mean.shape)}, {tuple(std.shape)}")
+        if shape.dim() != 3:
+            raise ValueError(f"shape must be (B, num_shapes, F); got {tuple(shape.shape)}")
+
+        mean_tok = mean.unsqueeze(1)   # (B, 1, F)
+        std_tok = std.unsqueeze(1)     # (B, 1, F)
+        # shape already (B, S, F)
+        x_stat = torch.cat([mean_tok, std_tok, shape], dim=1)  # (B, 2+S, F)
+
+        expected = self.n_stat_tokens
+        if x_stat.shape[1] != expected:
+            raise ValueError(
+                f"x_stat length {x_stat.shape[1]} != expected {expected} "
+                f"(1 mean + 1 std + {self.num_shapes} shapes)"
+            )
+        return x_stat
+
+    def _encode_x_patches(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        """
+        Macro-compress + patch-embed + pos-encode + transformer encoder.
+
+        Returns:
+            patch_map: (B, N, D) encoder output
+            N: number of patches
+        """
         x_macro = x[:, :, self.n_market_features:]                 # (B, T, n_macro)
         x_macro = self.latent_macro_transform_x(x_macro)           # (B, T, L)
         x = torch.cat(
             [x[:, :, :self.n_market_features], x_macro], dim=-1
         )                                                          # (B, T, n_market + L)
-
-        # ---- 0b. Encode window stats for global conditioning ----
-        stats_embed = self._encode_stats(mean, std, shape)         # (B, D)
 
         B, T, _ = x.shape
         device = x.device
@@ -251,18 +531,12 @@ class MarketTransformerWithHeads(nn.Module):
 
         assert T % P == 0, f"T ({T}) must be divisible by patch_size ({P})"
         N = T // P
-
         if N > self.max_seq_len:
             raise ValueError(f"N ({N}) exceeds max_seq_len ({self.max_seq_len})")
 
-        # ---- 1. Patch Embedding ----
         x = self.patch_embed(x)                                    # (B, N, D)
-
-        # ---- 2. Positional encoding + stats conditioning ----
         x = x + self.pos_embed[:, :N, :]
-        x = x + stats_embed.unsqueeze(1)                           # broadcast to all patches
 
-        # ---- 3. Transformer ----
         if self.causal:
             if self.causal_mask is None or self.causal_mask.shape[0] != N:
                 self.causal_mask = self._create_causal_mask(N).to(device)
@@ -272,16 +546,63 @@ class MarketTransformerWithHeads(nn.Module):
 
         x = self.transformer(x, mask=attn_mask)                    # (B, N, D)
         patch_map = self.norm(x)                                   # (B, N, D)
+        return patch_map, N
 
-        # ---- 4. Aggregate for prediction (last patch; causal-friendly) ----
-        aggregated = patch_map[:, -1, :]                           # (B, D)
+    def forward(
+        self,
+        x: torch.Tensor,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        shape: torch.Tensor,
+    ):
+        """
+        Encoder–decoder mix of the time series and window statistics.
 
-        # ---- 5. Prediction Head ----
-        predictions = self.prediction_head(aggregated)             # (B, 3)
+        1. Build x_stat (B, N_stat, F), N_stat = 1 + 1 + num_shapes:
+              [mean, std, shape_0, ..., shape_{S-1}]
+        2. Encoder on x (patches) → memory
+        3. Decoder on x_stat:
+              - project x_stat → (B, N_stat, D)
+              - TransformerDecoder(tgt=x_stat, memory=encoder(x))
+              - LayerNorm → (B, N_stat, D)
+        4. Flatten (B, N_stat, D) → (B, N_stat * D), FFN → (B, 3)
 
-        # ---- 6. Reconstruction (sequence only; no stats fusion) ----
+        Args:
+            x:     (B, T, F)
+            mean:  (B, F)
+            std:   (B, F)
+            shape: (B, num_shapes, F)
+
+        Returns:
+            predictions, patch_map, recon
+        """
+        # ---- 0. Statistics token sequence ----
+        x_stat = self._build_x_stat(mean, std, shape)              # (B, N_stat, F)
+
+        # ---- 1. Encode x ----
+        patch_map, N = self._encode_x_patches(x)                   # (B, N, D)
+
+        # ---- 2. Embed x_stat as decoder tokens ----
+        stat_tok = self.stat_token_proj(x_stat)                    # (B, N_stat, D)
+        n_stat = stat_tok.shape[1]
+        stat_tok = stat_tok + self.stat_pos_embed[:, :n_stat, :]
+
+        # Transformer decoder: tgt = stats, memory = encoder(x)
+        # Cross-attention inside: Query ← tgt (stats), Key/Value ← memory (x)
+        dec_out = self.transformer_decoder(
+            tgt=stat_tok,
+            memory=patch_map,
+        )                                                          # (B, N_stat, D)
+        dec_out = self.decoder_norm(dec_out)
+
+        # ---- 3. Flatten decoder tokens + FFN → (B, 3) ----
+        B = dec_out.shape[0]
+        flat = dec_out.reshape(B, n_stat * self.embed_dim)         # (B, N_stat * D)
+        predictions = self.prediction_head(flat)                   # (B, 3)
+
+        # ---- 4. Reconstruction from encoder map (optional) ----
         if self.use_reconstruction:
-            recon = self.depatch(patch_map)                        # (B, T, F_in)
+            recon = self.depatch(patch_map)
         else:
             recon = None
 
@@ -365,13 +686,11 @@ if __name__ == "__main__":
         head_hidden_dim_multiplier=config['head_hidden_dim_multiplier'],
         output_dim=config['output_dim'],
         use_reconstruction=config['use_reconstruction'],
+        num_shapes=num_shapes,
     ).to(device)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nModel parameters:")
-    print(f"  Total: {total_params:,}")
-    print(f"  Trainable: {trainable_params:,}")
+    # ---- Size + weight-update diagnostics at start ----
+    report_model_size(model, name="MarketTransformerWithHeads")
 
     B = 4
     T = (past_window // config['patch_size']) * config['patch_size']
@@ -380,12 +699,24 @@ if __name__ == "__main__":
     std = torch.randn(B, F, device=device).abs() + 1e-3
     shape = torch.randn(B, num_shapes, F, device=device)
 
-    print(f"\nTesting forward pass with input shape: {x.shape}")
-    predictions, patch_map, recon = model(x, mean, std, shape)
+    check_all_weights_updated(
+        model,
+        sample_batch=(x, mean, std, shape),
+        loss_fn=lambda P, X, Y: custom_loss(
+            P, X, Y, slope_weight=0.1, intercept_weight=0.01, recon_weight=0.01
+        ),
+        name="MarketTransformerWithHeads",
+    )
 
-    print(f"Predictions shape: {predictions.shape}")
-    print(f"Patch map shape: {patch_map.shape}")
+    print(f"\nTesting forward() with input shape: {x.shape}")
+    predictions, patch_map, recon = model(x, mean, std, shape)
+    print(f"  predictions: {tuple(predictions.shape)}")
+    print(f"  patch_map:   {tuple(patch_map.shape)}")
     if recon is not None:
-        print(f"Reconstruction shape: {recon.shape}")
+        print(f"  recon:       {tuple(recon.shape)}")
+
+    x_stat = model._build_x_stat(mean, std, shape)
+    print(f"  x_stat:      {tuple(x_stat.shape)}  (N_stat={model.n_stat_tokens})")
+    print(f"  pred_in_dim: {model.n_stat_tokens * model.embed_dim}  (N_stat * D)")
 
     print("\nModel module demo complete!")

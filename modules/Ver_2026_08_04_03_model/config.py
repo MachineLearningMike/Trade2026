@@ -103,7 +103,7 @@ config = {
     # ============================================================
     'epochs': 200,
     'batch_size': 8,
-    'learning_rate': 0.0005,
+    'learning_rate': 0.0001,
     'save_every_n_minibatches': 5000,
     'checkpoint_dir': 'trading_checkpoints',
     'max_checkpoints': 3,

@@ -22,7 +22,12 @@ from data import (
     get_binance_data,
     generate_dataset_signature,
 )
-from model import MarketTransformerWithHeads, custom_loss
+from model import (
+    MarketTransformerWithHeads,
+    custom_loss,
+    report_model_size,
+    check_all_weights_updated,
+)
 from trainer import ResumableTrainer, generate_checkpoint_key
 
 
@@ -145,6 +150,15 @@ def main(config):
             'Visualize training history without loading market data. '
             'Use --history (current config key), --history all, or '
             '--history <checkpoint_key> (e.g. 541f3423a2cec4a6).'
+        ),
+    )
+    parser.add_argument(
+        '--loss', nargs='?', const='current', default=None,
+        help=(
+            'Display per-minibatch loss of the latest training epoch '
+            '(no market data load). '
+            'Use --loss (current config key), --loss all, or '
+            '--loss <checkpoint_key>.'
         ),
     )
     parser.add_argument('--features', action='store_true', default=False,
@@ -401,6 +415,127 @@ def main(config):
         if _plot_history(subdir, state_info, label=" (fallback: latest with history)"):
             print("✅ Training history visualization completed!")
         return
+
+    # ============================================================
+    # STEP 2b: Handle --loss flag (latest-epoch minibatch curve)
+    # ============================================================
+    if args.loss is not None:
+        print("\n" + "=" * 60)
+        print("📉 LATEST EPOCH LOSS VISUALIZATION MODE")
+        print("=" * 60)
+
+        checkpoint_dir = Path(config['checkpoint_dir'])
+        if not checkpoint_dir.exists():
+            print(f"⚠ Checkpoint directory not found: {checkpoint_dir}")
+            print("No latest-epoch loss history available.")
+            return
+
+        from trainer import LatestEpochLoss, LATEST_EPOCH_LOSS_FILENAME
+
+        def _has_latest_loss(subdir: Path) -> bool:
+            if (subdir / LATEST_EPOCH_LOSS_FILENAME).exists():
+                return True
+            state_file = subdir / 'training_state.json'
+            if not state_file.exists():
+                return False
+            try:
+                with open(state_file, 'r') as f:
+                    state = json.load(f)
+                data = state.get('latest_epoch_loss') or {}
+                return bool(data.get('batch_losses'))
+            except Exception:
+                return False
+
+        def _list_loss_runs():
+            runs = []
+            for subdir in checkpoint_dir.iterdir():
+                if not subdir.is_dir():
+                    continue
+                if not _has_latest_loss(subdir):
+                    continue
+                # Prefer mtime of latest_epoch_loss.json, else state file
+                loss_file = subdir / LATEST_EPOCH_LOSS_FILENAME
+                state_file = subdir / 'training_state.json'
+                mtime_src = loss_file if loss_file.exists() else state_file
+                runs.append((subdir, mtime_src.stat().st_mtime))
+            runs.sort(key=lambda item: item[1], reverse=True)
+            return runs
+
+        def _plot_latest_loss(subdir: Path, label: str = "") -> bool:
+            le = LatestEpochLoss.load(subdir)
+            if le is None or not le.batch_losses:
+                print(f"⚠ No latest-epoch loss data in {subdir.name}")
+                return False
+            try:
+                print(f"📁 Checkpoint: {subdir.name}{label}")
+                le.print_summary()
+                plot_path = subdir / 'latest_epoch_loss_view.png'
+                le.plot(save_path=str(plot_path))
+                print(f"   Loss plot saved to: {plot_path}\n")
+                return True
+            except Exception as e:
+                print(f"⚠ Failed to plot latest-epoch loss from {subdir.name}: {e}")
+                return False
+
+        # Case 1: --loss all
+        if args.loss == 'all':
+            print("Showing ALL latest-epoch loss curves...\n")
+            found = False
+            for subdir, _ in _list_loss_runs():
+                if _plot_latest_loss(subdir):
+                    found = True
+            if not found:
+                print("⚠ No latest-epoch loss history found.")
+                print("   Train at least one epoch to generate it.")
+                available = [p.name for p in checkpoint_dir.iterdir() if p.is_dir()]
+                if available:
+                    print(f"   Available checkpoint keys: {', '.join(available)}")
+            else:
+                print("✅ All latest-epoch loss curves visualized!")
+            return
+
+        # Case 2: --loss <explicit_key>
+        if args.loss not in ('current', None):
+            explicit_key = args.loss
+            current_dir = checkpoint_dir / explicit_key
+            print(f"🔑 Requested checkpoint key: {explicit_key}")
+            if not current_dir.exists():
+                print(f"⚠ Checkpoint directory not found: {current_dir}")
+                available = [p.name for p in checkpoint_dir.iterdir() if p.is_dir()]
+                if available:
+                    print(f"   Available keys: {', '.join(available)}")
+                return
+            if _plot_latest_loss(current_dir):
+                print("✅ Latest-epoch loss visualization completed!")
+            return
+
+        # Case 3: --loss (current config key)
+        dataset_signature = generate_dataset_signature(config)
+        current_key = generate_checkpoint_key(config, dataset_signature)
+        current_dir = checkpoint_dir / current_key
+        print(f"🔑 Dataset signature: {dataset_signature}")
+        print(f"🔑 Checkpoint key:    {current_key}")
+
+        if current_dir.exists() and _plot_latest_loss(current_dir, label=" (exact config match)"):
+            print("✅ Latest-epoch loss visualization completed!")
+            return
+
+        print(f"⚠ No latest-epoch loss for current config key: {current_key}")
+        runs = _list_loss_runs()
+        available = [p.name for p in checkpoint_dir.iterdir() if p.is_dir()]
+        if available:
+            print(f"   Available checkpoint keys: {', '.join(available)}")
+        if not runs:
+            print("   No runs with latest-epoch loss found.")
+            print("   Train under the current key, or use: --loss <key> / --loss all")
+            return
+
+        subdir, _ = runs[0]
+        print(f"   Falling back to most recent run with loss data: {subdir.name}")
+        print(f"   Tip: pin a run with  --loss {subdir.name}")
+        if _plot_latest_loss(subdir, label=" (fallback: latest with loss data)"):
+            print("✅ Latest-epoch loss visualization completed!")
+        return
     
     # ============================================================
     # STEP 3: Handle --clean flag
@@ -487,20 +622,38 @@ def main(config):
         causal=config['causal'],
         head_hidden_dim_multiplier=config['head_hidden_dim_multiplier'],
         output_dim=config['output_dim'],
-        use_reconstruction=config['use_reconstruction']
+        use_reconstruction=config['use_reconstruction'],
+        num_shapes=config.get('num_shapes', 4),
     )
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nModel parameters:")
-    print(f"  Total: {total_params:,}")
-    print(f"  Trainable: {trainable_params:,}")
-    
+
+    # Size report + one-step gradient coverage check at start
+    report_model_size(model, name="MarketTransformerWithHeads")
+    _probe_T = (past_window // config['patch_size']) * config['patch_size']
+    _probe_B = 2
+    _probe_device = torch.device(config['device']) if config.get('device') else torch.device('cpu')
+    model = model.to(_probe_device)
+    check_all_weights_updated(
+        model,
+        sample_batch=(
+            torch.randn(_probe_B, _probe_T, F, device=_probe_device),
+            torch.randn(_probe_B, F, device=_probe_device),
+            torch.randn(_probe_B, F, device=_probe_device).abs() + 1e-3,
+            torch.randn(_probe_B, config.get('num_shapes', 4), F, device=_probe_device),
+        ),
+        loss_fn=lambda P, X, Y: custom_loss(
+            P, X, Y,
+            slope_weight=config['slope_loss_weight'],
+            intercept_weight=config['intercept_loss_weight'],
+            recon_weight=config['reconstruction_loss_weight'],
+        ),
+        name="MarketTransformerWithHeads",
+    )
+
     # Create dataloaders
     train_loader = ThreadedDataLoader(dataset.train_dataset, batch_size=config['batch_size'], shuffle=True)
     val_loader = ThreadedDataLoader(dataset.val_dataset, batch_size=config['validate_batch_size'], shuffle=False)
     test_loader = ThreadedDataLoader(dataset.test_dataset, batch_size=config['validate_batch_size'], shuffle=False)
-    
+
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     
     # Create trainer with validation

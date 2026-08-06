@@ -100,7 +100,7 @@ class TrainingState:
     def save_checkpoint(self, model, optimizer, dataloader_state, epoch, batch_idx, 
                         total_minibatches_processed, loss, is_emergency=False, training_finished=False,
                         val_loss=None, history=None, embed_dim=None, max_seq_len=None,
-                        total_epochs=None):
+                        total_epochs=None, latest_epoch_loss=None):
         """Save checkpoint with atomic write to prevent corruption."""
         # Preserve planned total_epochs across saves (was previously wiped every checkpoint).
         preserved_total = total_epochs
@@ -122,6 +122,7 @@ class TrainingState:
             'loss': loss,
             'val_loss': val_loss,
             'history': history,
+            'latest_epoch_loss': latest_epoch_loss,
             'training_finished': training_finished,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -166,6 +167,7 @@ class TrainingState:
             'loss': loss,
             'val_loss': val_loss,
             'history': history,
+            'latest_epoch_loss': latest_epoch_loss,
             'training_finished': training_finished,
             'timestamp': time.time(),
             'is_emergency': is_emergency,
@@ -175,6 +177,17 @@ class TrainingState:
         if training_finished:
             # epoch is 0-based index of last trained epoch
             state_info['completed_epochs'] = int(epoch) + 1
+
+        # Persist per-minibatch curve of the latest epoch for --loss
+        if latest_epoch_loss is not None:
+            try:
+                loss_path = self.save_dir / LATEST_EPOCH_LOSS_FILENAME
+                temp_loss = loss_path.with_suffix('.tmp')
+                with open(temp_loss, 'w') as f:
+                    json.dump(latest_epoch_loss, f, indent=2, default=str)
+                os.replace(temp_loss, loss_path)
+            except Exception as e:
+                print(f"⚠ Failed to save {LATEST_EPOCH_LOSS_FILENAME}: {e}")
         
         temp_state = self.state_file.with_suffix('.tmp')
         with open(temp_state, 'w') as f:
@@ -227,7 +240,7 @@ class TrainingState:
     
     def mark_training_finished(self, model, optimizer, dataloader_state, epoch, batch_idx, 
                                total_minibatches_processed, loss, val_loss=None, history=None,
-                               embed_dim=None, max_seq_len=None):
+                               embed_dim=None, max_seq_len=None, latest_epoch_loss=None):
         """Save a final checkpoint marking training as finished."""
         self.save_checkpoint(
             model=model,
@@ -239,6 +252,7 @@ class TrainingState:
             loss=loss,
             val_loss=val_loss,
             history=history,
+            latest_epoch_loss=latest_epoch_loss,
             is_emergency=False,
             training_finished=True,
             embed_dim=embed_dim,
@@ -416,6 +430,9 @@ class TrainingState:
         loss = checkpoint.get('loss', 0.0)
         val_loss = checkpoint.get('val_loss', None)
         history = checkpoint.get('history', None)
+        latest_epoch_loss = checkpoint.get('latest_epoch_loss', None)
+        if latest_epoch_loss is None:
+            latest_epoch_loss = state_info.get('latest_epoch_loss')
         is_emergency = checkpoint.get('is_emergency', False)
         dataloader_state = checkpoint.get('dataloader_state', None)
         
@@ -439,6 +456,7 @@ class TrainingState:
                 'loss': loss,
                 'val_loss': val_loss,
                 'history': history,
+                'latest_epoch_loss': latest_epoch_loss,
                 'dataloader_state': dataloader_state,
                 'is_emergency': is_emergency,
             }
@@ -499,6 +517,7 @@ class TrainingState:
             'loss': loss,
             'val_loss': val_loss,
             'history': history,
+            'latest_epoch_loss': latest_epoch_loss,
             'dataloader_state': dataloader_state,
             'is_emergency': is_emergency,
         }
@@ -600,6 +619,192 @@ class TrainingHistory:
 
 
 # ═══════════════════════════════════════════════════════════
+# LATEST EPOCH LOSS (per-minibatch curve)
+# ═══════════════════════════════════════════════════════════
+
+LATEST_EPOCH_LOSS_FILENAME = 'latest_epoch_loss.json'
+
+
+class LatestEpochLoss:
+    """
+    Per-minibatch loss history for the most recent training epoch.
+
+    Saved as latest_epoch_loss.json under the checkpoint directory so it can
+    be inspected later with --loss without reloading model weights.
+    """
+
+    def __init__(self):
+        self.epoch: Optional[int] = None          # 1-based epoch id
+        self.batch_indices: List[int] = []        # 1-based batch ids within epoch
+        self.batch_losses: List[float] = []
+        self.running_avgs: List[float] = []
+        self.avg_loss: Optional[float] = None
+        self.val_loss: Optional[float] = None
+        self.timestamp: Optional[float] = None
+        self.total_minibatches_processed: int = 0
+        self.complete: bool = False               # True if epoch finished fully
+
+    def reset(self, epoch: int, resume_batch_start: int = 0):
+        """Start a new epoch (or resume mid-epoch with empty continuation)."""
+        self.epoch = int(epoch)  # 1-based
+        self.batch_indices = []
+        self.batch_losses = []
+        self.running_avgs = []
+        self.avg_loss = None
+        self.val_loss = None
+        self.timestamp = time.time()
+        self.complete = False
+        self._resume_batch_start = int(resume_batch_start)
+
+    def add_batch(self, batch_idx_1based: int, loss: float, running_avg: float):
+        self.batch_indices.append(int(batch_idx_1based))
+        self.batch_losses.append(float(loss))
+        self.running_avgs.append(float(running_avg))
+        self.avg_loss = float(running_avg)
+        self.timestamp = time.time()
+
+    def mark_complete(self, avg_loss: Optional[float] = None, val_loss: Optional[float] = None,
+                      total_minibatches_processed: int = 0):
+        self.complete = True
+        if avg_loss is not None:
+            self.avg_loss = float(avg_loss)
+        if val_loss is not None:
+            self.val_loss = float(val_loss)
+        self.total_minibatches_processed = int(total_minibatches_processed)
+        self.timestamp = time.time()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'epoch': self.epoch,
+            'batch_indices': self.batch_indices,
+            'batch_losses': self.batch_losses,
+            'running_avgs': self.running_avgs,
+            'avg_loss': self.avg_loss,
+            'val_loss': self.val_loss,
+            'timestamp': self.timestamp,
+            'total_minibatches_processed': self.total_minibatches_processed,
+            'complete': self.complete,
+            'num_batches': len(self.batch_losses),
+        }
+
+    def from_dict(self, data: Dict[str, Any]):
+        if not isinstance(data, dict):
+            return
+        self.epoch = data.get('epoch')
+        self.batch_indices = list(data.get('batch_indices') or [])
+        self.batch_losses = [float(x) for x in (data.get('batch_losses') or [])]
+        self.running_avgs = [float(x) for x in (data.get('running_avgs') or [])]
+        self.avg_loss = data.get('avg_loss')
+        self.val_loss = data.get('val_loss')
+        self.timestamp = data.get('timestamp')
+        self.total_minibatches_processed = int(data.get('total_minibatches_processed') or 0)
+        self.complete = bool(data.get('complete', False))
+        # Back-fill batch indices if older file only had losses
+        if self.batch_losses and not self.batch_indices:
+            self.batch_indices = list(range(1, len(self.batch_losses) + 1))
+
+    def save(self, save_dir: Path) -> Path:
+        path = Path(save_dir) / LATEST_EPOCH_LOSS_FILENAME
+        temp = path.with_suffix('.tmp')
+        with open(temp, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+        os.replace(temp, path)
+        return path
+
+    @classmethod
+    def load(cls, save_dir: Path) -> Optional['LatestEpochLoss']:
+        path = Path(save_dir) / LATEST_EPOCH_LOSS_FILENAME
+        if not path.exists():
+            # Fallback: training_state.json may embed the same payload
+            state_path = Path(save_dir) / 'training_state.json'
+            if not state_path.exists():
+                return None
+            try:
+                with open(state_path, 'r') as f:
+                    state = json.load(f)
+                data = state.get('latest_epoch_loss')
+                if not data or not data.get('batch_losses'):
+                    return None
+                obj = cls()
+                obj.from_dict(data)
+                return obj
+            except Exception:
+                return None
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+            obj = cls()
+            obj.from_dict(data)
+            if not obj.batch_losses:
+                return None
+            return obj
+        except Exception:
+            return None
+
+    def plot(self, save_path: Optional[str] = None, figsize: Tuple[int, int] = (12, 6)):
+        if not self.batch_losses:
+            print("No latest-epoch batch losses to plot.")
+            return None
+
+        xs = self.batch_indices if self.batch_indices else list(range(1, len(self.batch_losses) + 1))
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.plot(xs, self.batch_losses, 'b-', linewidth=1.2, alpha=0.75, label='Batch loss')
+        if self.running_avgs and len(self.running_avgs) == len(self.batch_losses):
+            ax.plot(xs, self.running_avgs, 'r-', linewidth=2.0, label='Running avg')
+
+        epoch_label = self.epoch if self.epoch is not None else '?'
+        status = 'complete' if self.complete else 'partial'
+        ax.set_xlabel('Minibatch (within epoch)', fontsize=12)
+        ax.set_ylabel('Loss', fontsize=12)
+        ax.set_title(
+            f'Latest Epoch Loss — epoch {epoch_label} ({status}, n={len(self.batch_losses)})',
+            fontsize=14, fontweight='bold',
+        )
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.3)
+
+        if self.avg_loss is not None:
+            ax.axhline(self.avg_loss, color='green', linestyle='--', linewidth=1,
+                       label=f'Epoch avg={self.avg_loss:.4f}')
+            ax.legend(fontsize=10)
+
+        min_loss = min(self.batch_losses)
+        min_i = self.batch_losses.index(min_loss)
+        ax.annotate(
+            f'Min: {min_loss:.4f}',
+            xy=(xs[min_i], min_loss),
+            xytext=(xs[min_i], min_loss * 1.05 if min_loss > 0 else min_loss + 0.01),
+            fontsize=9, color='blue',
+        )
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"✓ Latest-epoch loss plot saved to: {save_path}")
+        plt.show()
+        return fig
+
+    def print_summary(self):
+        if not self.batch_losses:
+            print("No latest-epoch loss history available.")
+            return
+        epoch_label = self.epoch if self.epoch is not None else '?'
+        status = 'complete' if self.complete else 'partial'
+        print("\n" + "=" * 60)
+        print("LATEST EPOCH LOSS SUMMARY")
+        print("=" * 60)
+        print(f"Epoch:          {epoch_label} ({status})")
+        print(f"Minibatches:    {len(self.batch_losses)}")
+        print(f"First / last:   {self.batch_losses[0]:.6f} / {self.batch_losses[-1]:.6f}")
+        print(f"Min / max:      {min(self.batch_losses):.6f} / {max(self.batch_losses):.6f}")
+        if self.avg_loss is not None:
+            print(f"Epoch avg:      {self.avg_loss:.6f}")
+        if self.val_loss is not None:
+            print(f"Val loss:       {self.val_loss:.6f}")
+        print("=" * 60)
+
+
+# ═══════════════════════════════════════════════════════════
 # RESUMABLE TRAINER - OPTIMIZED
 # ═══════════════════════════════════════════════════════════
 
@@ -657,6 +862,7 @@ class ResumableTrainer:
         self.current_val_loss = None
         
         self.history = TrainingHistory()
+        self.latest_epoch_loss = LatestEpochLoss()
         
         self._setup_signal_handlers()
         atexit.register(self._at_exit_handler)
@@ -707,6 +913,7 @@ class ResumableTrainer:
                 loss=self.current_loss,
                 val_loss=self.current_val_loss,
                 history=self.history.to_dict(),
+                latest_epoch_loss=self.latest_epoch_loss.to_dict() if self.latest_epoch_loss.batch_losses else None,
                 is_emergency=True,
                 training_finished=False,
                 embed_dim=getattr(self, 'embed_dim', None),
@@ -740,10 +947,18 @@ class ResumableTrainer:
         total_batches = loader.get_total_batches_in_epoch()
         
         with torch.no_grad():
-            # Create progress bar with proper settings
-            pbar = tqdm(total=total_batches, desc=desc, 
-                        mininterval=0.5, miniters=1,  # Update more frequently
-                        smoothing=0.1)  # Smooth the rate calculation
+            pbar = tqdm(
+                total=total_batches,
+                desc=desc,
+                mininterval=0.5,
+                miniters=1,
+                smoothing=0.1,
+                dynamic_ncols=True,
+                bar_format=(
+                    '{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                    '[{elapsed}<{remaining}, {rate_fmt}{postfix}]'
+                ),
+            )
             
             while True:
                 batch, load_time = loader.get_next_batch()
@@ -763,15 +978,11 @@ class ResumableTrainer:
                 total_loss += L.item()
                 num_batches += 1
                 
-                # Update progress bar every batch
                 avg_loss = total_loss / num_batches
-                pbar.update(1)  # Always update by 1 batch
-                pbar.set_postfix({
-                    'loss': f'{avg_loss:.4f}',
-                    'batch': f'{num_batches}/{total_batches}'
-                })
+                pbar.update(1)
+                # batch count is already in n/total; keep postfix short
+                pbar.set_postfix_str(f', loss={avg_loss:.4f}', refresh=False)
             
-            # Ensure progress bar reaches 100%
             if pbar.n < total_batches:
                 pbar.update(total_batches - pbar.n)
             pbar.close()
@@ -941,6 +1152,18 @@ class ResumableTrainer:
                     self.history.from_dict(result["history"])
                     print(f"✓ Loaded training history ({len(self.history.epochs)} epochs)")
 
+                # Prefer dedicated file; fall back to checkpoint payload
+                loaded_le = LatestEpochLoss.load(self.state_manager.save_dir)
+                if loaded_le is None and result.get("latest_epoch_loss"):
+                    loaded_le = LatestEpochLoss()
+                    loaded_le.from_dict(result["latest_epoch_loss"])
+                if loaded_le is not None and loaded_le.batch_losses:
+                    self.latest_epoch_loss = loaded_le
+                    print(
+                        f"✓ Loaded latest-epoch loss "
+                        f"(epoch {loaded_le.epoch}, {len(loaded_le.batch_losses)} batches)"
+                    )
+
                 total_batches_in_epoch = self.dataloader.get_total_batches_in_epoch()
 
                 if result["status"] == "finished":
@@ -1027,6 +1250,10 @@ class ResumableTrainer:
                             loss=self.current_loss if self.current_loss != 0 else 0,
                             val_loss=self.current_val_loss,
                             history=self.history.to_dict(),
+                            latest_epoch_loss=(
+                                self.latest_epoch_loss.to_dict()
+                                if self.latest_epoch_loss.batch_losses else None
+                            ),
                             embed_dim=getattr(self, "embed_dim", None),
                             max_seq_len=getattr(self, "max_seq_len", None),
                         )
@@ -1143,6 +1370,19 @@ class ResumableTrainer:
                 else:
                     self.history.add_epoch(epoch_num, train_loss, val_loss)
 
+                # Finalize latest-epoch minibatch curve and persist for --loss
+                self.latest_epoch_loss.mark_complete(
+                    avg_loss=train_loss,
+                    val_loss=val_loss,
+                    total_minibatches_processed=self.total_minibatches_processed,
+                )
+                try:
+                    path = self.latest_epoch_loss.save(self.state_manager.save_dir)
+                    print(f"✓ Saved latest-epoch loss history → {path.name} "
+                          f"(epoch {epoch_num}, {len(self.latest_epoch_loss.batch_losses)} batches)")
+                except Exception as e:
+                    print(f"⚠ Failed to save latest-epoch loss history: {e}")
+
                 epoch += 1
                 # After first loop iteration, resume batch only applies once
                 self.start_batch = 0
@@ -1186,6 +1426,10 @@ class ResumableTrainer:
                         loss=train_loss if "train_loss" in locals() else 0,
                         val_loss=self.current_val_loss,
                         history=self.history.to_dict(),
+                        latest_epoch_loss=(
+                            self.latest_epoch_loss.to_dict()
+                            if self.latest_epoch_loss.batch_losses else None
+                        ),
                         embed_dim=getattr(self, "embed_dim", None),
                         max_seq_len=getattr(self, "max_seq_len", None),
                     )
@@ -1235,16 +1479,51 @@ class ResumableTrainer:
         )
         print(f"🔍 DEBUG: dataset len = {len(self.dataloader.dataset)}")
             
-        pbar = tqdm(total=target_batches, desc=f'Epoch {epoch+1}',
-                    initial=min(resume_batch_start, target_batches),
-                    mininterval=0.5,
-                    miniters=5)
+        # Compact postfix so the bar itself stays visible on typical terminal widths.
+        # Long multi-key postfix used to collapse the bar to "| |" and truncate keys.
+        pbar = tqdm(
+            total=target_batches,
+            desc=f'Epoch {epoch+1}',
+            initial=min(resume_batch_start, target_batches),
+            mininterval=0.5,
+            miniters=5,
+            dynamic_ncols=True,
+            bar_format=(
+                '{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                '[{elapsed}<{remaining}, {rate_fmt}{postfix}]'
+            ),
+        )
 
-        if resume_batch_start > 0: pbar.refresh()
+        if resume_batch_start > 0:
+            pbar.refresh()
         
         batch_idx = resume_batch_start
         total_loss = 0.0
         batches_in_epoch = 0
+        avg_loss = 0.0
+
+        # Per-minibatch curve for this epoch. Keep prior batches if resuming same epoch.
+        epoch_1based = epoch + 1
+        same_epoch_resume = (
+            resume_batch_start > 0
+            and self.latest_epoch_loss.epoch == epoch_1based
+            and len(self.latest_epoch_loss.batch_losses) > 0
+        )
+        if same_epoch_resume:
+            # Reconstruct running totals so avg stays continuous after resume
+            total_loss = float(sum(self.latest_epoch_loss.batch_losses))
+            batches_in_epoch = len(self.latest_epoch_loss.batch_losses)
+            avg_loss = total_loss / batches_in_epoch if batches_in_epoch else 0.0
+            self.latest_epoch_loss.complete = False
+            print(
+                f"✓ Continuing latest-epoch loss curve "
+                f"({batches_in_epoch} batches already recorded)"
+            )
+        else:
+            self.latest_epoch_loss.reset(
+                epoch=epoch_1based,
+                resume_batch_start=resume_batch_start,
+            )
         
         total_wait_time = 0.0
         total_load_time = 0.0
@@ -1308,7 +1587,8 @@ class ResumableTrainer:
             L.backward()
             optimizer.step()
             
-            total_loss += L.item()
+            batch_loss = L.item()
+            total_loss += batch_loss
             
             compute_time = time.perf_counter() - compute_start
             total_compute_time += compute_time
@@ -1323,32 +1603,35 @@ class ResumableTrainer:
 
             self.current_batch = batch_idx
             samples_used = min(batch_idx * self.dataloader.batch_size, total_samples)
+
+            avg_loss = (total_loss / batches_in_epoch) if batches_in_epoch > 0 else 0.0
+            self.current_loss = avg_loss
+            # Record every minibatch for latest-epoch --loss curve
+            self.latest_epoch_loss.add_batch(batch_idx, batch_loss, avg_loss)
+            self.latest_epoch_loss.total_minibatches_processed = self.total_minibatches_processed
             
             update_cycle = 10
             if batch_idx % update_cycle == 0 or batch_idx == 1:
-                avg_loss = (total_loss / batches_in_epoch) if batches_in_epoch > 0 else 0
-                self.current_loss = avg_loss
                 avg_wait = total_wait_time / batches_in_epoch * 1000
-                avg_load = total_load_time / batches_in_epoch * 1000
                 avg_comp = total_compute_time / batches_in_epoch * 1000
-                avg_cycle = total_cycle_time / batches_in_epoch * 1000
 
                 pbar.update(batch_idx - pbar.n)
-                pbar.set_postfix({
-                    'loss': f'{avg_loss:.4f}',
-                    'wait': f'{avg_wait:.0f}ms',
-                    'load': f'{avg_load:.0f}ms',
-                    'comp': f'{avg_comp:.0f}ms',
-                    'cycle': f'{avg_cycle:.0f}ms',
-                    'data': f'{samples_used}/{total_samples}',
-                    'total': self.total_minibatches_processed
-                })
+                # Leading ", " matches tqdm's default set_postfix spacing in bar_format.
+                pbar.set_postfix_str(
+                    f', loss={avg_loss:.4f}, '
+                    f'wait={avg_wait:.0f}ms, '
+                    f'comp={avg_comp:.0f}ms',
+                    refresh=False,
+                )
 
             if (self.total_minibatches_processed % 
                 self.state_manager.save_every_n_minibatches == 0):
                 
                 dataloader_state = dataloader.get_state()
                 
+                # Clear the live bar before multi-line checkpoint logs so the
+                # bar is not interleaved/corrupted by print() output.
+                pbar.clear()
                 self.state_manager.save_checkpoint(
                     model=model,
                     optimizer=optimizer,
@@ -1359,11 +1642,13 @@ class ResumableTrainer:
                     loss=avg_loss,
                     val_loss=self.current_val_loss,
                     history=self.history.to_dict(),
+                    latest_epoch_loss=self.latest_epoch_loss.to_dict(),
                     is_emergency=False,
                     training_finished=False,
                     embed_dim=getattr(self, 'embed_dim', None),
                     max_seq_len=getattr(self, 'max_seq_len', None),
                 )
+                pbar.refresh()
             wait_start = time.time()
 
         print(f"🔍 DEBUG: Epoch {epoch+1} completed. Processed {batch_count}/{total_batches} batches")
