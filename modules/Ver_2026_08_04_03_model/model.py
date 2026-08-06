@@ -229,8 +229,10 @@ class MarketTransformerWithHeads(nn.Module):
         """
         Args:
             x:     (B, T, F) — window features. T must be divisible by patch_size.
-            mean:  (B, F)
-            std:   (B, F)
+                    x = normalize(feature_window, stat(feature_window))
+            mean:  (B, F).  mean = normalize(mean_feature_window, stat({mean_feature_window | feature}) )
+            std:   (B, F).  std = normalize(std_feature_window, stat({std_feature_window | feature}) )
+                    NOTE: Do NOT multiply x with std or mean, as some of them are zero (nearly, at least)
             shape: (B, num_shapes, F)
         """
         # ---- 0. Compress macro channels over time ----
