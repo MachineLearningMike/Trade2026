@@ -1,5 +1,9 @@
 # INFER.py
 # Inference script for trained model
+#
+# Important: never materialize the full test set of windows in RAM.
+# With ~430k samples, past_window=10080, F≈56, the test split alone is ~90+ GB
+# if stacked. Always stream samples in small batches.
 
 import torch
 import torch.nn as nn
@@ -110,6 +114,7 @@ def load_model(
         head_hidden_dim_multiplier=config['head_hidden_dim_multiplier'],
         output_dim=config['output_dim'],
         use_reconstruction=config['use_reconstruction'],
+        num_shapes=config.get('num_shapes', 4),
     )
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
@@ -118,45 +123,106 @@ def load_model(
     return model
 
 
+def _collate_batch(dataset, indices: List[int]):
+    """Load a small batch of samples from the dataset (CPU tensors)."""
+    xs, ys, means, stds, shapes = [], [], [], [], []
+    for idx in indices:
+        x, y, mean, std, shape = dataset[idx]
+        xs.append(x)
+        ys.append(y)
+        means.append(mean)
+        stds.append(std)
+        shapes.append(shape)
+    return (
+        torch.stack(xs),      # (B, T, F)
+        torch.stack(ys),      # (B, 3)
+        torch.stack(means),   # (B, F)
+        torch.stack(stds),    # (B, F)
+        torch.stack(shapes),  # (B, num_shapes, F)
+    )
+
+
 def run_inference_on_test_set(
     model,
     dataset,
-    test_windows: torch.Tensor,
-    test_labels: torch.Tensor,
-    test_means: torch.Tensor,
-    test_stds: torch.Tensor,
-    test_shapes: torch.Tensor,
     device: str = 'cuda',
+    batch_size: int = 8,
+    max_samples: Optional[int] = None,
 ):
     """
-    Run inference on the entire test set.
+    Stream the test split in batches. Never stacks the full test windows.
 
-    test_windows: (N, T, F)  — same layout as dataset __getitem__
+    model.forward expects:
+        x:     (B, T, F)
+        mean:  (B, F)
+        std:   (B, F)
+        shape: (B, num_shapes, F)
+
+    Returns:
+        preds:  (N, 3) denormalized predictions on `device`
+        labels: (N, 3) raw (denormalized) labels on `device`
+        used_indices: list of dataset indices that were evaluated
     """
     model.eval()
 
-    test_windows = test_windows.to(device)
-    test_labels = test_labels.to(device)
-    test_means = test_means.to(device)
-    test_stds = test_stds.to(device)
-    test_shapes = test_shapes.to(device)
+    test_indices = list(dataset.test_indices)
+    if max_samples is not None and max_samples < len(test_indices):
+        test_indices = test_indices[:max_samples]
+        print(f"  (capped to first {max_samples} test samples)", flush=True)
 
-    # Dataset already returns (T, F); stacked → (N, T, F). No transpose needed.
-    x = test_windows
+    n = len(test_indices)
+    if n == 0:
+        raise RuntimeError("No test samples available.")
+
+    # Rough memory note so hangs are not mysterious next time
+    bytes_per_window = dataset.past_window * dataset.F * 4
+    full_gb = n * bytes_per_window / (1024 ** 3)
+    print(
+        f"  Test samples: {n}  |  window≈{bytes_per_window / 1e6:.2f} MB each  "
+        f"|  full stack would be ~{full_gb:.1f} GB → streaming batch_size={batch_size}",
+        flush=True,
+    )
+
+    pred_chunks = []
+    label_chunks = []
+    n_batches = (n + batch_size - 1) // batch_size
 
     with torch.no_grad():
-        pred_norm, _, _ = model(x, test_means, test_stds, test_shapes)
+        for b in range(n_batches):
+            start = b * batch_size
+            end = min(start + batch_size, n)
+            batch_idx = test_indices[start:end]
 
-    preds = []
-    for i in range(pred_norm.shape[0]):
-        pred_denorm = dataset.denormalize_y(pred_norm[i].cpu())
-        horizon = int(round(pred_denorm[0].item()))
-        slope = pred_denorm[1].item()
-        intercept = pred_denorm[2].item()
-        preds.append(torch.tensor([horizon, slope, intercept], device=device, dtype=torch.float32))
+            x, y, mean, std, shape = _collate_batch(dataset, batch_idx)
+            # Shapes into model: x (B,T,F), mean/std (B,F), shape (B,S,F)
+            x = x.to(device, non_blocking=True)
+            mean = mean.to(device, non_blocking=True)
+            std = std.to(device, non_blocking=True)
+            shape = shape.to(device, non_blocking=True)
 
-    preds = torch.stack(preds)
-    return preds, test_labels
+            pred_norm, _, _ = model(x, mean, std, shape)  # (B, 3) normalized
+
+            # Denormalize on CPU (dataset stats live on CPU)
+            pred_denorm = torch.stack(
+                [dataset.denormalize_y(pred_norm[i].detach().cpu()) for i in range(pred_norm.shape[0])]
+            )
+            # y from __getitem__ is already label-normalized → denormalize for metrics
+            y_denorm = torch.stack(
+                [dataset.denormalize_y(y[i]) for i in range(y.shape[0])]
+            )
+
+            pred_chunks.append(pred_denorm)
+            label_chunks.append(y_denorm)
+
+            if b == 0 or (b + 1) % max(1, n_batches // 20) == 0 or (b + 1) == n_batches:
+                print(f"  Inference batch {b + 1}/{n_batches}  ({end}/{n} samples)", flush=True)
+
+            # Free GPU tensors early
+            del x, mean, std, shape, pred_norm
+
+    preds = torch.cat(pred_chunks, dim=0).to(device)
+    labels = torch.cat(label_chunks, dim=0).to(device)
+    return preds, labels, test_indices
 
 
 # ═══════════════════════════════════════════════════════════
@@ -166,12 +232,15 @@ def run_inference_on_test_set(
 if __name__ == "__main__":
     config = get_config()
     device = config['device']
+    batch_size = config.get('batch_size', 8)
+    # Optional cap for quick smoke tests (None = full test split)
+    max_test_samples = config.get('infer_max_samples', None)
 
-    print("\nLoading dataset (same path as TRAIN)...")
+    print("\nLoading dataset (same path as TRAIN)...", flush=True)
     dataset, total_features = get_dataset(config)
 
     checkpoint_key = generate_checkpoint_key(config, dataset.cache_key)
-    print(f"🔑 Generated Checkpoint Key: {checkpoint_key}")
+    print(f"🔑 Generated Checkpoint Key: {checkpoint_key}", flush=True)
 
     result = find_checkpoint_by_key(config.get('checkpoint_dir', 'trading_checkpoints'), checkpoint_key)
     if result is None:
@@ -184,54 +253,29 @@ if __name__ == "__main__":
 
     checkpoint_path, checkpoint_key = result
 
-    print(f"\nLoading model from: {checkpoint_path}")
-    print(f"Checkpoint Key: {checkpoint_key}")
+    print(f"\nLoading model from: {checkpoint_path}", flush=True)
+    print(f"Checkpoint Key: {checkpoint_key}", flush=True)
 
     model = load_model(checkpoint_path, config, dataset, device)
-    print("✓ Model loaded successfully")
+    print("✓ Model loaded successfully", flush=True)
 
-    print("\nCollecting test samples...")
-    test_windows = []
-    test_labels = []
-    test_means = []
-    test_stds = []
-    test_shapes = []
-    valid_starts = []
-
-    for idx in dataset.test_indices:
-        x, y, mean, std, shape = dataset[idx]
-        test_windows.append(x)
-        test_labels.append(y)
-        test_means.append(mean)
-        test_stds.append(std)
-        test_shapes.append(shape)
-        valid_starts.append(dataset.valid_starts[idx])
-
-    test_windows = torch.stack(test_windows)   # (N, T, F)
-    test_labels = torch.stack(test_labels)     # (N, 3)
-    test_means = torch.stack(test_means)       # (N, F)
-    test_stds = torch.stack(test_stds)         # (N, F)
-    test_shapes = torch.stack(test_shapes)     # (N, num_shapes, F)
-
-    print(f"✓ Loaded {len(test_windows)} test samples")
-    print(f"  windows: {tuple(test_windows.shape)}  means: {tuple(test_means.shape)}  "
-          f"shapes: {tuple(test_shapes.shape)}")
-
-    print(f"\nRunning inference on {len(test_windows)} test samples...")
-    preds, test_labels_device = run_inference_on_test_set(
+    print("\nRunning batched inference on test samples...", flush=True)
+    preds, test_labels, used_indices = run_inference_on_test_set(
         model,
         dataset,
-        test_windows, test_labels, test_means, test_stds, test_shapes,
-        device,
+        device=device,
+        batch_size=batch_size,
+        max_samples=max_test_samples,
     )
+    print(f"✓ Finished inference on {len(preds)} test samples", flush=True)
 
     print("\n📊 Test Set Results:")
-    horizon_mse = torch.nn.functional.mse_loss(preds[:, 0], test_labels_device[:, 0]).item()
-    slope_mse = torch.nn.functional.mse_loss(preds[:, 1], test_labels_device[:, 1]).item()
-    intercept_mse = torch.nn.functional.mse_loss(preds[:, 2], test_labels_device[:, 2]).item()
+    horizon_mse = torch.nn.functional.mse_loss(preds[:, 0], test_labels[:, 0]).item()
+    slope_mse = torch.nn.functional.mse_loss(preds[:, 1], test_labels[:, 1]).item()
+    intercept_mse = torch.nn.functional.mse_loss(preds[:, 2], test_labels[:, 2]).item()
     print(f"  Horizon MSE:     {horizon_mse:.4f}")
-    print(f"  Slope MSE:     {slope_mse:.4f}")
-    print(f"  Intercept MSE: {intercept_mse:.4f}")
+    print(f"  Slope MSE:       {slope_mse:.4f}")
+    print(f"  Intercept MSE:   {intercept_mse:.4f}")
 
     print(f"\n📈 Sample Predictions (first 5):")
     print(f"  {'Index':<6} {'True H':<8} {'Pred H':<8} {'True Slope':<12} {'Pred Slope':<12} "
@@ -239,17 +283,19 @@ if __name__ == "__main__":
     print(f"  {'-'*6} {'-'*8} {'-'*8} {'-'*12} {'-'*12} {'-'*14} {'-'*14}")
     for i in range(min(5, len(preds))):
         print(
-            f"  {i:<6} {test_labels_device[i, 0].item():<8.0f} {preds[i, 0].item():<8.0f} "
-            f"{test_labels_device[i, 1].item():<12.4f} {preds[i, 1].item():<12.4f} "
-            f"{test_labels_device[i, 2].item():<14.2f} {preds[i, 2].item():<14.2f}"
+            f"  {i:<6} {test_labels[i, 0].item():<8.0f} {preds[i, 0].item():<8.0f} "
+            f"{test_labels[i, 1].item():<12.4f} {preds[i, 1].item():<12.4f} "
+            f"{test_labels[i, 2].item():<14.2f} {preds[i, 2].item():<14.2f}"
         )
 
-    # For visualization of *true* labels, use raw (denormalized) label tensor +
-    # per-sample mean/std from the dataset cache (not the train-stats-normalized ones).
-    print("\n📈 Visualizing true linear trends...")
-    raw_means = torch.stack([dataset.mean_tensor[i] for i in dataset.test_indices])
-    raw_stds = torch.stack([dataset.std_tensor[i] for i in dataset.test_indices])
-    raw_labels = torch.stack([dataset.label_tensor[i] for i in dataset.test_indices])
+    # Visualization only needs a handful of raw (unnormalized) labels + window stats
+    print("\n📈 Visualizing true linear trends...", flush=True)
+    viz_n = min(6, len(used_indices))
+    viz_indices = used_indices[:viz_n]
+    valid_starts = [dataset.valid_starts[i] for i in viz_indices]
+    raw_means = torch.stack([dataset.mean_tensor[i] for i in viz_indices])
+    raw_stds = torch.stack([dataset.std_tensor[i] for i in viz_indices])
+    raw_labels = torch.stack([dataset.label_tensor[i] for i in viz_indices])
 
     visualize_linear_trends(
         total_tensor=dataset.Total,
@@ -261,7 +307,7 @@ if __name__ == "__main__":
         past_window=dataset.past_window,
         future_window=dataset.future_window,
         mode=config.get('horizon_mode', 'anchored'),
-        num_samples=6,
+        num_samples=viz_n,
     )
 
-    print(f"\n✓ Inference complete!")
+    print(f"\n✓ Inference complete!", flush=True)

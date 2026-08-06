@@ -556,15 +556,6 @@ class MarketTransformerWithHeads(nn.Module):
         shape: torch.Tensor,
     ):
         """
-        Args:
-            x:     (B, T, F) — window features. T must be divisible by patch_size.
-                    x = normalize(feature_window, stat(feature_window))
-            mean:  (B, F).  mean = normalize(mean_feature_window, stat({mean_feature_window | feature}) )
-            std:   (B, F).  std = normalize(std_feature_window, stat({std_feature_window | feature}) )
-                    NOTE: Do NOT multiply x with std or mean, as some of them are zero (nearly, at least)
-            shape: (B, num_shapes, F)
-        """
-        """
         Encoder–decoder mix of the time series and window statistics.
 
         1. Build x_stat (B, N_stat, F), N_stat = 1 + 1 + num_shapes:
@@ -577,9 +568,11 @@ class MarketTransformerWithHeads(nn.Module):
         4. Flatten (B, N_stat, D) → (B, N_stat * D), FFN → (B, 3)
 
         Args:
-            x:     (B, T, F)
-            mean:  (B, F)
-            std:   (B, F)
+            x:     (B, T, F) — window features. T must be divisible by patch_size.
+                    x = normalize(feature_window, stat(feature_window))
+            mean:  (B, F) — normalize(mean_feature_window, train-set mean/std of means)
+            std:   (B, F) — normalize(std_feature_window, train-set mean/std of stds)
+                    NOTE: Do NOT multiply x with std or mean; some channels are ~0.
             shape: (B, num_shapes, F)
 
         Returns:
