@@ -10,9 +10,9 @@ config = {
     # ============================================================
     # DATA CONFIGURATION
     # ============================================================
-    'past_days': 7,     # 1, 2, 
+    'past_days': 2,     # 1, 2, 
     'future_minutes': 60,
-    'step': 3,
+    'step': 5,
     'num_features': 5,
     'num_shapes': 4,
     'total_synthetic_days': 30,
@@ -90,7 +90,7 @@ config = {
     # ============================================================
     'patch_size': 30,
     'embed_dim': None,  # AUTO-COMPUTED
-    'num_layers': 16,
+    'num_layers': 6,
     'num_heads': 6,
     'ff_dim_multiplier': 4,
     'dropout': 0.1,

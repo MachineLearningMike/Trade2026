@@ -1668,24 +1668,14 @@ class ResumableTrainer:
             if batch_idx % update_cycle == 0 or batch_idx == 1:
                 denom = max(timed_batches, 1)
                 avg_wait = total_wait_time / denom * 1000.0
-                avg_data = total_load_time / denom * 1000.0
                 avg_comp = total_compute_time / denom * 1000.0
-                avg_step = total_cycle_time / denom * 1000.0
-                # Amortized checkpoint I/O — this is the usual "missing" wall time
-                avg_save = total_save_time / denom * 1000.0
-                avg_eff = avg_step + avg_save
 
                 pbar.update(batch_idx - pbar.n)
                 # tqdm already prefixes postfix with ", ".
-                # data is producer-side (overlaps); do not expect wait+data+comp=step.
                 pbar.set_postfix_str(
                     f'loss={avg_loss:.4f}, '
                     f'wait={avg_wait:.0f}ms, '
-                    f'data={avg_data:.0f}ms, '
-                    f'comp={avg_comp:.0f}ms, '
-                    f'step={avg_step:.0f}ms, '
-                    f'save={avg_save:.0f}ms, '
-                    f'eff={avg_eff:.0f}ms',
+                    f'comp={avg_comp:.0f}ms',
                     refresh=False,
                 )
 
