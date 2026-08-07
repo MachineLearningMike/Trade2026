@@ -39,19 +39,32 @@ config = {
     # ============================================================
     # HORIZON LABELING CONFIGURATION
     # ============================================================
-    'max_accum_deviation': 0.35,
+    'max_accum_deviation': 0.35,   # legacy alias; prefer fitness_threshold
     'min_horizon': 3,
     'max_horizon': 50,
-    
+    # Dimensionless fitness: sum(|residual|) / history_sigma
+    'fitness_threshold': 0.75,
+
     # ============================================================
-    # HORIZON LABELING MODE
+    # HORIZON SEARCH RULE
     # ============================================================
+    # Free (unanchored) OLS always. Choose how the threshold is applied:
+    #   'longest_linear'         - grow h while fitness <= threshold; keep last good
+    #                              (default: longest approximately linear regime)
+    #   'shortest_to_threshold'  - return first h where fitness >= threshold
+    #                              (deviation budget exhausted)
+    'horizon_search': 'longest_linear',
+
+    # ============================================================
+    # HORIZON FIT / VISUALIZATION MODE (display + legacy weighted path)
+    # ============================================================
+    # Labeling always uses free OLS (not anchored through f[0]).
     # Choose one of: 'floating', 'anchored', 'weighted'
-    #   'floating'  - Unconstrained OLS fit (no anchor)
-    #   'anchored'  - Constrained to pass through f[0] (first future price)
+    #   'floating'  - Unconstrained OLS (matches label math)
+    #   'anchored'  - Viz only: line constrained through f[0]
     #   'weighted'  - Weighted OLS with far future getting higher weights
     'horizon_mode': 'floating',
-    
+
     # ============================================================
     # WEIGHTED LABELING CONFIGURATION (only used when mode='weighted')
     # ============================================================
@@ -64,7 +77,7 @@ config = {
     'use_binance_data': True,
     'binance_datatype': 'klines',
     'binance_interval': '1m',
-    'binance_start_date': '2024-01-01 00:00:00',
+    'binance_start_date': '2026-01-01 00:00:00',
     'binance_end_date': '2026-07-01 00:00:00',
     'binance_symbols': {
         "BTCUSDT": ["Close", "Volume"],

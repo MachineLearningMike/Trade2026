@@ -26,9 +26,17 @@ from datetime import datetime
 
 from Binance import Binance
 
-# Label fitness threshold used in _compute_labels_and_norm_params.
-# Keep in the dataset signature so code changes invalidate caches.
+# Default label fitness threshold (overridden by config['fitness_threshold']).
+# Kept as a module constant so older call sites / cache docs stay consistent.
 LABEL_FITNESS_THRESHOLD = 0.75
+
+# Horizon search rules for find_linear_regime (free OLS, no f[0] anchor).
+HORIZON_SEARCH_LONGEST_LINEAR = 'longest_linear'
+HORIZON_SEARCH_SHORTEST_TO_THRESHOLD = 'shortest_to_threshold'
+VALID_HORIZON_SEARCH_MODES = (
+    HORIZON_SEARCH_LONGEST_LINEAR,
+    HORIZON_SEARCH_SHORTEST_TO_THRESHOLD,
+)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -182,7 +190,8 @@ def generate_dataset_signature(config: dict) -> str:
         # --- label algorithm ---
         'min_horizon': config.get('min_horizon', 3),
         'max_horizon': max_horizon,
-        'fitness_threshold': LABEL_FITNESS_THRESHOLD,
+        'fitness_threshold': config.get('fitness_threshold', LABEL_FITNESS_THRESHOLD),
+        'horizon_search': config.get('horizon_search', HORIZON_SEARCH_LONGEST_LINEAR),
         'normalize': config.get('normalize', True),
 
         # --- train-split stats ---
@@ -270,84 +279,117 @@ def generate_synthetic_data(T: int, F: int, price_feature_idx: int = 0):
 # HORIZON LABELING FUNCTION - SUPPORTS ALL MODES
 # ═══════════════════════════════════════════════════════════
 
-def find_shortest_horizon(
+def _ols_fit_segment(y: torch.Tensor, eps: float = 1e-8):
+    """
+    Free (unanchored) OLS fit of y on t = 0..h-1.
+
+    Returns:
+        slope, intercept, fitness_l1  where fitness_l1 = sum(|y - ŷ|)
+        (caller may divide by a scale to make fitness dimensionless).
+    """
+    device = y.device
+    dtype = y.dtype
+    h = y.shape[0]
+    x = torch.arange(h, device=device, dtype=dtype)
+    x_mean = x.mean()
+    y_mean = y.mean()
+    dx = x - x_mean
+    denom = torch.sum(dx * dx)
+    if denom < eps:
+        slope = torch.zeros((), device=device, dtype=dtype)
+        intercept = y_mean
+    else:
+        slope = torch.sum(dx * (y - y_mean)) / denom
+        intercept = y_mean - slope * x_mean
+    residual_l1 = torch.sum(torch.abs(y - (slope * x + intercept)))
+    return slope, intercept, residual_l1
+
+
+def find_linear_regime(
     future,
     history,
     min_horizon=3,
     max_horizon=30,
     fitness_threshold=1.0,
+    mode=HORIZON_SEARCH_LONGEST_LINEAR,
 ):
     """
-    Find the longest approximately linear future segment.
+    Free OLS linear-regime search over future prices (not anchored through f[0]).
+
+    Fitness is dimensionless cumulative L1 residual:
+        fitness(h) = sum_t |y_t - ŷ_t| / history_sigma
+    where ŷ is the free OLS line on t = 0..h-1 and
+    history_sigma = std(history) (clamped).
+
+    Search modes (config key ``horizon_search``):
+        'longest_linear' (default)
+            Grow h while fitness(h) <= fitness_threshold.
+            Return the last admissible (h, m, b). If even min_horizon
+            fails the threshold, still return the OLS fit at min_horizon.
+
+        'shortest_to_threshold'
+            Return the first h where fitness(h) >= fitness_threshold
+            (deviation budget exhausted). If the threshold is never
+            reached, return the OLS fit at max_horizon.
 
     Args:
         future : Tensor (future_window,)
-            Future normalized prices.
-
+            Future prices (prefer same scale as history; typically z-scored).
         history : Tensor (history_window,)
-            Past normalized prices used only for fitness normalization.
-
-        min_horizon : int
-            Minimum candidate horizon.
-
-        max_horizon : int
-            Maximum candidate horizon.
-
+            Past prices used only for residual scale (std).
+        min_horizon, max_horizon : int
         fitness_threshold : float
-            Maximum allowable dimensionless fitness.
+            Threshold on dimensionless fitness.
+        mode : str
+            'longest_linear' or 'shortest_to_threshold'.
 
     Returns:
         horizon : int
-        slope : Tensor
-        intercept : Tensor
+        slope : Tensor (0-d)
+        intercept : Tensor (0-d)
     """
+    if mode not in VALID_HORIZON_SEARCH_MODES:
+        raise ValueError(
+            f"Unknown horizon search mode {mode!r}; "
+            f"expected one of {VALID_HORIZON_SEARCH_MODES}"
+        )
 
     device = future.device
     dtype = future.dtype
     eps = 1e-8
 
-    max_horizon = min(max_horizon, future.shape[0])
-    history_sigma = history.std().clamp(min=eps)
+    max_horizon = min(int(max_horizon), int(future.shape[0]))
+    min_horizon = max(2, int(min_horizon))
+    if min_horizon > max_horizon:
+        min_horizon = max_horizon
+
+    history_sigma = history.to(device=device, dtype=dtype).std().clamp(min=eps)
 
     best_h = min_horizon
-
-    best_slope = torch.tensor(0.0, device=device, dtype=dtype)
-    best_intercept = torch.tensor(0.0, device=device, dtype=dtype)
-
-    # ---------------------------------------------------------
-    # Search progressively longer horizons
-    # ---------------------------------------------------------
+    best_slope = torch.zeros((), device=device, dtype=dtype)
+    best_intercept = torch.zeros((), device=device, dtype=dtype)
+    have_fit = False
 
     for h in range(min_horizon, max_horizon + 1):
+        slope, intercept, residual_l1 = _ols_fit_segment(future[:h], eps=eps)
+        fitness = residual_l1 / history_sigma
 
-        y = future[:h]
-
-        x = torch.arange(h, device=device, dtype=dtype)
-
-        x_mean = x.mean()
-        y_mean = y.mean()
-
-        dx = x - x_mean
-
-        slope = torch.sum(dx * (y - y_mean)) / (
-            torch.sum(dx * dx) + eps
-        )
-
-        intercept = y_mean - slope * x_mean
-        prediction = slope * x + intercept
-
-        cumulative_deviation = torch.sum(
-            torch.abs(y - prediction)
-        )
-
-        fitness = cumulative_deviation
-
-        if fitness <= fitness_threshold:
-            best_h = h
-            best_slope = slope
-            best_intercept = intercept
+        if mode == HORIZON_SEARCH_LONGEST_LINEAR:
+            # Keep lengthening while still "linear enough".
+            if fitness <= fitness_threshold:
+                best_h, best_slope, best_intercept = h, slope, intercept
+                have_fit = True
+            else:
+                # First failure: keep last good fit, or min_horizon fit if none.
+                if not have_fit:
+                    best_h, best_slope, best_intercept = h, slope, intercept
+                break
         else:
-            break
+            # shortest_to_threshold: first h that exhausts the deviation budget.
+            best_h, best_slope, best_intercept = h, slope, intercept
+            have_fit = True
+            if fitness >= fitness_threshold:
+                break
 
     return best_h, best_slope, best_intercept
 
@@ -809,8 +851,19 @@ class TradingDataset(Dataset):
 
         config = get_config()
         self.num_shapes = config['num_shapes']
-        
-        self.horizon_mode = config.get('horizon_mode', 'anchored')
+
+        self.horizon_search = config.get(
+            'horizon_search', HORIZON_SEARCH_LONGEST_LINEAR
+        )
+        if self.horizon_search not in VALID_HORIZON_SEARCH_MODES:
+            raise ValueError(
+                f"Unknown horizon_search={self.horizon_search!r}; "
+                f"expected one of {VALID_HORIZON_SEARCH_MODES}"
+            )
+        self.fitness_threshold = float(
+            config.get('fitness_threshold', LABEL_FITNESS_THRESHOLD)
+        )
+        self.horizon_mode = config.get('horizon_mode', 'floating')
         self.weight_type = config.get('weight_type', 'exponential')
         self.weight_decay = config.get('weight_decay', 0.9)
         
@@ -866,10 +919,12 @@ class TradingDataset(Dataset):
         print(f"  Past window: {self.past_window} minutes ({past_days} days)")
         print(f"  Future window: {self.future_window} minutes")
         print(f"  Step: {step}")
-        print(f"  Horizon mode: {self.horizon_mode}")
+        print(f"  Horizon search: {self.horizon_search}")
+        print(f"  Fitness threshold: {self.fitness_threshold}")
+        print(f"  Horizon viz mode: {self.horizon_mode}")
         if self.horizon_mode == 'weighted':
             print(f"  Weight type: {self.weight_type}, Decay: {self.weight_decay}")
-        print(f"  Max accum deviation: {max_accum_deviation}")
+        print(f"  Max accum deviation (legacy): {max_accum_deviation}")
         print(f"  Min horizon: {min_horizon}, Max horizon: {self.max_horizon}")
         print(f"  Normalize: {normalize}")
         print(f"  Total samples: {len(self)}")
@@ -878,21 +933,6 @@ class TradingDataset(Dataset):
               f"Val: {self.split_ratios[1]:.2f}, Test: {self.split_ratios[2]:.2f}")
         print(f"  Split sizes - Train: {len(self.train_indices)}, "
               f"Val: {len(self.val_indices)}, Test: {len(self.test_indices)}")
-        
-        # Print statistics
-        print(f"\n📊 Dataset Statistics (computed from TRAINING set, {len(self.train_indices)} samples):")
-        print(f"  Label (horizon, slope, intercept):")
-        print(f"    Mean:  {self.stats['label']['mean'].tolist()}")
-        print(f"    Std:   {self.stats['label']['std'].tolist()}")
-        print(f"  Mean tensor (per feature):")
-        print(f"    Mean:  {self.stats['mean']['mean'].tolist()}")
-        print(f"    Std:   {self.stats['mean']['std'].tolist()}")
-        print(f"  Std tensor (per feature):")
-        print(f"    Mean:  {self.stats['std']['mean'].tolist()}")
-        print(f"    Std:   {self.stats['std']['std'].tolist()}")
-        print(f"  Shape tensor (per feature):")
-        print(f"    Mean:  {self.stats['shape']['mean'].tolist()}")
-        print(f"    Std:   {self.stats['shape']['std'].tolist()}")
         
     def _stack_features(self, features: List[np.ndarray]) -> torch.Tensor:
         shapes = [arr.shape for arr in features]
@@ -976,20 +1016,27 @@ class TradingDataset(Dataset):
             y_start = start + self.past_window
             y_end = y_start + self.future_window
             future_prices = self.Total[y_start:y_end, self.price_feature_idx]
-            
+            history_prices = self.Total[
+                start:start + self.past_window, self.price_feature_idx
+            ]
+
             if self.normalize:
                 price_mean = mean[self.price_feature_idx]
                 price_std = std[self.price_feature_idx]
-                future_prices_normalized = (future_prices - price_mean) / price_std
+                # Same scale for future and history so fitness uses consistent σ.
+                future_for_label = (future_prices - price_mean) / price_std
+                history_for_label = (history_prices - price_mean) / price_std
             else:
-                future_prices_normalized = future_prices
-            
-            best_h, best_slope, best_intercept = find_shortest_horizon(
-                future_prices_normalized,
-                self.Total[start:start + self.past_window, self.price_feature_idx],
+                future_for_label = future_prices
+                history_for_label = history_prices
+
+            best_h, best_slope, best_intercept = find_linear_regime(
+                future_for_label,
+                history_for_label,
                 min_horizon=self.min_horizon,
                 max_horizon=self.max_horizon,
-                fitness_threshold=LABEL_FITNESS_THRESHOLD,
+                fitness_threshold=self.fitness_threshold,
+                mode=self.horizon_search,
             )
 
             label = torch.tensor([best_h, best_slope, best_intercept], dtype=torch.float32)
@@ -1081,6 +1128,8 @@ class TradingDataset(Dataset):
                 'max_accum_deviation': self.max_accum_deviation,
                 'min_horizon': self.min_horizon,
                 'max_horizon': self.max_horizon,
+                'fitness_threshold': self.fitness_threshold,
+                'horizon_search': self.horizon_search,
                 'normalize': self.normalize,
                 'price_feature_idx': self.price_feature_idx,
                 'cache_key': self.cache_key,

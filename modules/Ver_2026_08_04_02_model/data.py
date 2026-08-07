@@ -561,19 +561,19 @@ class TradingDataset(Dataset):
               f"Val: {len(self.val_indices)}, Test: {len(self.test_indices)}")
         
         # Print statistics
-        print(f"\n📊 Dataset Statistics (computed from TRAINING set, {len(self.train_indices)} samples):")
-        print(f"  Label (horizon, slope, intercept):")
-        print(f"    Mean:  {self.stats['label']['mean'].tolist()}")
-        print(f"    Std:   {self.stats['label']['std'].tolist()}")
-        print(f"  Mean tensor (per feature):")
-        print(f"    Mean:  {self.stats['mean']['mean'].tolist()}")
-        print(f"    Std:   {self.stats['mean']['std'].tolist()}")
-        print(f"  Std tensor (per feature):")
-        print(f"    Mean:  {self.stats['std']['mean'].tolist()}")
-        print(f"    Std:   {self.stats['std']['std'].tolist()}")
-        print(f"  Shape tensor (per feature):")
-        print(f"    Mean:  {self.stats['shape']['mean'].tolist()}")
-        print(f"    Std:   {self.stats['shape']['std'].tolist()}")
+        # print(f"\n📊 Dataset Statistics (computed from TRAINING set, {len(self.train_indices)} samples):")
+        # print(f"  Label (horizon, slope, intercept):")
+        # print(f"    Mean:  {self.stats['label']['mean'].tolist()}")
+        # print(f"    Std:   {self.stats['label']['std'].tolist()}")
+        # print(f"  Mean tensor (per feature):")
+        # print(f"    Mean:  {self.stats['mean']['mean'].tolist()}")
+        # print(f"    Std:   {self.stats['mean']['std'].tolist()}")
+        # print(f"  Std tensor (per feature):")
+        # print(f"    Mean:  {self.stats['std']['mean'].tolist()}")
+        # print(f"    Std:   {self.stats['std']['std'].tolist()}")
+        # print(f"  Shape tensor (per feature):")
+        # print(f"    Mean:  {self.stats['shape']['mean'].tolist()}")
+        # print(f"    Std:   {self.stats['shape']['std'].tolist()}")
         
     def _stack_features(self, features: List[np.ndarray]) -> torch.Tensor:
         shapes = [arr.shape for arr in features]
