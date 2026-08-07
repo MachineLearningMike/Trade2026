@@ -703,13 +703,37 @@ def visualize_linear_trends(
 
             y_start = start + past_window
             y_end = y_start + future_window
-            # Total is (T, F)
-            future_prices = total_tensor[y_start:y_end, price_feature_idx].cpu().numpy()
+            # Total is (T, F). Extend actual prices left into recent past for context.
+            past_context = 15  # minutes of recent past to the left of t=0
+            past_ctx = min(past_context, past_window, y_start)
+            ctx_start = y_start - past_ctx
+            actual_prices = total_tensor[
+                ctx_start:y_end, price_feature_idx
+            ].cpu().numpy()
+            # t=0 is first future bar; past is negative minutes
+            time_steps = np.arange(-past_ctx, len(actual_prices) - past_ctx)
 
-            time_steps = np.arange(len(future_prices))
-            ax.plot(time_steps, future_prices, 'b-', linewidth=2, label='Actual prices', alpha=0.75)
+            # Slightly different colors for history vs future actuals
+            if past_ctx > 0:
+                # Include the t=0 point on both sides so the line connects
+                ax.plot(
+                    time_steps[: past_ctx + 1],
+                    actual_prices[: past_ctx + 1],
+                    color='#8AB4D4',  # softer blue — recent history
+                    linewidth=2,
+                    label='Actual (past)',
+                    alpha=0.75,
+                )
+            ax.plot(
+                time_steps[past_ctx:],
+                actual_prices[past_ctx:],
+                'b-',  # original matplotlib blue — future
+                linewidth=2,
+                label='Actual (future)',
+                alpha=0.75,
+            )
 
-            # Label trend
+            # Label trend (still defined on future t = 0..H-1)
             if h_lbl > 0:
                 t_lbl = np.arange(h_lbl)
                 ax.plot(
@@ -743,6 +767,7 @@ def visualize_linear_trends(
             else:
                 title_extra = ''
 
+            # Vertical marker at prediction start (t=0)
             ax.axvline(x=0, color='gray', linestyle=':', linewidth=1.2, alpha=0.5)
             if h_lbl > 0:
                 ax.axvspan(0, max(h_lbl - 1, 0), alpha=0.10, color='orange')
@@ -752,7 +777,7 @@ def visualize_linear_trends(
                 f'Sample {display_id}: label H={h_lbl}, m={m_lbl:.4f}, b={b_lbl:.2f}{title_extra}',
                 fontsize=9,
             )
-            ax.set_xlabel('Time (minutes)')
+            ax.set_xlabel('Time (min; gray line = t=0 future start)')
             ax.set_ylabel('Price')
             ax.grid(True, alpha=0.3)
             ax.legend(fontsize=7, loc='best')

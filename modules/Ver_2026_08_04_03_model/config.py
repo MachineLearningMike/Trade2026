@@ -77,7 +77,7 @@ config = {
     'use_binance_data': True,
     'binance_datatype': 'klines',
     'binance_interval': '1m',
-    'binance_start_date': '2026-01-01 00:00:00',
+    'binance_start_date': '2025-06-01 00:00:00',
     'binance_end_date': '2026-07-01 00:00:00',
     'binance_symbols': {
         "BTCUSDT": ["Close", "Volume"],
@@ -101,9 +101,9 @@ config = {
     # ============================================================
     # TRANSFORMER CONFIGURATION
     # ============================================================
-    'patch_size': 30,
+    'patch_size': 15,
     'embed_dim': None,  # AUTO-COMPUTED
-    'num_layers': 6,
+    'num_layers': 8,
     'num_heads': 6,
     'ff_dim_multiplier': 4,
     'dropout': 0.1,
@@ -143,8 +143,8 @@ config = {
     # ============================================================
     # LOSS WEIGHT CONFIGURATION
     # ============================================================
-    'slope_loss_weight': 30.0,
-    'intercept_loss_weight': 1.0,
+    'slope_loss_weight': 1.0,
+    'intercept_loss_weight': 10.0,
     'reconstruction_loss_weight': 0.01,
     'use_reconstruction': False,
 }

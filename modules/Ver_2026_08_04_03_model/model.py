@@ -566,7 +566,7 @@ class MarketTransformerWithHeads(nn.Module):
 # LOSS FUNCTION
 # ═══════════════════════════════════════════════════════════
 
-def custom_loss(P, X, Y, slope_weight=0.1, intercept_weight=0.01, recon_weight=0.01):
+def custom_loss(P, X, Y, slope_weight=0.1, intercept_weight=10, recon_weight=0.01):
     """
     Multi-output prediction loss with optional reconstruction term.
 
