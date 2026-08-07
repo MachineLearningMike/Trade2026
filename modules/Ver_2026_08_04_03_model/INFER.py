@@ -137,7 +137,7 @@ def _collate_batch(dataset, indices: List[int]):
         shapes.append(shape)
     return (
         torch.stack(xs),      # (B, T, F)
-        torch.stack(ys),      # (B, 3)
+        torch.stack(ys),      # (B, output_dim)
         torch.stack(means),   # (B, F)
         torch.stack(stds),    # (B, F)
         torch.stack(shapes),  # (B, num_shapes, F)
@@ -163,8 +163,8 @@ def run_inference_on_test_set(
         shape: (B, num_shapes, F)
 
     Returns:
-        preds:  (N, 3) denormalized predictions on `device`
-        labels: (N, 3) raw (denormalized) labels on `device`
+        preds:  (N, output_dim) denormalized predictions on `device`
+        labels: (N, output_dim) denormalized model targets on `device`
         used_indices: list of dataset indices that were evaluated
     """
     model.eval()
@@ -210,13 +210,13 @@ def run_inference_on_test_set(
             std = std.to(device, non_blocking=True)
             shape = shape.to(device, non_blocking=True)
 
-            pred_norm, _, _ = model(x, mean, std, shape)  # (B, 3) normalized
+            pred_norm, _, _ = model(x, mean, std, shape)  # (B, output_dim) normalized
 
             # Denormalize on CPU (dataset stats live on CPU)
             pred_denorm = torch.stack(
                 [dataset.denormalize_y(pred_norm[i].detach().cpu()) for i in range(pred_norm.shape[0])]
             )
-            # y from __getitem__ is already label-normalized → denormalize for metrics
+            # y from __getitem__ is model-target-normalized → denormalize for metrics
             y_denorm = torch.stack(
                 [dataset.denormalize_y(y[i]) for i in range(y.shape[0])]
             )
@@ -309,38 +309,84 @@ def run_test(
     )
     print(f"✓ Finished inference on {len(preds)} test samples", flush=True)
 
+    out_dim = preds.shape[-1]
     print("\n📊 Test Set Results:")
-    horizon_mse = torch.nn.functional.mse_loss(preds[:, 0], test_labels[:, 0]).item()
-    slope_mse = torch.nn.functional.mse_loss(preds[:, 1], test_labels[:, 1]).item()
-    intercept_mse = torch.nn.functional.mse_loss(preds[:, 2], test_labels[:, 2]).item()
-    print(f"  Horizon MSE:     {horizon_mse:.4f}")
-    print(f"  Slope MSE:       {slope_mse:.4f}")
-    print(f"  Intercept MSE:   {intercept_mse:.4f}")
+    metrics = {}
+    if out_dim == 3:
+        metrics['horizon_mse'] = torch.nn.functional.mse_loss(
+            preds[:, 0], test_labels[:, 0]
+        ).item()
+        metrics['slope_mse'] = torch.nn.functional.mse_loss(
+            preds[:, 1], test_labels[:, 1]
+        ).item()
+        metrics['intercept_mse'] = torch.nn.functional.mse_loss(
+            preds[:, 2], test_labels[:, 2]
+        ).item()
+        print(f"  Horizon MSE:     {metrics['horizon_mse']:.4f}")
+        print(f"  Slope MSE:       {metrics['slope_mse']:.4f}")
+        print(f"  Intercept MSE:   {metrics['intercept_mse']:.4f}")
+    elif out_dim == 2:
+        metrics['slope_mse'] = torch.nn.functional.mse_loss(
+            preds[:, 0], test_labels[:, 0]
+        ).item()
+        metrics['intercept_mse'] = torch.nn.functional.mse_loss(
+            preds[:, 1], test_labels[:, 1]
+        ).item()
+        print(f"  Slope MSE:       {metrics['slope_mse']:.4f}")
+        print(f"  Intercept MSE:   {metrics['intercept_mse']:.4f}")
+    else:
+        raise ValueError(f"Unexpected pred dim {out_dim}")
 
     print(f"\n📈 Sample Predictions (first 5):")
-    print(f"  {'Index':<6} {'True H':<8} {'Pred H':<8} {'True Slope':<12} {'Pred Slope':<12} "
-          f"{'True Intercept':<14} {'Pred Intercept':<14}")
-    print(f"  {'-'*6} {'-'*8} {'-'*8} {'-'*12} {'-'*12} {'-'*14} {'-'*14}")
-    for i in range(min(5, len(preds))):
+    if out_dim == 3:
         print(
-            f"  {i:<6} {test_labels[i, 0].item():<8.0f} {preds[i, 0].item():<8.0f} "
-            f"{test_labels[i, 1].item():<12.4f} {preds[i, 1].item():<12.4f} "
-            f"{test_labels[i, 2].item():<14.2f} {preds[i, 2].item():<14.2f}"
+            f"  {'Index':<6} {'True H':<8} {'Pred H':<8} {'True Slope':<12} {'Pred Slope':<12} "
+            f"{'True Intercept':<14} {'Pred Intercept':<14}"
         )
+        print(f"  {'-'*6} {'-'*8} {'-'*8} {'-'*12} {'-'*12} {'-'*14} {'-'*14}")
+        for i in range(min(5, len(preds))):
+            print(
+                f"  {i:<6} {test_labels[i, 0].item():<8.0f} {preds[i, 0].item():<8.0f} "
+                f"{test_labels[i, 1].item():<12.4f} {preds[i, 1].item():<12.4f} "
+                f"{test_labels[i, 2].item():<14.2f} {preds[i, 2].item():<14.2f}"
+            )
+    else:
+        print(
+            f"  {'Index':<6} {'True Slope':<12} {'Pred Slope':<12} "
+            f"{'True Intercept':<14} {'Pred Intercept':<14}"
+        )
+        print(f"  {'-'*6} {'-'*12} {'-'*12} {'-'*14} {'-'*14}")
+        for i in range(min(5, len(preds))):
+            print(
+                f"  {i:<6} {test_labels[i, 0].item():<12.4f} {preds[i, 0].item():<12.4f} "
+                f"{test_labels[i, 1].item():<14.2f} {preds[i, 1].item():<14.2f}"
+            )
 
     if visualize:
-        # Plot only the chosen test samples: actual prices + label trend + inferred trend.
-        # preds / test_labels are already denormalized to label_tensor (price-norm) space.
+        # Plot chosen test samples: actual prices + full label trend + inferred trend.
+        # Labels for viz always use full (h,m,b) from the cache so horizon is available
+        # even when the model only predicts (m, b).
         print("\n📈 Visualizing label vs inferred trends on chosen test samples...", flush=True)
         n_viz = len(used_indices)
         valid_starts = [dataset.valid_starts[i] for i in used_indices]
         raw_means = torch.stack([dataset.mean_tensor[i] for i in used_indices])
         raw_stds = torch.stack([dataset.std_tensor[i] for i in used_indices])
+        full_labels = torch.stack(
+            [dataset.label_tensor[i] for i in used_indices]
+        )
+
+        # When output_dim=2 the model does not predict horizon; draw the
+        # inferred (m, b) line out to max_horizon.
+        pred_horizon = int(
+            config.get('max_horizon')
+            if config.get('max_horizon') is not None
+            else getattr(dataset, 'max_horizon', dataset.future_window)
+        )
 
         visualize_linear_trends(
             total_tensor=dataset.Total,
             valid_starts=valid_starts,
-            label_tensor=test_labels.detach().cpu(),
+            label_tensor=full_labels,
             mean_tensor=raw_means,
             std_tensor=raw_stds,
             price_feature_idx=dataset.price_feature_idx,
@@ -351,6 +397,7 @@ def run_test(
             pred_tensor=preds.detach().cpu(),
             fixed_order=True,
             sample_ids=list(used_indices),
+            default_pred_horizon=pred_horizon,
         )
 
     print(f"\n✓ Inference complete!", flush=True)
@@ -359,11 +406,8 @@ def run_test(
         'preds': preds,
         'labels': test_labels,
         'used_indices': used_indices,
-        'metrics': {
-            'horizon_mse': horizon_mse,
-            'slope_mse': slope_mse,
-            'intercept_mse': intercept_mse,
-        },
+        'metrics': metrics,
+        'output_dim': out_dim,
         'checkpoint_path': checkpoint_path,
         'checkpoint_key': checkpoint_key,
     }

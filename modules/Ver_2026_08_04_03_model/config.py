@@ -114,7 +114,10 @@ config = {
     # HEAD CONFIGURATION
     # ============================================================
     'head_hidden_dim_multiplier': 4,
-    'output_dim': 3,  # horizon, slope, intercept
+    # Prediction target layout (labels always stored as h, m, b; model uses a slice):
+    #   3 → (horizon, slope, intercept)
+    #   2 → (slope, intercept)  — no horizon head / loss
+    'output_dim': 2,
     
     # ============================================================
     # TRAINING CONFIGURATION

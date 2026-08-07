@@ -30,6 +30,9 @@ from Binance import Binance
 # Kept as a module constant so older call sites / cache docs stay consistent.
 LABEL_FITNESS_THRESHOLD = 0.75
 
+# Full label layout in cache / label_tensor: (horizon, slope, intercept).
+LABEL_FULL_DIM = 3
+
 # Horizon search rules for find_linear_regime (free OLS, no f[0] anchor).
 HORIZON_SEARCH_LONGEST_LINEAR = 'longest_linear'
 HORIZON_SEARCH_SHORTEST_TO_THRESHOLD = 'shortest_to_threshold'
@@ -37,6 +40,28 @@ VALID_HORIZON_SEARCH_MODES = (
     HORIZON_SEARCH_LONGEST_LINEAR,
     HORIZON_SEARCH_SHORTEST_TO_THRESHOLD,
 )
+
+
+def label_target_slice(output_dim: int) -> slice:
+    """
+    Map model output_dim → slice into full (horizon, slope, intercept) labels.
+
+      3 → [horizon, slope, intercept]
+      2 → [slope, intercept]
+    """
+    if output_dim == 3:
+        return slice(0, 3)
+    if output_dim == 2:
+        return slice(1, 3)
+    raise ValueError(f"output_dim must be 2 or 3, got {output_dim}")
+
+
+def label_target_names(output_dim: int) -> Tuple[str, ...]:
+    if output_dim == 3:
+        return ('horizon', 'slope', 'intercept')
+    if output_dim == 2:
+        return ('slope', 'intercept')
+    raise ValueError(f"output_dim must be 2 or 3, got {output_dim}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -525,11 +550,31 @@ def find_power_regime(
 # VISUALIZATION FUNCTION
 # ═══════════════════════════════════════════════════════════
 
-def _trend_to_price_space(h_s_b, price_mean: float, price_std: float):
-    """Map (horizon, slope, intercept) from price-normalized space to price space."""
-    horizon = max(0, int(round(float(h_s_b[0].item() if hasattr(h_s_b[0], 'item') else h_s_b[0]))))
-    slope_norm = float(h_s_b[1].item() if hasattr(h_s_b[1], 'item') else h_s_b[1])
-    intercept_norm = float(h_s_b[2].item() if hasattr(h_s_b[2], 'item') else h_s_b[2])
+def _as_float(v) -> float:
+    return float(v.item() if hasattr(v, 'item') else v)
+
+
+def _trend_to_price_space(vec, price_mean: float, price_std: float, default_horizon: int = 0):
+    """
+    Map a trend vector from price-normalized space to price space.
+
+    Accepts:
+      len 3 → (horizon, slope, intercept)
+      len 2 → (slope, intercept); horizon = default_horizon
+    """
+    if hasattr(vec, 'detach'):
+        vec = vec.detach().cpu().flatten()
+    n = len(vec)
+    if n == 3:
+        horizon = max(0, int(round(_as_float(vec[0]))))
+        slope_norm = _as_float(vec[1])
+        intercept_norm = _as_float(vec[2])
+    elif n == 2:
+        horizon = max(0, int(default_horizon))
+        slope_norm = _as_float(vec[0])
+        intercept_norm = _as_float(vec[1])
+    else:
+        raise ValueError(f"Trend vector must have length 2 or 3, got {n}")
     if price_std == 0:
         price_std = 1.0
     slope = slope_norm * price_std
@@ -553,6 +598,7 @@ def visualize_linear_trends(
     pred_tensor: Optional[torch.Tensor] = None,
     fixed_order: bool = False,
     sample_ids: Optional[List[int]] = None,
+    default_pred_horizon: Optional[int] = None,
 ):
     """
     Visualize linear trends over future prices.
@@ -562,8 +608,10 @@ def visualize_linear_trends(
       - label linear trend (from label_tensor)
       - inferred linear trend (from pred_tensor), if provided
 
-    label_tensor / pred_tensor are in price-normalized (horizon, slope, intercept)
-    space — the same space as dataset.label_tensor / denormalize_y outputs.
+    label_tensor / pred_tensor are in price-normalized space:
+      len 3 → (horizon, slope, intercept)
+      len 2 → (slope, intercept); for preds, line length uses
+              default_pred_horizon (typically config max_horizon).
 
     When fixed_order=True, pages sequentially through the provided samples only
     (no random re-sampling). Otherwise interactive Next draws random batches.
@@ -670,9 +718,20 @@ def visualize_linear_trends(
                 )
                 ax.axvline(x=h_lbl - 1, color='red', linestyle='--', linewidth=1.3, alpha=0.65)
 
-            # Inferred trend
+            # Inferred trend: dim-2 preds (slope, intercept) have no horizon —
+            # use default_pred_horizon (max_horizon) for line length.
             if pred_tensor is not None:
-                h_prd, m_prd, b_prd = _trend_to_price_space(pred_tensor[idx], price_mean, price_std)
+                pred_h_default = (
+                    default_pred_horizon
+                    if default_pred_horizon is not None
+                    else future_window
+                )
+                h_prd, m_prd, b_prd = _trend_to_price_space(
+                    pred_tensor[idx],
+                    price_mean,
+                    price_std,
+                    default_horizon=pred_h_default,
+                )
                 if h_prd > 0:
                     t_prd = np.arange(h_prd)
                     ax.plot(
@@ -863,6 +922,12 @@ class TradingDataset(Dataset):
         self.fitness_threshold = float(
             config.get('fitness_threshold', LABEL_FITNESS_THRESHOLD)
         )
+        self.output_dim = int(config.get('output_dim', 3))
+        if self.output_dim not in (2, 3):
+            raise ValueError(
+                f"output_dim must be 2 or 3, got {self.output_dim}"
+            )
+        self._label_slice = label_target_slice(self.output_dim)
         self.horizon_mode = config.get('horizon_mode', 'floating')
         self.weight_type = config.get('weight_type', 'exponential')
         self.weight_decay = config.get('weight_decay', 0.9)
@@ -902,6 +967,10 @@ class TradingDataset(Dataset):
         self.label_tensor, self.mean_tensor, self.std_tensor, self.shape_tensor, self.stats = self._load_or_compute_labels()
         
         self._create_splits()
+
+        # Model-target stats (slice of full h,m,b stats).
+        self._label_stat_mean = self.stats['label']['mean'][self._label_slice]
+        self._label_stat_std = self.stats['label']['std'][self._label_slice]
         
         # Cache local references for faster __getitem__
         self._mean_tensor = self.mean_tensor
@@ -921,6 +990,7 @@ class TradingDataset(Dataset):
         print(f"  Step: {step}")
         print(f"  Horizon search: {self.horizon_search}")
         print(f"  Fitness threshold: {self.fitness_threshold}")
+        print(f"  Model output_dim: {self.output_dim} {label_target_names(self.output_dim)}")
         print(f"  Horizon viz mode: {self.horizon_mode}")
         if self.horizon_mode == 'weighted':
             print(f"  Weight type: {self.weight_type}, Decay: {self.weight_decay}")
@@ -933,6 +1003,13 @@ class TradingDataset(Dataset):
               f"Val: {self.split_ratios[1]:.2f}, Test: {self.split_ratios[2]:.2f}")
         print(f"  Split sizes - Train: {len(self.train_indices)}, "
               f"Val: {len(self.val_indices)}, Test: {len(self.test_indices)}")
+        print(f"\n📊 Dataset Statistics (training set, {len(self.train_indices)} samples):")
+        print(f"  Full label (horizon, slope, intercept):")
+        print(f"    Mean:  {self.stats['label']['mean'].tolist()}")
+        print(f"    Std:   {self.stats['label']['std'].tolist()}")
+        print(f"  Model target {label_target_names(self.output_dim)}:")
+        print(f"    Mean:  {self._label_stat_mean.tolist()}")
+        print(f"    Std:   {self._label_stat_std.tolist()}")
         
     def _stack_features(self, features: List[np.ndarray]) -> torch.Tensor:
         shapes = [arr.shape for arr in features]
@@ -1215,15 +1292,31 @@ class TradingDataset(Dataset):
         plt.show()
     
     def normalize_y(self, y: torch.Tensor) -> torch.Tensor:
-        y_normalized = (y - self.stats['label']['mean']) / (self.stats['label']['std'] + 1e-8)
-        return y_normalized
-    
+        """
+        Normalize a model-target label vector.
+
+        y must already be sliced to output_dim:
+          3 → (horizon, slope, intercept)
+          2 → (slope, intercept)
+        """
+        mean = self._label_stat_mean
+        std = self._label_stat_std
+        if y.shape[-1] != mean.shape[-1]:
+            raise ValueError(
+                f"y last dim {y.shape[-1]} != expected output_dim {mean.shape[-1]}"
+            )
+        return (y - mean.to(y.device)) / (std.to(y.device) + 1e-8)
+
     def denormalize_y(self, y: torch.Tensor) -> torch.Tensor:
+        """Inverse of normalize_y for model-target vectors (dim = output_dim)."""
         device = y.device
-        label_mean = self.stats['label']['mean'].to(device)
-        label_std = self.stats['label']['std'].to(device)
-        y_denormalized = y * label_std + label_mean
-        return y_denormalized
+        label_mean = self._label_stat_mean.to(device)
+        label_std = self._label_stat_std.to(device)
+        if y.shape[-1] != label_mean.shape[-1]:
+            raise ValueError(
+                f"y last dim {y.shape[-1]} != expected output_dim {label_mean.shape[-1]}"
+            )
+        return y * label_std + label_mean
     
     def clear_cache(self):
         if self.cache_file.exists():
@@ -1264,11 +1357,11 @@ class TradingDataset(Dataset):
             std = torch.ones(self._F)
             shape = torch.zeros(self.num_shapes, self._F)
         
-        # Get label
-        y = self._label_tensor[idx]
-        
+        # Full label cache is always (horizon, slope, intercept); slice for model.
+        y_full = self._label_tensor[idx]
+        y = y_full[self._label_slice]
+
         # Normalize label, mean, std, and shape using dataset statistics
-        # Label: (horizon, slope, intercept)
         y_normalized = self.normalize_y(y)
         
         # Mean: (F,)

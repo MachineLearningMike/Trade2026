@@ -163,7 +163,7 @@ def check_all_weights_updated(
     predictions, patch_map, recon = P
 
     if loss_fn is not None:
-        # Dummy targets for a real loss path (horizon, slope, intercept)
+        # Dummy targets matching prediction layout (2 or 3 dims)
         Y = torch.zeros(predictions.shape[0], predictions.shape[1], device=device)
         loss = loss_fn(P, x, Y)
     else:
@@ -228,19 +228,27 @@ def check_all_weights_updated(
 # ═══════════════════════════════════════════════════════════
 
 class PredictionHead(nn.Module):
-    """Prediction head for horizon, slope, and intercept."""
-    
+    """
+    Prediction head.
+
+    output_dim=3 → (horizon, slope, intercept)
+    output_dim=2 → (slope, intercept)
+    """
+
     def __init__(self, embed_dim: int, hidden_dim: int, output_dim: int = 3, dropout: float = 0.1):
         super().__init__()
+        if output_dim not in (2, 3):
+            raise ValueError(f"output_dim must be 2 or 3, got {output_dim}")
+        self.output_dim = output_dim
         self.fc1 = nn.Linear(embed_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, output_dim)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
-    
+
     def forward(self, x):
         x = self.relu(self.fc1(x))
         x = self.dropout(x)
-        return self.fc2(x)  # (B, 3) -> [horizon, slope, intercept]
+        return self.fc2(x)  # (B, output_dim)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -249,12 +257,15 @@ class PredictionHead(nn.Module):
 
 class MarketTransformerWithHeads(nn.Module):
     """
-    Transformer model with prediction heads for horizon, slope, intercept,
-    and optional reconstruction.
+    Transformer model with a prediction head for trend labels and optional
+    reconstruction.
 
-    Window statistics (mean / std / shape moments) are projected into a single
-    conditioning vector and added to every patch token so the transformer and
-    prediction head actually use them.
+    output_dim controls the head layout:
+      3 → (horizon, slope, intercept)
+      2 → (slope, intercept)
+
+    Window statistics (mean / std / shape moments) condition the decoder via
+    x_stat tokens.
     """
 
     def __init__(
@@ -276,6 +287,8 @@ class MarketTransformerWithHeads(nn.Module):
         num_shapes: int = 4,
     ):
         super().__init__()
+        if output_dim not in (2, 3):
+            raise ValueError(f"output_dim must be 2 or 3, got {output_dim}")
         self.patch_size = patch_size
         self.in_features = in_features
         self.n_market_features = n_market_features
@@ -284,6 +297,7 @@ class MarketTransformerWithHeads(nn.Module):
         self.causal = causal
         self.max_seq_len = max_seq_len
         self.use_reconstruction = use_reconstruction
+        self.output_dim = output_dim
         self.num_shapes = num_shapes
         # x_stat tokens: mean (1) + std (1) + shape moments (num_shapes)
         self.n_stat_tokens = 1 + 1 + num_shapes
@@ -340,7 +354,7 @@ class MarketTransformerWithHeads(nn.Module):
         # ---- Encoder–decoder: x patches as memory, x_stat tokens as tgt ----
         # memory = encoder(x)  → Key & Value for decoder cross-attn
         # tgt    = x_stat      → decoder self-attn; Query for cross-attn
-        # After decode: flatten (B, N_stat, D) → FFN → (B, 3)
+        # After decode: flatten (B, N_stat, D) → FFN → (B, output_dim)
         self.stat_token_proj = nn.Linear(F, embed_dim)
         self.stat_pos_embed = nn.Parameter(
             torch.zeros(1, self.n_stat_tokens, embed_dim)
@@ -362,7 +376,7 @@ class MarketTransformerWithHeads(nn.Module):
         self.decoder_norm = nn.LayerNorm(embed_dim)
 
         # ---- Prediction Head ----
-        # Flatten decoder tokens (B, N_stat, D) → (B, N_stat * D) then FFN → (B, 3)
+        # Flatten decoder tokens (B, N_stat, D) → (B, N_stat * D) then FFN → (B, output_dim)
         pred_in_dim = self.n_stat_tokens * embed_dim
         self.prediction_head = PredictionHead(
             embed_dim=pred_in_dim,
@@ -409,69 +423,6 @@ class MarketTransformerWithHeads(nn.Module):
 
         stats = torch.cat([mean_lat, std_lat, shape_lat], dim=-1)  # (B, 3L)
         return self.stats_norm(self.stats_to_embed(stats))         # (B, D)
-
-    # def forward(self, x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor, shape: torch.Tensor):
-    #     """
-    #     Args:
-    #         x:     (B, T, F) — window features. T must be divisible by patch_size.
-    #                 x = normalize(feature_window, stat(feature_window))
-    #         mean:  (B, F).  mean = normalize(mean_feature_window, stat({mean_feature_window | feature}) )
-    #         std:   (B, F).  std = normalize(std_feature_window, stat({std_feature_window | feature}) )
-    #                 NOTE: Do NOT multiply x with std or mean, as some of them are zero (nearly, at least)
-    #         shape: (B, num_shapes, F)
-    #     """
-    #     # ---- 0. Compress macro channels over time ----
-    #     x_market = x[:, : :self.n_market_features]
-    #     x_macro = x[:, :, self.n_market_features:]                 # (B, T, n_macro)
-    #     x_macro = self.latent_macro_transform_x(x_macro)           # (B, T, L)
-    #     x = torch.cat(
-    #         [x[:, :, :self.n_market_features], x_macro], dim=-1
-    #     )                                                          # (B, T, n_market + L)
-
-    #     # ---- 0b. Encode window stats for global conditioning ----
-    #     stats_embed = self._encode_stats(mean, std, shape)         # (B, D)
-
-    #     B, T, _ = x.shape
-    #     device = x.device
-    #     P = self.patch_size
-
-    #     assert T % P == 0, f"T ({T}) must be divisible by patch_size ({P})"
-    #     N = T // P
-
-    #     if N > self.max_seq_len:
-    #         raise ValueError(f"N ({N}) exceeds max_seq_len ({self.max_seq_len})")
-
-    #     # ---- 1. Patch Embedding ----
-    #     x = self.patch_embed(x)                                    # (B, N, D)
-
-    #     # ---- 2. Positional encoding + stats conditioning ----
-    #     x = x + self.pos_embed[:, :N, :]
-    #     x = x + stats_embed.unsqueeze(1)                           # broadcast to all patches
-
-    #     # ---- 3. Transformer ----
-    #     if self.causal:
-    #         if self.causal_mask is None or self.causal_mask.shape[0] != N:
-    #             self.causal_mask = self._create_causal_mask(N).to(device)
-    #         attn_mask = self.causal_mask
-    #     else:
-    #         attn_mask = None
-
-    #     x = self.transformer(x, mask=attn_mask)                    # (B, N, D)
-    #     patch_map = self.norm(x)                                   # (B, N, D)
-
-    #     # ---- 4. Aggregate for prediction (last patch; causal-friendly) ----
-    #     aggregated = patch_map[:, -1, :]                           # (B, D)
-
-    #     # ---- 5. Prediction Head ----
-    #     predictions = self.prediction_head(aggregated)             # (B, 3)
-
-    #     # ---- 6. Reconstruction (sequence only; no stats fusion) ----
-    #     if self.use_reconstruction:
-    #         recon = self.depatch(patch_map)                        # (B, T, F_in)
-    #     else:
-    #         recon = None
-
-    #     return predictions, patch_map, recon
 
     # ───────────────────────────────────────────────────────
     # forward2 helpers
@@ -600,7 +551,7 @@ class MarketTransformerWithHeads(nn.Module):
         # ---- 3. Flatten decoder tokens + FFN → (B, 3) ----
         B = dec_out.shape[0]
         flat = dec_out.reshape(B, n_stat * self.embed_dim)         # (B, N_stat * D)
-        predictions = self.prediction_head(flat)                   # (B, 3)
+        predictions = self.prediction_head(flat)                   # (B, output_dim)
 
         # ---- 4. Reconstruction from encoder map (optional) ----
         if self.use_reconstruction:
@@ -617,28 +568,45 @@ class MarketTransformerWithHeads(nn.Module):
 
 def custom_loss(P, X, Y, slope_weight=0.1, intercept_weight=0.01, recon_weight=0.01):
     """
-    Custom loss function for multi-output prediction with optional reconstruction loss.
+    Multi-output prediction loss with optional reconstruction term.
+
+    Prediction / target layout (last dim must match):
+      output_dim=3 → (horizon, slope, intercept)
+      output_dim=2 → (slope, intercept)  — no horizon term
     """
     predictions, patch_map, recon = P
-    
-    pred_horizon = predictions[:, 0]
-    pred_slope = predictions[:, 1]
-    pred_intercept = predictions[:, 2]
-    
-    true_horizon = Y[:, 0]
-    true_slope = Y[:, 1]
-    true_intercept = Y[:, 2]
-    
-    horizon_loss = nn.functional.mse_loss(pred_horizon, true_horizon)
-    slope_loss = nn.functional.mse_loss(pred_slope, true_slope)
-    intercept_loss = nn.functional.mse_loss(pred_intercept, true_intercept)
-    
-    pred_loss = horizon_loss + slope_weight * slope_loss + intercept_weight * intercept_loss
-    
+    out_dim = predictions.shape[-1]
+    if Y.shape[-1] != out_dim:
+        raise ValueError(
+            f"Target dim Y.shape[-1]={Y.shape[-1]} != predictions dim {out_dim}"
+        )
+
+    if out_dim == 3:
+        pred_horizon, pred_slope, pred_intercept = (
+            predictions[:, 0], predictions[:, 1], predictions[:, 2]
+        )
+        true_horizon, true_slope, true_intercept = Y[:, 0], Y[:, 1], Y[:, 2]
+        horizon_loss = nn.functional.mse_loss(pred_horizon, true_horizon)
+        slope_loss = nn.functional.mse_loss(pred_slope, true_slope)
+        intercept_loss = nn.functional.mse_loss(pred_intercept, true_intercept)
+        pred_loss = (
+            horizon_loss
+            + slope_weight * slope_loss
+            + intercept_weight * intercept_loss
+        )
+    elif out_dim == 2:
+        pred_slope, pred_intercept = predictions[:, 0], predictions[:, 1]
+        true_slope, true_intercept = Y[:, 0], Y[:, 1]
+        slope_loss = nn.functional.mse_loss(pred_slope, true_slope)
+        intercept_loss = nn.functional.mse_loss(pred_intercept, true_intercept)
+        pred_loss = slope_weight * slope_loss + intercept_weight * intercept_loss
+    else:
+        raise ValueError(f"Unsupported prediction dim {out_dim}; expected 2 or 3")
+
     if recon is not None:
         recon_loss = nn.functional.mse_loss(recon, X)
         return pred_loss + recon_weight * recon_loss
-    
+
     return pred_loss
 
 

@@ -623,7 +623,9 @@ def main(config):
     
     print(f"\nData shapes:")
     print(f"  Input x: (F={F}, past_window={past_window})")
-    print(f"  Output: (horizon, slope, intercept) - 3 values")
+    _od = config.get('output_dim', 3)
+    _onames = ('horizon', 'slope', 'intercept') if _od == 3 else ('slope', 'intercept')
+    print(f"  Output: {_onames} - { _od } values (config output_dim)")
     print(f"  Total samples: {len(dataset)}")
     print(f"  Train samples: {len(dataset.train_indices)}")
     print(f"  Val samples: {len(dataset.val_indices)}")
