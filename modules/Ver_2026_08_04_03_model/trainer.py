@@ -199,10 +199,11 @@ class TrainingState:
             # epoch is 0-based index of last trained epoch
             state_info['completed_epochs'] = int(epoch) + 1
 
-        # Persist per-minibatch curve for --loss (compact JSON, no indent).
-        # This used to use indent=2 and was also duplicated into training_state
-        # and the .pt file — at ~30k batches that alone could exceed train step time.
-        if latest_epoch_loss is not None:
+        # Persist per-minibatch curve for --loss ONLY on emergency / epoch-final
+        # saves. Rewriting a growing 10k–40k-point JSON on every periodic
+        # checkpoint made mid-epoch training feel suddenly slow (save blocked
+        # the train loop and grew with batch count).
+        if latest_epoch_loss is not None and (is_emergency or training_finished):
             try:
                 loss_path = self.save_dir / LATEST_EPOCH_LOSS_FILENAME
                 temp_loss = loss_path.with_suffix('.tmp')
@@ -1688,6 +1689,9 @@ class ResumableTrainer:
                 # bar is not interleaved/corrupted by print() output.
                 pbar.clear()
                 save_t0 = time.perf_counter()
+                # Periodic saves: weights + small state only. Do NOT call
+                # latest_epoch_loss.to_dict() here — serializing tens of
+                # thousands of points every N steps was a major mid-epoch stall.
                 self.state_manager.save_checkpoint(
                     model=model,
                     optimizer=optimizer,
@@ -1698,7 +1702,7 @@ class ResumableTrainer:
                     loss=avg_loss,
                     val_loss=self.current_val_loss,
                     history=self.history.to_dict(),
-                    latest_epoch_loss=self.latest_epoch_loss.to_dict(),
+                    latest_epoch_loss=None,
                     is_emergency=False,
                     training_finished=False,
                     embed_dim=getattr(self, 'embed_dim', None),
