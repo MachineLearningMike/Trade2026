@@ -648,6 +648,7 @@ def main(config):
         n_market_features=dataset.n_market_features,
         n_macro_features=dataset.n_macro_features,
         n_latent_macro_features=config['n_latent_macro_features'],
+        n_max_past_horizon=config['max_past_horizon'],
         patch_size=config['patch_size'],
         num_layers=config['num_layers'],
         num_heads=config['num_heads'],
@@ -667,10 +668,12 @@ def main(config):
     _probe_B = 2
     _probe_device = torch.device(config['device']) if config.get('device') else torch.device('cpu')
     model = model.to(_probe_device)
+    _probe_P = int(config.get('max_past_horizon') or 30)
     check_all_weights_updated(
         model,
         sample_batch=(
             torch.randn(_probe_B, _probe_T, F, device=_probe_device),
+            torch.randn(_probe_B, _probe_P, device=_probe_device),  # recent past p
             torch.randn(_probe_B, F, device=_probe_device),
             torch.randn(_probe_B, F, device=_probe_device).abs() + 1e-3,
             torch.randn(_probe_B, config.get('num_shapes', 4), F, device=_probe_device),

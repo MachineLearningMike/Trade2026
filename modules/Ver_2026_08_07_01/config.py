@@ -42,17 +42,19 @@ config = {
     'max_accum_deviation': 0.35,   # legacy alias; prefer fitness_threshold
     'min_horizon': 3,
     'max_horizon': 50,
+    # How far into recent past the joint linear regime may extend (bars).
+    # None → same as max_horizon. Past and future compete to grow the span.
+    'max_past_horizon': 30,
+    'regime_use_past': True,
     # Dimensionless fitness: sum(|residual|) / history_sigma
     'fitness_threshold': 0.75,
 
     # ============================================================
     # HORIZON SEARCH RULE
     # ============================================================
-    # Free (unanchored) OLS always. Choose how the threshold is applied:
-    #   'longest_linear'         - grow h while fitness <= threshold; keep last good
-    #                              (default: longest approximately linear regime)
-    #   'shortest_to_threshold'  - return first h where fitness >= threshold
-    #                              (deviation budget exhausted)
+    # Free (unanchored) OLS on joint [recent past ‖ nearest future].
+    #   'longest_linear'         - grow while fitness <= threshold; keep last good
+    #   'shortest_to_threshold'  - first window where fitness >= threshold
     'horizon_search': 'longest_linear',
 
     # ============================================================
@@ -130,7 +132,7 @@ config = {
     # ============================================================
     'epochs': 200,
     'batch_size': 8,
-    'learning_rate': 0.00003,
+    'learning_rate': 0.00002,
     'save_every_n_minibatches': 5000,
     'checkpoint_dir': 'trading_checkpoints',
     'max_checkpoints': 3,

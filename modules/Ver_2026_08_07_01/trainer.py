@@ -1007,14 +1007,14 @@ class ResumableTrainer:
                 if batch is None:
                     break
                 
-                x, y, mean, std, shape = batch
+                x, p, mean, std, shape, y = batch
                 x = x.to(self.device, non_blocking=True)
                 y = y.to(self.device, non_blocking=True)
                 mean = mean.to(self.device, non_blocking=True)
                 std = std.to(self.device, non_blocking=True)
                 shape = shape.to(self.device, non_blocking=True)
                 
-                P = self.model(x, mean, std, shape)
+                P = self.model(x, p, mean, std, shape)
                 L = self.loss_fn(P, x, y)
                 
                 total_loss += L.item()
@@ -1626,8 +1626,8 @@ class ResumableTrainer:
                         
             compute_start = time.perf_counter()
             
-            x, y, mean, std, shape = batch   # All normalized and ready for model input
-            # x: (batch_size, F, T), y: (batch_size, output_dim), mean: (batch_size, F, 1), std: (batch_size, F, 1), shape: (batch_size, F, 4)
+            x, p, mean, std, shape, y = batch   # All normalized and ready for model input
+            # x: (B, F, T), p: (B, max_past_horizon), mean: (B, F, 1), std: (B, F, 1), shape: (B, F, 4), y: (B, output_dim)
             
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -1636,7 +1636,7 @@ class ResumableTrainer:
             shape = shape.to(device, non_blocking=True)
             
             optimizer.zero_grad()
-            P = model(x, mean, std, shape)
+            P = model(x, p, mean, std, shape)
             L = loss_fn(P, x, y)
             L.backward()
             optimizer.step()
@@ -1748,7 +1748,7 @@ if __name__ == "__main__":
         def __init__(self, input_dim, output_dim):
             super().__init__()
             self.fc = nn.Linear(input_dim, output_dim)
-        def forward(self, x, mean=None, std=None, shape=None):
+        def forward(self, x, p=None, mean=None, std=None, shape=None):
             if x.dim() == 3:
                 x = x.reshape(x.size(0), -1)
             return self.fc(x)

@@ -101,11 +101,17 @@ def load_model(
         max_seq_len = past_window // config['patch_size']
 
     F = dataset.F
+    n_max_past = int(
+        config.get('max_past_horizon')
+        or getattr(dataset, 'max_past_horizon', None)
+        or 30
+    )
     model = MarketTransformerWithHeads(
         in_features=F,
         n_market_features=dataset.n_market_features,
         n_macro_features=dataset.n_macro_features,
         n_latent_macro_features=config['n_latent_macro_features'],
+        n_max_past_horizon=n_max_past,
         patch_size=config['patch_size'],
         num_layers=config['num_layers'],
         num_heads=config['num_heads'],
@@ -127,16 +133,24 @@ def load_model(
 
 def _collate_batch(dataset, indices: List[int]):
     """Load a small batch of samples from the dataset (CPU tensors)."""
-    xs, ys, means, stds, shapes = [], [], [], [], []
+    xs, ps, ys, means, stds, shapes = [], [], [], [], [], []
     for idx in indices:
-        x, y, mean, std, shape = dataset[idx]
+        sample = dataset[idx]
+        if len(sample) == 6:
+            x, p, mean, std, shape, y = sample
+        else:
+            x, y, mean, std, shape = sample
+            n_p = int(getattr(dataset, 'max_past_horizon', None) or 0)
+            p = x[-n_p:, getattr(dataset, 'price_feature_idx', 0)] if n_p else x.new_zeros(0)
         xs.append(x)
+        ps.append(p)
         ys.append(y)
         means.append(mean)
         stds.append(std)
         shapes.append(shape)
     return (
         torch.stack(xs),      # (B, T, F)
+        torch.stack(ps),      # (B, max_past_horizon)
         torch.stack(ys),      # (B, output_dim)
         torch.stack(means),   # (B, F)
         torch.stack(stds),    # (B, F)
@@ -158,6 +172,7 @@ def run_inference_on_test_set(
 
     model.forward expects:
         x:     (B, T, F)
+        p:     (B, max_past_horizon) recent past prices
         mean:  (B, F)
         std:   (B, F)
         shape: (B, num_shapes, F)
@@ -203,14 +218,15 @@ def run_inference_on_test_set(
             end = min(start + batch_size, n)
             batch_idx = test_indices[start:end]
 
-            x, y, mean, std, shape = _collate_batch(dataset, batch_idx)
-            # Shapes into model: x (B,T,F), mean/std (B,F), shape (B,S,F)
+            x, p, y, mean, std, shape = _collate_batch(dataset, batch_idx)
+            # Shapes into model: x (B,T,F), p (B,P), mean/std (B,F), shape (B,S,F)
             x = x.to(device, non_blocking=True)
+            p = p.to(device, non_blocking=True)
             mean = mean.to(device, non_blocking=True)
             std = std.to(device, non_blocking=True)
             shape = shape.to(device, non_blocking=True)
 
-            pred_norm, _, _ = model(x, mean, std, shape)  # (B, output_dim) normalized
+            pred_norm, _, _ = model(x, p, mean, std, shape)  # (B, output_dim) normalized
 
             # Denormalize on CPU (dataset stats live on CPU)
             pred_denorm = torch.stack(
@@ -228,7 +244,7 @@ def run_inference_on_test_set(
                 print(f"  Inference batch {b + 1}/{n_batches}  ({end}/{n} samples)", flush=True)
 
             # Free GPU tensors early
-            del x, mean, std, shape, pred_norm
+            del x, p, mean, std, shape, pred_norm
 
     preds = torch.cat(pred_chunks, dim=0).to(device)
     labels = torch.cat(label_chunks, dim=0).to(device)
@@ -398,6 +414,21 @@ def run_test(
             fixed_order=True,
             sample_ids=list(used_indices),
             default_pred_horizon=pred_horizon,
+            min_horizon=config.get('min_horizon', getattr(dataset, 'min_horizon', 3)),
+            max_horizon=config.get('max_horizon', getattr(dataset, 'max_horizon', None)),
+            max_past_horizon=config.get(
+                'max_past_horizon', getattr(dataset, 'max_past_horizon', None)
+            ),
+            fitness_threshold=config.get(
+                'fitness_threshold', getattr(dataset, 'fitness_threshold', 0.75)
+            ),
+            horizon_search=config.get(
+                'horizon_search', getattr(dataset, 'horizon_search', 'longest_linear')
+            ),
+            regime_use_past=config.get(
+                'regime_use_past', getattr(dataset, 'regime_use_past', True)
+            ),
+            normalize_prices=config.get('normalize', getattr(dataset, 'normalize', True)),
         )
 
     print(f"\n✓ Inference complete!", flush=True)

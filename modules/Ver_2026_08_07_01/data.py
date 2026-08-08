@@ -216,6 +216,8 @@ def generate_dataset_signature(config: dict) -> str:
         # --- label algorithm ---
         'min_horizon': config.get('min_horizon', 3),
         'max_horizon': max_horizon,
+        'max_past_horizon': config.get('max_past_horizon', max_horizon),
+        'regime_use_past': config.get('regime_use_past', True),
         'fitness_threshold': config.get('fitness_threshold', LABEL_FITNESS_THRESHOLD),
         'horizon_search': config.get('horizon_search', HORIZON_SEARCH_LONGEST_LINEAR),
         'normalize': config.get('normalize', True),
@@ -305,30 +307,68 @@ def generate_synthetic_data(T: int, F: int, price_feature_idx: int = 0):
 # HORIZON LABELING FUNCTION - SUPPORTS ALL MODES
 # ═══════════════════════════════════════════════════════════
 
-def _ols_fit_segment(y: torch.Tensor, eps: float = 1e-8):
+def _ols_fit_segment(
+    y: torch.Tensor,
+    t: Optional[torch.Tensor] = None,
+    eps: float = 1e-8,
+):
     """
-    Free (unanchored) OLS fit of y on t = 0..h-1.
+    Free (unanchored) OLS fit of y on time coordinates t.
+
+    If t is None, uses t = 0..h-1. Prefer t measured relative to the
+    past/future boundary (past negative, future non-negative) so intercept
+    is the level at the decision time t=0.
 
     Returns:
-        slope, intercept, fitness_l1  where fitness_l1 = sum(|y - ŷ|)
+        slope, intercept, residual_l1  where residual_l1 = sum(|y - ŷ|)
         (caller may divide by a scale to make fitness dimensionless).
     """
     device = y.device
     dtype = y.dtype
     h = y.shape[0]
-    x = torch.arange(h, device=device, dtype=dtype)
-    x_mean = x.mean()
+    if t is None:
+        t = torch.arange(h, device=device, dtype=dtype)
+    else:
+        t = t.to(device=device, dtype=dtype)
+    t_mean = t.mean()
     y_mean = y.mean()
-    dx = x - x_mean
-    denom = torch.sum(dx * dx)
+    dt = t - t_mean
+    denom = torch.sum(dt * dt)
     if denom < eps:
         slope = torch.zeros((), device=device, dtype=dtype)
         intercept = y_mean
     else:
-        slope = torch.sum(dx * (y - y_mean)) / denom
-        intercept = y_mean - slope * x_mean
-    residual_l1 = torch.sum(torch.abs(y - (slope * x + intercept)))
+        slope = torch.sum(dt * (y - y_mean)) / denom
+        intercept = y_mean - slope * t_mean
+    residual_l1 = torch.sum(torch.abs(y - (slope * t + intercept)))
     return slope, intercept, residual_l1
+
+
+def _regime_segment(history: torch.Tensor, future: torch.Tensor, h_past: int, h_fut: int):
+    """
+    Build (y, t) for a joint past+future window.
+
+    t is relative to the first future bar (t=0):
+      past  → t = -h_past, ..., -1
+      future → t = 0, ..., h_fut-1
+    """
+    device = future.device
+    dtype = future.dtype
+    parts_y = []
+    parts_t = []
+    if h_past > 0:
+        parts_y.append(history[-h_past:].to(device=device, dtype=dtype))
+        parts_t.append(
+            torch.arange(-h_past, 0, device=device, dtype=dtype)
+        )
+    if h_fut > 0:
+        parts_y.append(future[:h_fut].to(device=device, dtype=dtype))
+        parts_t.append(
+            torch.arange(0, h_fut, device=device, dtype=dtype)
+        )
+    y = torch.cat(parts_y, dim=0)
+    t = torch.cat(parts_t, dim=0)
+    return y, t
 
 
 def find_linear_regime(
@@ -338,41 +378,44 @@ def find_linear_regime(
     max_horizon=30,
     fitness_threshold=1.0,
     mode=HORIZON_SEARCH_LONGEST_LINEAR,
+    max_past_horizon=None,
+    use_past=True,
 ):
     """
-    Free OLS linear-regime search over future prices (not anchored through f[0]).
+    Free OLS linear-regime search spanning recent past and nearest future.
+
+    Time origin t=0 is the first future bar. The search window is
+        history[-h_past:]  ‖  future[:h_fut]
+    with times t ∈ {-h_past,...,-1, 0,...,h_fut-1}.
+
+    Recent past and nearest future **compete** to grow the regime:
+    at each step try +1 past and/or +1 future; pick the expansion that
+    best preserves linearity (lowest fitness) while respecting the mode.
 
     Fitness is dimensionless cumulative L1 residual:
-        fitness(h) = sum_t |y_t - ŷ_t| / history_sigma
-    where ŷ is the free OLS line on t = 0..h-1 and
+        fitness = sum |y - ŷ| / history_sigma
     history_sigma = std(history) (clamped).
 
     Search modes (config key ``horizon_search``):
         'longest_linear' (default)
-            Grow h while fitness(h) <= fitness_threshold.
-            Return the last admissible (h, m, b). If even min_horizon
-            fails the threshold, still return the OLS fit at min_horizon.
-
+            Grow total span while fitness <= threshold.
+            Label horizon = h_fut at the last admissible window.
         'shortest_to_threshold'
-            Return the first h where fitness(h) >= fitness_threshold
-            (deviation budget exhausted). If the threshold is never
-            reached, return the OLS fit at max_horizon.
+            Grow until fitness >= threshold (budget exhausted).
+            Label horizon = h_fut at that window (or max if never reached).
 
     Args:
         future : Tensor (future_window,)
-            Future prices (prefer same scale as history; typically z-scored).
-        history : Tensor (history_window,)
-            Past prices used only for residual scale (std).
-        min_horizon, max_horizon : int
-        fitness_threshold : float
-            Threshold on dimensionless fitness.
-        mode : str
-            'longest_linear' or 'shortest_to_threshold'.
+        history : Tensor (history_window,)  — past prices (scale + optional past span)
+        min_horizon, max_horizon : int  — bounds on **future** extent h_fut
+        max_past_horizon : optional max bars of past (default = max_horizon)
+        use_past : if False, future-only search (legacy behavior)
+        fitness_threshold, mode : as above
 
     Returns:
-        horizon : int
-        slope : Tensor (0-d)
-        intercept : Tensor (0-d)
+        horizon : int   — future extent h_fut of the chosen regime
+        slope, intercept : Tensor (0-d)  — joint OLS on past+future window
+        h_past : int    — recent-past extent included in the joint fit
     """
     if mode not in VALID_HORIZON_SEARCH_MODES:
         raise ValueError(
@@ -384,40 +427,106 @@ def find_linear_regime(
     dtype = future.dtype
     eps = 1e-8
 
+    history = history.to(device=device, dtype=dtype)
+    future = future.to(device=device, dtype=dtype)
+
     max_horizon = min(int(max_horizon), int(future.shape[0]))
     min_horizon = max(2, int(min_horizon))
     if min_horizon > max_horizon:
         min_horizon = max_horizon
 
-    history_sigma = history.to(device=device, dtype=dtype).std().clamp(min=eps)
+    if max_past_horizon is None:
+        max_past_horizon = max_horizon
+    max_past_horizon = min(int(max_past_horizon), int(history.shape[0]))
+    if not use_past:
+        max_past_horizon = 0
 
-    best_h = min_horizon
-    best_slope = torch.zeros((), device=device, dtype=dtype)
-    best_intercept = torch.zeros((), device=device, dtype=dtype)
-    have_fit = False
+    history_sigma = history.std().clamp(min=eps)
 
-    for h in range(min_horizon, max_horizon + 1):
-        slope, intercept, residual_l1 = _ols_fit_segment(future[:h], eps=eps)
+    def _eval(h_past: int, h_fut: int):
+        y, t = _regime_segment(history, future, h_past, h_fut)
+        slope, intercept, residual_l1 = _ols_fit_segment(y, t=t, eps=eps)
         fitness = residual_l1 / history_sigma
+        return slope, intercept, fitness
 
-        if mode == HORIZON_SEARCH_LONGEST_LINEAR:
-            # Keep lengthening while still "linear enough".
-            if fitness <= fitness_threshold:
-                best_h, best_slope, best_intercept = h, slope, intercept
-                have_fit = True
-            else:
-                # First failure: keep last good fit, or min_horizon fit if none.
-                if not have_fit:
-                    best_h, best_slope, best_intercept = h, slope, intercept
+    # Seed: min_horizon future bars at the boundary (past empty).
+    h_past, h_fut = 0, min_horizon
+    slope, intercept, fitness = _eval(h_past, h_fut)
+    best_h_fut = h_fut
+    best_h_past = h_past
+    best_slope, best_intercept = slope, intercept
+    best_total = h_past + h_fut
+
+    if mode == HORIZON_SEARCH_LONGEST_LINEAR:
+        # Accept seed even if slightly over threshold (fallback).
+        admissible = fitness <= fitness_threshold
+        if admissible:
+            best_h_fut, best_h_past = h_fut, h_past
+            best_slope, best_intercept = slope, intercept
+            best_total = h_past + h_fut
+
+        while True:
+            candidates = []
+            if h_fut < max_horizon:
+                candidates.append((h_past, h_fut + 1))
+            if h_past < max_past_horizon:
+                candidates.append((h_past + 1, h_fut))
+            if not candidates:
                 break
-        else:
-            # shortest_to_threshold: first h that exhausts the deviation budget.
-            best_h, best_slope, best_intercept = h, slope, intercept
-            have_fit = True
+
+            # Compete: only expansions that stay under threshold;
+            # prefer lower fitness, then larger total span.
+            valid = []
+            for hp, hf in candidates:
+                s, b, fit = _eval(hp, hf)
+                if fit <= fitness_threshold:
+                    valid.append((fit, -(hp + hf), hp, hf, s, b))
+
+            if not valid:
+                # No legal expansion — keep last good (or seed if never good).
+                if not admissible:
+                    best_h_fut, best_h_past = h_fut, h_past
+                    best_slope, best_intercept = slope, intercept
+                break
+
+            valid.sort()  # lowest fitness, then largest total (via -total)
+            fit, neg_tot, hp, hf, s, b = valid[0]
+            h_past, h_fut = hp, hf
+            slope, intercept, fitness = s, b, fit
+            admissible = True
+            total = h_past + h_fut
+            if total >= best_total:
+                best_total = total
+                best_h_fut, best_h_past = h_fut, h_past
+                best_slope, best_intercept = slope, intercept
+
+    else:
+        # shortest_to_threshold: grow until budget exhausted.
+        best_h_past = h_past
+        while fitness < fitness_threshold:
+            candidates = []
+            if h_fut < max_horizon:
+                candidates.append((h_past, h_fut + 1))
+            if h_past < max_past_horizon:
+                candidates.append((h_past + 1, h_fut))
+            if not candidates:
+                break
+
+            # Compete: pick expansion with lower fitness (stay linear longer).
+            scored = []
+            for hp, hf in candidates:
+                s, b, fit = _eval(hp, hf)
+                scored.append((fit, hp, hf, s, b))
+            scored.sort()
+            fit, hp, hf, s, b = scored[0]
+            h_past, h_fut = hp, hf
+            slope, intercept, fitness = s, b, fit
+            best_h_fut, best_h_past = h_fut, h_past
+            best_slope, best_intercept = slope, intercept
             if fitness >= fitness_threshold:
                 break
 
-    return best_h, best_slope, best_intercept
+    return best_h_fut, best_slope, best_intercept, best_h_past
 
 
 def find_power_regime(
@@ -600,19 +709,29 @@ def visualize_linear_trends(
     fixed_order: bool = False,
     sample_ids: Optional[List[int]] = None,
     default_pred_horizon: Optional[int] = None,
+    # Regime search params (to recover h_past for label drawing)
+    min_horizon: int = 3,
+    max_horizon: Optional[int] = None,
+    max_past_horizon: Optional[int] = None,
+    fitness_threshold: float = LABEL_FITNESS_THRESHOLD,
+    horizon_search: str = HORIZON_SEARCH_LONGEST_LINEAR,
+    regime_use_past: bool = True,
+    normalize_prices: bool = True,
 ):
     """
-    Visualize linear trends over future prices.
+    Visualize joint past+future linear regimes.
 
     Plots for each panel:
-      - actual future prices
-      - label linear trend (from label_tensor)
-      - inferred linear trend (from pred_tensor), if provided
+      - actual prices (recent past + full future)
+      - label regime line on t ∈ [-h_past, h_fut)  (joint OLS; t=0 = first future)
+      - inferred trend (from pred_tensor), if provided — future span only
 
     label_tensor / pred_tensor are in price-normalized space:
       len 3 → (horizon, slope, intercept)
-      len 2 → (slope, intercept); for preds, line length uses
-              default_pred_horizon (typically config max_horizon).
+      len 2 → (slope, intercept); preds use default_pred_horizon for length.
+
+    h_past is recomputed via find_linear_regime so the red line matches the
+    competitive past/future labeling rule.
 
     When fixed_order=True, pages sequentially through the provided samples only
     (no random re-sampling). Otherwise interactive Next draws random batches.
@@ -687,6 +806,8 @@ def visualize_linear_trends(
             ax.clear()
             ax.set_visible(True)
 
+        max_h = int(max_horizon) if max_horizon is not None else int(future_window)
+
         for i, idx in enumerate(indices):
             if i >= len(axes):
                 break
@@ -700,27 +821,54 @@ def visualize_linear_trends(
             if price_std == 0:
                 price_std = 1.0
 
-            h_lbl, m_lbl, b_lbl = _trend_to_price_space(label_tensor[idx], price_mean, price_std)
+            h_lbl, m_lbl, b_lbl = _trend_to_price_space(
+                label_tensor[idx], price_mean, price_std
+            )
 
             y_start = start + past_window
             y_end = y_start + future_window
-            # Total is (T, F). Extend actual prices left into recent past for context.
-            past_context = 15  # minutes of recent past to the left of t=0
+            history_prices = total_tensor[
+                start:y_start, price_feature_idx
+            ].float()
+            future_prices = total_tensor[
+                y_start:y_end, price_feature_idx
+            ].float()
+
+            # Recover h_past (and confirm joint fit) with the same labeling rule.
+            if normalize_prices:
+                hist_n = (history_prices - price_mean) / price_std
+                fut_n = (future_prices - price_mean) / price_std
+            else:
+                hist_n, fut_n = history_prices, future_prices
+            try:
+                _, _, _, h_past_lbl = find_linear_regime(
+                    fut_n,
+                    hist_n,
+                    min_horizon=min_horizon,
+                    max_horizon=max_h,
+                    fitness_threshold=fitness_threshold,
+                    mode=horizon_search,
+                    max_past_horizon=max_past_horizon,
+                    use_past=regime_use_past,
+                )
+                h_past_lbl = int(h_past_lbl)
+            except Exception:
+                h_past_lbl = 0
+
+            # Actual prices: enough past to cover regime past (min 15 for context).
+            past_context = max(15, h_past_lbl)
             past_ctx = min(past_context, past_window, y_start)
             ctx_start = y_start - past_ctx
             actual_prices = total_tensor[
                 ctx_start:y_end, price_feature_idx
             ].cpu().numpy()
-            # t=0 is first future bar; past is negative minutes
             time_steps = np.arange(-past_ctx, len(actual_prices) - past_ctx)
 
-            # Slightly different colors for history vs future actuals
             if past_ctx > 0:
-                # Include the t=0 point on both sides so the line connects
                 ax.plot(
                     time_steps[: past_ctx + 1],
                     actual_prices[: past_ctx + 1],
-                    color='#8AB4D4',  # softer blue — recent history
+                    color='#8AB4D4',
                     linewidth=2,
                     label='Actual (past)',
                     alpha=0.75,
@@ -728,28 +876,56 @@ def visualize_linear_trends(
             ax.plot(
                 time_steps[past_ctx:],
                 actual_prices[past_ctx:],
-                'b-',  # original matplotlib blue — future
+                'b-',
                 linewidth=2,
                 label='Actual (future)',
                 alpha=0.75,
             )
 
-            # Label trend (still defined on future t = 0..H-1)
-            if h_lbl > 0:
-                t_lbl = np.arange(h_lbl)
-                ax.plot(
-                    t_lbl, m_lbl * t_lbl + b_lbl, 'r-', linewidth=2.5,
-                    label=f'Label: H={h_lbl}, m={m_lbl:.4f}, b={b_lbl:.2f}',
-                )
-                ax.axvline(x=h_lbl - 1, color='red', linestyle='--', linewidth=1.3, alpha=0.65)
+            # Label joint regime: t = -h_past .. h_fut-1 (intercept at t=0)
+            if h_lbl > 0 or h_past_lbl > 0:
+                t0 = -h_past_lbl
+                t1 = max(h_lbl, 1)
+                t_lbl = np.arange(t0, t1)
+                if len(t_lbl) > 0:
+                    ax.plot(
+                        t_lbl,
+                        m_lbl * t_lbl + b_lbl,
+                        'r-',
+                        linewidth=2.5,
+                        label=(
+                            f'Label regime: past={h_past_lbl}, H={h_lbl}, '
+                            f'm={m_lbl:.4f}, b={b_lbl:.2f}'
+                        ),
+                    )
+                if h_past_lbl > 0:
+                    ax.axvline(
+                        x=-h_past_lbl, color='red', linestyle=':',
+                        linewidth=1.2, alpha=0.65,
+                    )
+                if h_lbl > 0:
+                    ax.axvline(
+                        x=h_lbl - 1, color='red', linestyle='--',
+                        linewidth=1.3, alpha=0.65,
+                    )
+                # Regime bands: slightly different tint for past vs future (match price split)
+                if h_past_lbl > 0:
+                    ax.axvspan(
+                        -h_past_lbl, 0,
+                        alpha=0.12, color='#B8D4E8',  # soft blue — past regime
+                    )
+                if h_lbl > 0:
+                    ax.axvspan(
+                        0, max(h_lbl - 1, 0),
+                        alpha=0.12, color='#FFCC80',  # soft orange — future regime
+                    )
 
-            # Inferred trend: dim-2 preds (slope, intercept) have no horizon —
-            # use default_pred_horizon (max_horizon) for line length.
+            # Inferred trend (model): future side only; t=0..H-1
             if pred_tensor is not None:
                 pred_h_default = (
                     default_pred_horizon
                     if default_pred_horizon is not None
-                    else future_window
+                    else max_h
                 )
                 h_prd, m_prd, b_prd = _trend_to_price_space(
                     pred_tensor[idx],
@@ -763,22 +939,28 @@ def visualize_linear_trends(
                         t_prd, m_prd * t_prd + b_prd, 'g-', linewidth=2.5,
                         label=f'Inferred: H={h_prd}, m={m_prd:.4f}, b={b_prd:.2f}',
                     )
-                    ax.axvline(x=h_prd - 1, color='green', linestyle='--', linewidth=1.3, alpha=0.65)
-                title_extra = f' | pred H={h_prd}'
+                    ax.axvline(
+                        x=h_prd - 1, color='green', linestyle='--',
+                        linewidth=1.3, alpha=0.65,
+                    )
+                title_line2 = (
+                    f'pred H={h_prd}, m={m_prd:.4f}, b={b_prd:.2f}'
+                )
             else:
-                title_extra = ''
+                title_line2 = None
 
-            # Vertical marker at prediction start (t=0)
             ax.axvline(x=0, color='gray', linestyle=':', linewidth=1.2, alpha=0.5)
-            if h_lbl > 0:
-                ax.axvspan(0, max(h_lbl - 1, 0), alpha=0.10, color='orange')
 
             display_id = sample_ids[idx] if sample_ids is not None else idx
+            title_line1 = (
+                f'Sample {display_id}: past={h_past_lbl}, H={h_lbl}, '
+                f'm={m_lbl:.4f}, b={b_lbl:.2f}'
+            )
             ax.set_title(
-                f'Sample {display_id}: label H={h_lbl}, m={m_lbl:.4f}, b={b_lbl:.2f}{title_extra}',
+                title_line1 if title_line2 is None else f'{title_line1}\n{title_line2}',
                 fontsize=9,
             )
-            ax.set_xlabel('Time (min; gray line = t=0 future start)')
+            ax.set_xlabel('Time (min; t=0 = first future bar)')
             ax.set_ylabel('Price')
             ax.grid(True, alpha=0.3)
             ax.legend(fontsize=7, loc='best')
@@ -790,12 +972,19 @@ def visualize_linear_trends(
         page_label = f'Page {page_num[0]}'
         if fixed_order and n_pages is not None:
             page_label = f'Page {page_num[0]}/{n_pages}'
-        has_pred = '  |  red=label  green=inferred' if pred_tensor is not None else ''
-        order_note = '  |  chosen samples only' if fixed_order else ''
+        line1 = f'Linear Regime Visualization — Mode: {mode.upper()}  |  {page_label}'
+        line2_parts = []
+        if regime_use_past:
+            line2_parts.append('past+future compete')
+        if pred_tensor is not None:
+            line2_parts.append('red=label regime  green=inferred')
+        if fixed_order:
+            line2_parts.append('chosen samples only')
+        if interactive:
+            line2_parts.append('[Next] / [Quit]')
+        line2 = '  |  '.join(line2_parts) if line2_parts else ''
         fig.suptitle(
-            f'Linear Trend Visualization — Mode: {mode.upper()}  |  {page_label}'
-            f'{has_pred}{order_note}'
-            + ('  |  [Next] / [Quit]' if interactive else ''),
+            line1 if not line2 else f'{line1}\n{line2}',
             fontsize=12,
             fontweight='bold',
         )
@@ -948,6 +1137,9 @@ class TradingDataset(Dataset):
         self.fitness_threshold = float(
             config.get('fitness_threshold', LABEL_FITNESS_THRESHOLD)
         )
+        self.regime_use_past = bool(config.get('regime_use_past', True))
+        mph = config.get('max_past_horizon', None)
+        self.max_past_horizon = None if mph is None else int(mph)
         self.output_dim = int(config.get('output_dim', 3))
         if self.output_dim not in (2, 3):
             raise ValueError(
@@ -1016,6 +1208,8 @@ class TradingDataset(Dataset):
         print(f"  Step: {step}")
         print(f"  Horizon search: {self.horizon_search}")
         print(f"  Fitness threshold: {self.fitness_threshold}")
+        print(f"  Regime use past: {self.regime_use_past} "
+              f"(max_past_horizon={self.max_past_horizon})")
         print(f"  Model output_dim: {self.output_dim} {label_target_names(self.output_dim)}")
         print(f"  Horizon viz mode: {self.horizon_mode}")
         if self.horizon_mode == 'weighted':
@@ -1133,15 +1327,18 @@ class TradingDataset(Dataset):
                 future_for_label = future_prices
                 history_for_label = history_prices
 
-            best_h, best_slope, best_intercept = find_linear_regime(
+            best_h, best_slope, best_intercept, _best_h_past = find_linear_regime(
                 future_for_label,
                 history_for_label,
                 min_horizon=self.min_horizon,
                 max_horizon=self.max_horizon,
                 fitness_threshold=self.fitness_threshold,
                 mode=self.horizon_search,
+                max_past_horizon=self.max_past_horizon,
+                use_past=self.regime_use_past,
             )
 
+            # Label stores future horizon only; past span is recovered at viz time.
             label = torch.tensor([best_h, best_slope, best_intercept], dtype=torch.float32)
 
             label_list.append(label)
@@ -1231,6 +1428,7 @@ class TradingDataset(Dataset):
                 'max_accum_deviation': self.max_accum_deviation,
                 'min_horizon': self.min_horizon,
                 'max_horizon': self.max_horizon,
+                'max_past_horizon': self.max_past_horizon,
                 'fitness_threshold': self.fitness_threshold,
                 'horizon_search': self.horizon_search,
                 'normalize': self.normalize,
@@ -1284,6 +1482,13 @@ class TradingDataset(Dataset):
             num_samples=num_samples,
             figsize=figsize,
             interactive=interactive,
+            min_horizon=self.min_horizon,
+            max_horizon=self.max_horizon,
+            max_past_horizon=self.max_past_horizon,
+            fitness_threshold=self.fitness_threshold,
+            horizon_search=self.horizon_search,
+            regime_use_past=self.regime_use_past,
+            normalize_prices=self.normalize,
         )
 
     def visualize_feature(self, fid, feature, feature_name, time_interval_minutes=1):
@@ -1389,6 +1594,8 @@ class TradingDataset(Dataset):
 
         # Normalize label, mean, std, and shape using dataset statistics
         y_normalized = self.normalize_y(y)
+
+        recent_prices = x_normalized[-self.max_past_horizon:, self.price_feature_idx]
         
         # Mean: (F,)
         mean_normalized = (mean - self.stats['mean']['mean']) / (self.stats['mean']['std'] + 1e-8)
@@ -1399,7 +1606,7 @@ class TradingDataset(Dataset):
         # Shape: (num_shapes, F)
         shape_normalized = (shape - self.stats['shape']['mean']) / (self.stats['shape']['std'] + 1e-8)
         
-        return x_normalized, y_normalized, mean_normalized, std_normalized, shape_normalized
+        return x_normalized, recent_prices, mean_normalized, std_normalized, shape_normalized, y_normalized
 
 
     
@@ -1527,27 +1734,30 @@ class ThreadedDataLoader:
         for i in range(0, len(indices), batch_size):
             batch_indices = indices[i:i + batch_size]
             
-            x_list, y_list, mean_list, std_list, shape_list = [], [], [], [], []
+            x_list, p_list, mean_list, std_list, shape_list, y_list = [], [], [], [], [], []
             
             for idx in batch_indices:
                 try:
-                    x, y, mean, std, shape = self.dataset.__getitem__(idx)
+                    x, p, mean, std, shape, y = self.dataset.__getitem__(idx)
                     x_list.append(x)
-                    y_list.append(y)
+                    p_list.append(p)
                     mean_list.append(mean)
                     std_list.append(std)
                     shape_list.append(shape)
+                    y_list.append(y)
                 except IndexError as e:
                     print(f"⚠ IndexError for idx={idx}, dataset length={len(self.dataset)}, indices length={len(self.current_epoch_indices)}")
                     raise
             
             x_batch = torch.stack(x_list)
-            y_batch = torch.stack(y_list)
+            p_batch = torch.stack(p_list)
             mean_batch = torch.stack(mean_list)
             std_batch = torch.stack(std_list)
             shape_batch = torch.stack(shape_list)
-            
-            yield x_batch, y_batch, mean_batch, std_batch, shape_batch      # (B, T, F), (3,), (B, F), (B, F), (B, 4, F). All normalized and ready for model input
+            y_batch = torch.stack(y_list)
+
+            # (B, T, F), (B, max_past_horizon), (B, F), (B, F), (B, 4, F), (B, 3,). All normalized and ready for model input
+            yield x_batch, p_batch, mean_batch, std_batch, shape_batch, y_batch
     
     def get_total_batches_in_epoch(self):
         """Get total number of batches in current epoch."""
