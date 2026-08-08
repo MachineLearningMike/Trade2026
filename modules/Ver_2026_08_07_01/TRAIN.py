@@ -101,6 +101,7 @@ def get_dataset(config):
     test_ratio = 1.0 - train_ratio - val_ratio
     split_ratios = (train_ratio, val_ratio, test_ratio)
 
+    from data import resolve_future_window
     dataset = TradingDataset(
         features=features_for_dataset,
         n_market_features=n_market_features,
@@ -108,11 +109,11 @@ def get_dataset(config):
         feature_names=market_feature_names + macro_feature_names_full,
         price_feature_idx=target_feature_id,
         past_days=config['past_days'],
-        future_minutes=config['future_minutes'],
+        future_minutes=resolve_future_window(config),
         step=config['step'],
         max_accum_deviation=config['max_accum_deviation'],
-        min_horizon=config['min_horizon'],
-        max_horizon=config['max_horizon'],
+        min_trend_horizon=config.get('min_trend_horizon', 3),
+        max_trend_future_horizon=config.get('max_trend_future_horizon'),
         device=config['device'],
         normalize=config['normalize'],
         data_dir=config.get('data_dir', 'dataset_cache'),
@@ -172,17 +173,36 @@ def main(config):
         ),
     )
     parser.add_argument('--past-days', type=int, default=config['past_days'], help='Past days for input')
-    parser.add_argument('--future-minutes', type=int, default=config['future_minutes'],
-                       help='Future minutes for prediction')
+    parser.add_argument(
+        '--max-trend-future-horizon', type=int,
+        default=config.get('max_trend_future_horizon', 50),
+        help='Max future trend horizon (also future_window for linear_regime)',
+    )
+    parser.add_argument(
+        '--max-hope-future-horizon', type=int,
+        default=config.get('max_hope_future_horizon', 60),
+        help='Max hope future horizon (also future_window for scattered_hope)',
+    )
     parser.add_argument('--batch-size', type=int, default=config['batch_size'], help='Batch size')
     parser.add_argument('--total-days', type=int, default=config['total_synthetic_days'], help='Total days of data')
     parser.add_argument('--step', type=int, default=config['step'], help='Step size for start indices')
     parser.add_argument('--max-accum-deviation', type=float, default=config['max_accum_deviation'],
                        help='Threshold for cumulative absolute deviation')
-    parser.add_argument('--min-horizon', type=int, default=config['min_horizon'],
-                       help='Minimum horizon to consider')
-    parser.add_argument('--max-horizon', type=int, default=config['max_horizon'],
-                       help='Maximum horizon to consider')
+    parser.add_argument(
+        '--min-trend-horizon', type=int,
+        default=config.get('min_trend_horizon', 3),
+        help='Minimum linear-regime horizon',
+    )
+    parser.add_argument(
+        '--min-yield-percent', type=float,
+        default=config.get('min_yield_percent', 0.0),
+        help='Minimum yield percent for scattered_hope',
+    )
+    parser.add_argument(
+        '--label', type=str, default=config.get('label', 'linear_regime'),
+        choices=['linear_regime', 'scattered_hope'],
+        help='Label family',
+    )
     parser.add_argument('--no-normalize', action='store_true', help='Disable per-window normalization')
     parser.add_argument('--lr', type=float, default=config['learning_rate'], help='Learning rate')
     parser.add_argument('--slope-weight', type=float, default=config['slope_loss_weight'],
@@ -230,13 +250,15 @@ def main(config):
     config['save_every_n_minibatches'] = args.save_every
     config['clean'] = args.clean
     config['past_days'] = args.past_days
-    config['future_minutes'] = args.future_minutes
+    config['max_trend_future_horizon'] = args.max_trend_future_horizon
+    config['max_hope_future_horizon'] = args.max_hope_future_horizon
     config['batch_size'] = args.batch_size
     config['total_synthetic_days'] = args.total_days
     config['step'] = args.step
     config['max_accum_deviation'] = args.max_accum_deviation
-    config['min_horizon'] = args.min_horizon
-    config['max_horizon'] = args.max_horizon
+    config['min_trend_horizon'] = args.min_trend_horizon
+    config['min_yield_percent'] = args.min_yield_percent
+    config['label'] = args.label
     config['learning_rate'] = args.lr
     config['slope_loss_weight'] = args.slope_weight
     config['intercept_loss_weight'] = args.intercept_weight
@@ -621,11 +643,18 @@ def main(config):
     config['embed_dim'] = embed_dim
     config['max_seq_len'] = past_window // config['patch_size']
     
+    # Keep config in sync if dataset forced output_dim (e.g. scattered_hope → 2)
+    config['output_dim'] = dataset.output_dim
+    from data import label_target_names
     print(f"\nData shapes:")
     print(f"  Input x: (F={F}, past_window={past_window})")
-    _od = config.get('output_dim', 3)
-    _onames = ('horizon', 'slope', 'intercept') if _od == 3 else ('slope', 'intercept')
-    print(f"  Output: {_onames} - { _od } values (config output_dim)")
+    print(f"  Label mode: {getattr(dataset, 'label_mode', config.get('label', 'linear_regime'))}")
+    _od = config['output_dim']
+    _onames = label_target_names(
+        getattr(dataset, 'label_mode', config.get('label', 'linear_regime')),
+        _od,
+    )
+    print(f"  Output: {_onames} - {_od} values (output_dim)")
     print(f"  Total samples: {len(dataset)}")
     print(f"  Train samples: {len(dataset.train_indices)}")
     print(f"  Val samples: {len(dataset.val_indices)}")
@@ -648,7 +677,9 @@ def main(config):
         n_market_features=dataset.n_market_features,
         n_macro_features=dataset.n_macro_features,
         n_latent_macro_features=config['n_latent_macro_features'],
-        n_max_past_horizon=config['max_past_horizon'],
+        n_max_past_horizon=config.get(
+            'max_trend_future_horizon', config.get('max_past_horizon', 30)
+        ),
         patch_size=config['patch_size'],
         num_layers=config['num_layers'],
         num_heads=config['num_heads'],
@@ -668,7 +699,11 @@ def main(config):
     _probe_B = 2
     _probe_device = torch.device(config['device']) if config.get('device') else torch.device('cpu')
     model = model.to(_probe_device)
-    _probe_P = int(config.get('max_past_horizon') or 30)
+    _probe_P = int(
+        config.get('max_trend_future_horizon')
+        or config.get('max_past_horizon')
+        or 30
+    )
     check_all_weights_updated(
         model,
         sample_batch=(
@@ -683,6 +718,9 @@ def main(config):
             slope_weight=config['slope_loss_weight'],
             intercept_weight=config['intercept_loss_weight'],
             recon_weight=config['reconstruction_loss_weight'],
+            label_mode=dataset.label_mode,
+            chance_weight=config.get('chance_loss_weight', 1.0),
+            wait_weight=config.get('wait_loss_weight', 1.0),
         ),
         name="MarketTransformerWithHeads",
     )
@@ -702,7 +740,10 @@ def main(config):
             P, X, Y,
             slope_weight=config['slope_loss_weight'],
             intercept_weight=config['intercept_loss_weight'],
-            recon_weight=config['reconstruction_loss_weight']
+            recon_weight=config['reconstruction_loss_weight'],
+            label_mode=dataset.label_mode,
+            chance_weight=config.get('chance_loss_weight', 1.0),
+            wait_weight=config.get('wait_loss_weight', 1.0),
         ),
         optimizer=optimizer,
         dataloader=train_loader,
@@ -724,10 +765,20 @@ def main(config):
     print(f"  Val: {len(dataset.val_indices)} samples")
     print(f"  Test: {len(dataset.test_indices)} samples")
     print(f"Past days: {config['past_days']} ({past_window} minutes)")
-    print(f"Future minutes: {config['future_minutes']}")
+    print(f"Label mode: {config.get('label', 'linear_regime')}")
+    print(f"Future window: {dataset.future_window} minutes")
     print(f"Step: {config['step']} minute(s)")
     print(f"Max accum deviation: {config['max_accum_deviation']}")
-    print(f"Min horizon: {config['min_horizon']}, Max horizon: {config['max_horizon']}")
+    if config.get('label', 'linear_regime') == 'scattered_hope':
+        print(
+            f"min_yield_percent: {config.get('min_yield_percent')}, "
+            f"max_hope_future_horizon: {config.get('max_hope_future_horizon')}"
+        )
+    else:
+        print(
+            f"min_trend_horizon: {config.get('min_trend_horizon')}, "
+            f"max_trend_future_horizon: {config.get('max_trend_future_horizon')}"
+        )
     print(f"Normalize: {config['normalize']}")
     print(f"Epochs: {config['epochs']}")
     if args.extend is not None and args.extend != 0:

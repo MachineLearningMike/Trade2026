@@ -10,8 +10,10 @@ config = {
     # ============================================================
     # DATA CONFIGURATION
     # ============================================================
-    'past_days': 2,     # 1, 2, 
-    'future_minutes': 60,
+    'past_days': 2,     # 1, 2,
+    # future_window length is NOT set here — see label-mode horizons below:
+    #   linear_regime  → max_trend_future_horizon
+    #   scattered_hope → max_hope_future_horizon
     'step': 5,
     'num_features': 5,
     'num_shapes': 4,
@@ -37,20 +39,37 @@ config = {
     'test_batch_size': 16,
     
     # ============================================================
-    # HORIZON LABELING CONFIGURATION
+    # LABEL FAMILY
     # ============================================================
+    # Choose how supervised targets are built from the future price window:
+    #   'linear_regime'   → (horizon, slope, intercept) via find_linear_regime
+    #                        model may use output_dim 2 (m,b) or 3 (h,m,b)
+    #   'scattered_hope'  → (chance, wait) via find_scattered_hope
+    #                        requires output_dim=2
+    'label': 'scattered_hope',
+
+    # ------------------------------------------------------------
+    # SCATTERED HOPE (distrubution of chance and wait)
+    # ------------------------------------------------------------
+    'min_yield_percent': 0.3,
+    # Also sets the sample future_window when label=scattered_hope
+    'max_hope_future_horizon': 60,
+
+    # ------------------------------------------------------------
+    # TREND / LINEAR-REGIME HORIZONS (linear_regime)
+    # ------------------------------------------------------------
     'max_accum_deviation': 0.35,   # legacy alias; prefer fitness_threshold
-    'min_horizon': 3,
-    'max_horizon': 50,
-    # How far into recent past the joint linear regime may extend (bars).
-    # None → same as max_horizon. Past and future compete to grow the span.
-    'max_past_horizon': 30,
+    'min_trend_horizon': 3,
+    # Max future bars for the linear regime search; also:
+    #   - sample future_window when label=linear_regime
+    #   - max past extent for joint past+future regime + model p vector
+    'max_trend_future_horizon': 50,
     'regime_use_past': True,
     # Dimensionless fitness: sum(|residual|) / history_sigma
     'fitness_threshold': 0.75,
 
     # ============================================================
-    # HORIZON SEARCH RULE
+    # HORIZON SEARCH RULE (linear_regime)
     # ============================================================
     # Free (unanchored) OLS on joint [recent past ‖ nearest future].
     #   'longest_linear'         - grow while fitness <= threshold; keep last good
@@ -79,7 +98,7 @@ config = {
     'use_binance_data': True,
     'binance_datatype': 'klines',
     'binance_interval': '1m',
-    'binance_start_date': '2025-01-01 00:00:00',
+    'binance_start_date': '2024-01-01 00:00:00',
     'binance_end_date': '2026-07-01 00:00:00',
     'binance_symbols': {
         "BTCUSDT": ["Close", "Volume"],
@@ -122,9 +141,9 @@ config = {
     # HEAD CONFIGURATION
     # ============================================================
     'head_hidden_dim_multiplier': 4,
-    # Prediction target layout (labels always stored as h, m, b; model uses a slice):
-    #   3 → (horizon, slope, intercept)
-    #   2 → (slope, intercept)  — no horizon head / loss
+    # Prediction head width. Must match label family:
+    #   linear_regime:  3 = (h,m,b),  2 = (m,b)
+    #   scattered_hope: 2 = (chance, wait)  [forced if mismatch]
     'output_dim': 2,
     
     # ============================================================
@@ -151,8 +170,12 @@ config = {
     # ============================================================
     # LOSS WEIGHT CONFIGURATION
     # ============================================================
+    # linear_regime (dim 3 uses horizon unweighted; dim 2 omits horizon):
     'slope_loss_weight': 1.0,
     'intercept_loss_weight': 10.0,
+    # scattered_hope:
+    'chance_loss_weight': 1.0,
+    'wait_loss_weight': 1.0,
     'reconstruction_loss_weight': 0.01,
     'use_reconstruction': False,
 }

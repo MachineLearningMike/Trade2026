@@ -43,12 +43,17 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
         'dropout': config.get('dropout'),
         'head_hidden_dim_multiplier': config.get('head_hidden_dim_multiplier'),
         'output_dim': config.get('output_dim', 3),
+        'max_trend_future_horizon': config.get('max_trend_future_horizon'),
+        'max_hope_future_horizon': config.get('max_hope_future_horizon'),
+        'label': config.get('label', 'linear_regime'),
         'causal': config.get('causal'),
         'use_reconstruction': config.get('use_reconstruction'),
 
         # Objective + optimizer (same weights, different training meaning)
         'slope_loss_weight': config.get('slope_loss_weight'),
         'intercept_loss_weight': config.get('intercept_loss_weight'),
+        'chance_loss_weight': config.get('chance_loss_weight'),
+        'wait_loss_weight': config.get('wait_loss_weight'),
         'reconstruction_loss_weight': config.get('reconstruction_loss_weight'),
         'learning_rate': config.get('learning_rate'),
         'batch_size': config.get('batch_size'),

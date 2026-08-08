@@ -30,8 +30,14 @@ from Binance import Binance
 # Kept as a module constant so older call sites / cache docs stay consistent.
 LABEL_FITNESS_THRESHOLD = 0.75
 
-# Full label layout in cache / label_tensor: (horizon, slope, intercept).
-LABEL_FULL_DIM = 3
+# Label families (config key ``label``).
+LABEL_LINEAR_REGIME = 'linear_regime'       # (horizon, slope, intercept) → model slice
+LABEL_SCATTERED_HOPE = 'scattered_hope'     # (chance, wait)
+VALID_LABEL_MODES = (LABEL_LINEAR_REGIME, LABEL_SCATTERED_HOPE)
+
+# Full layout for linear_regime cache / label_tensor.
+LABEL_FULL_DIM_LINEAR = 3
+LABEL_FULL_DIM_SCATTERED = 2
 
 # Horizon search rules for find_linear_regime (free OLS, no f[0] anchor).
 HORIZON_SEARCH_LONGEST_LINEAR = 'longest_linear'
@@ -42,26 +48,59 @@ VALID_HORIZON_SEARCH_MODES = (
 )
 
 
-def label_target_slice(output_dim: int) -> slice:
+def label_target_slice(label_mode: str, output_dim: int) -> slice:
     """
-    Map model output_dim → slice into full (horizon, slope, intercept) labels.
+    Map (label_mode, output_dim) → slice into stored label vectors.
 
-      3 → [horizon, slope, intercept]
-      2 → [slope, intercept]
+    linear_regime (stored as h, m, b):
+      output_dim=3 → [horizon, slope, intercept]
+      output_dim=2 → [slope, intercept]
+    scattered_hope (stored as chance, wait):
+      always [chance, wait]  (output_dim must be 2)
     """
-    if output_dim == 3:
-        return slice(0, 3)
-    if output_dim == 2:
-        return slice(1, 3)
-    raise ValueError(f"output_dim must be 2 or 3, got {output_dim}")
+    if label_mode == LABEL_SCATTERED_HOPE:
+        if output_dim != 2:
+            raise ValueError(
+                f"label={LABEL_SCATTERED_HOPE!r} requires output_dim=2, got {output_dim}"
+            )
+        return slice(0, 2)
+    if label_mode == LABEL_LINEAR_REGIME:
+        if output_dim == 3:
+            return slice(0, 3)
+        if output_dim == 2:
+            return slice(1, 3)
+        raise ValueError(f"output_dim must be 2 or 3 for linear_regime, got {output_dim}")
+    raise ValueError(
+        f"Unknown label mode {label_mode!r}; expected one of {VALID_LABEL_MODES}"
+    )
 
 
-def label_target_names(output_dim: int) -> Tuple[str, ...]:
-    if output_dim == 3:
-        return ('horizon', 'slope', 'intercept')
-    if output_dim == 2:
-        return ('slope', 'intercept')
-    raise ValueError(f"output_dim must be 2 or 3, got {output_dim}")
+def label_target_names(label_mode: str, output_dim: int) -> Tuple[str, ...]:
+    if label_mode == LABEL_SCATTERED_HOPE:
+        return ('chance', 'wait')
+    if label_mode == LABEL_LINEAR_REGIME:
+        if output_dim == 3:
+            return ('horizon', 'slope', 'intercept')
+        if output_dim == 2:
+            return ('slope', 'intercept')
+        raise ValueError(f"output_dim must be 2 or 3 for linear_regime, got {output_dim}")
+    raise ValueError(
+        f"Unknown label mode {label_mode!r}; expected one of {VALID_LABEL_MODES}"
+    )
+
+
+def resolve_future_window(config: dict) -> int:
+    """
+    Sample future_window length from the active label mode's max future horizon.
+
+      linear_regime  → max_trend_future_horizon
+      scattered_hope → max_hope_future_horizon
+    """
+    mode = config.get('label', LABEL_LINEAR_REGIME)
+    if mode == LABEL_SCATTERED_HOPE:
+        return int(config.get('max_hope_future_horizon', 60))
+    # linear_regime (default) and any unknown fall back to trend horizon
+    return int(config.get('max_trend_future_horizon', 50))
 
 
 # ═══════════════════════════════════════════════════════════
@@ -182,10 +221,8 @@ def generate_dataset_signature(config: dict) -> str:
     T = estimate_T_from_config(config)
 
     past_days = config.get('past_days', 7)
-    future_minutes = config.get('future_minutes', 60)
-    max_horizon = config.get('max_horizon', None)
-    if max_horizon is None:
-        max_horizon = future_minutes
+    future_window = resolve_future_window(config)
+    max_trend_future = int(config.get('max_trend_future_horizon', future_window))
 
     train_ratio = config.get('train_ratio', 0.70)
     val_ratio = config.get('val_ratio', 0.20)
@@ -210,16 +247,19 @@ def generate_dataset_signature(config: dict) -> str:
 
         # --- windowing / sampling ---
         'past_days': past_days,
-        'future_minutes': future_minutes,
+        'future_window': future_window,
         'step': config.get('step', 1),
 
         # --- label algorithm ---
-        'min_horizon': config.get('min_horizon', 3),
-        'max_horizon': max_horizon,
-        'max_past_horizon': config.get('max_past_horizon', max_horizon),
+        'label': config.get('label', LABEL_LINEAR_REGIME),
+        'min_yield_percent': config.get('min_yield_percent', 0.0),
+        'max_hope_future_horizon': config.get('max_hope_future_horizon', 60),
+        'min_trend_horizon': config.get('min_trend_horizon', 3),
+        'max_trend_future_horizon': max_trend_future,
         'regime_use_past': config.get('regime_use_past', True),
         'fitness_threshold': config.get('fitness_threshold', LABEL_FITNESS_THRESHOLD),
         'horizon_search': config.get('horizon_search', HORIZON_SEARCH_LONGEST_LINEAR),
+        'output_dim': config.get('output_dim', 3),
         'normalize': config.get('normalize', True),
 
         # --- train-split stats ---
@@ -527,6 +567,63 @@ def find_linear_regime(
                 break
 
     return best_h_fut, best_slope, best_intercept, best_h_past
+
+
+def find_scattered_hope(
+    future,
+    history,
+    min_yield_percent: float,
+    max_hope_future_horizon: Optional[int] = None,
+):
+    """
+    Scattered-hope label: (chance, wait).
+
+    Parallel role to find_linear_regime: both consume the same
+    (future, history) price windows (typically z-scored with past-window
+    moments). Characteristics:
+      - linear_regime → continuity / OLS fitness → (horizon, slope, intercept)
+      - scattered_hope → thresholded yield events → (chance, wait)
+
+    Args:
+        future : Tensor (future_window,)
+            Future prices (same scale as history).
+        history : Tensor (history_window,)
+            Past prices; last bar is the reference level for yield.
+        min_yield_percent : float
+            Minimum yield threshold (%) to count an event.
+        max_hope_future_horizon : optional int
+            Cap on future look-ahead (defaults to len(future)).
+
+    Returns:
+        chance : float
+        wait : float
+    """
+    n = int(future.shape[0])
+    if max_hope_future_horizon is not None:
+        n = min(n, max(0, int(max_hope_future_horizon)))
+
+    chance = 0.0
+    wait = 0.0
+    if n == 0 or history.numel() == 0:
+        return chance, wait
+
+    current = history[-1]
+    # Avoid division by zero on the reference level (raw or z-scored).
+    eps = 1e-8
+    denom = current if abs(float(current)) > eps else (
+        current + eps if float(current) >= 0 else current - eps
+    )
+
+    for t in range(n):
+        _yield = ((future[t] - current) / denom) * 100
+        yv = float(_yield)
+        if yv < min_yield_percent:
+            continue
+        chance += yv
+        # t is minutes from decision; weight by inverse yield strength
+        wait += t * 1000.0 / yv
+
+    return float(chance), float(wait)
 
 
 def find_power_regime(
@@ -1098,33 +1195,59 @@ class TradingDataset(Dataset):
         feature_names: List[str],
         price_feature_idx: int,
         past_days: int = 7,
-        future_minutes: int = 60,
+        future_minutes: Optional[int] = None,
         step: int = 1,
         max_accum_deviation: float = 12.0,
-        min_horizon: int = 3,
-        max_horizon: Optional[int] = None,
+        min_trend_horizon: int = 3,
+        max_trend_future_horizon: Optional[int] = None,
         device: str = 'cpu',
         normalize: bool = True,
         data_dir: Optional[str] = None,
         force_recompute: bool = False,
         split_ratios: Optional[Tuple[float, float, float]] = None
     ):
+        config = get_config()
         self.feature_names = feature_names
         self.n_market_features = n_market_features
         self.n_macro_features = n_macro_features
         self.past_days = past_days
-        self.future_minutes = future_minutes
         self.price_feature_idx = price_feature_idx
         self.step = step
         self.max_accum_deviation = max_accum_deviation
-        self.min_horizon = min_horizon
-        self.max_horizon = max_horizon
         self.device = device
         self.normalize = normalize
         self.force_recompute = force_recompute
-
-        config = get_config()
         self.num_shapes = config['num_shapes']
+
+        self.label_mode = config.get('label', LABEL_LINEAR_REGIME)
+        if self.label_mode not in VALID_LABEL_MODES:
+            raise ValueError(
+                f"Unknown label={self.label_mode!r}; "
+                f"expected one of {VALID_LABEL_MODES}"
+            )
+        self.min_yield_percent = float(config.get('min_yield_percent', 0.0))
+        self.max_hope_future_horizon = int(
+            config.get('max_hope_future_horizon', 60)
+        )
+
+        # future_window from label-mode max future horizon
+        if future_minutes is None:
+            future_minutes = resolve_future_window(config)
+        self.future_minutes = int(future_minutes)
+
+        self.min_trend_horizon = int(
+            config.get('min_trend_horizon', min_trend_horizon)
+        )
+        mtf = config.get('max_trend_future_horizon', max_trend_future_horizon)
+        if mtf is None:
+            mtf = self.future_minutes
+        self.max_trend_future_horizon = int(mtf)
+        # Past regime extent + model p length use the same max as trend future
+        # (config key max_trend_future_horizon; formerly max_past_horizon / max_horizon).
+        self.max_past_horizon = self.max_trend_future_horizon
+        # Aliases used by older call sites / viz
+        self.min_horizon = self.min_trend_horizon
+        self.max_horizon = self.max_trend_future_horizon
 
         self.horizon_search = config.get(
             'horizon_search', HORIZON_SEARCH_LONGEST_LINEAR
@@ -1138,14 +1261,19 @@ class TradingDataset(Dataset):
             config.get('fitness_threshold', LABEL_FITNESS_THRESHOLD)
         )
         self.regime_use_past = bool(config.get('regime_use_past', True))
-        mph = config.get('max_past_horizon', None)
-        self.max_past_horizon = None if mph is None else int(mph)
         self.output_dim = int(config.get('output_dim', 3))
-        if self.output_dim not in (2, 3):
+        if self.label_mode == LABEL_SCATTERED_HOPE:
+            if self.output_dim != 2:
+                print(
+                    f"⚠ label={LABEL_SCATTERED_HOPE}: forcing output_dim "
+                    f"{self.output_dim} → 2 (chance, wait)"
+                )
+                self.output_dim = 2
+        elif self.output_dim not in (2, 3):
             raise ValueError(
-                f"output_dim must be 2 or 3, got {self.output_dim}"
+                f"output_dim must be 2 or 3 for linear_regime, got {self.output_dim}"
             )
-        self._label_slice = label_target_slice(self.output_dim)
+        self._label_slice = label_target_slice(self.label_mode, self.output_dim)
         self.horizon_mode = config.get('horizon_mode', 'floating')
         self.weight_type = config.get('weight_type', 'exponential')
         self.weight_decay = config.get('weight_decay', 0.9)
@@ -1167,14 +1295,17 @@ class TradingDataset(Dataset):
         self.T, self.F = self.Total.shape
         
         self.past_window = 60 * 24 * past_days
-        self.future_window = future_minutes
+        self.future_window = self.future_minutes
         self.total_window = self.past_window + self.future_window
         
-        if self.max_horizon is None:
-            self.max_horizon = self.future_window
-        elif self.max_horizon < self.min_horizon:
-            self.max_horizon = self.min_horizon
-            print(f"⚠ max_horizon adjusted to min_horizon ({self.min_horizon})")
+        if self.max_trend_future_horizon < self.min_trend_horizon:
+            self.max_trend_future_horizon = self.min_trend_horizon
+            self.max_horizon = self.max_trend_future_horizon
+            self.max_past_horizon = self.max_trend_future_horizon
+            print(
+                f"⚠ max_trend_future_horizon adjusted to min_trend_horizon "
+                f"({self.min_trend_horizon})"
+            )
         
         self.valid_starts = self._get_valid_starts()
         
@@ -1186,7 +1317,7 @@ class TradingDataset(Dataset):
         
         self._create_splits()
 
-        # Model-target stats (slice of full h,m,b stats).
+        # Model-target stats (slice of full label vectors).
         self._label_stat_mean = self.stats['label']['mean'][self._label_slice]
         self._label_stat_std = self.stats['label']['std'][self._label_slice]
         
@@ -1204,18 +1335,30 @@ class TradingDataset(Dataset):
         print(f"\nTradingDataset initialized:")
         print(f"  Features: {self.F}, Time steps: {self.T}")
         print(f"  Past window: {self.past_window} minutes ({past_days} days)")
-        print(f"  Future window: {self.future_window} minutes")
+        print(f"  Future window: {self.future_window} minutes "
+              f"(from {'max_hope_future_horizon' if self.label_mode == LABEL_SCATTERED_HOPE else 'max_trend_future_horizon'})")
         print(f"  Step: {step}")
-        print(f"  Horizon search: {self.horizon_search}")
-        print(f"  Fitness threshold: {self.fitness_threshold}")
-        print(f"  Regime use past: {self.regime_use_past} "
-              f"(max_past_horizon={self.max_past_horizon})")
-        print(f"  Model output_dim: {self.output_dim} {label_target_names(self.output_dim)}")
+        print(f"  Label mode: {self.label_mode}")
+        if self.label_mode == LABEL_LINEAR_REGIME:
+            print(f"  Horizon search: {self.horizon_search}")
+            print(f"  Fitness threshold: {self.fitness_threshold}")
+            print(f"  Regime use past: {self.regime_use_past} "
+                  f"(max past/future trend={self.max_trend_future_horizon})")
+            print(
+                f"  Min trend horizon: {self.min_trend_horizon}, "
+                f"Max trend future: {self.max_trend_future_horizon}"
+            )
+        else:
+            print(f"  min_yield_percent: {self.min_yield_percent}")
+            print(f"  max_hope_future_horizon: {self.max_hope_future_horizon}")
+        print(
+            f"  Model output_dim: {self.output_dim} "
+            f"{label_target_names(self.label_mode, self.output_dim)}"
+        )
         print(f"  Horizon viz mode: {self.horizon_mode}")
         if self.horizon_mode == 'weighted':
             print(f"  Weight type: {self.weight_type}, Decay: {self.weight_decay}")
         print(f"  Max accum deviation (legacy): {max_accum_deviation}")
-        print(f"  Min horizon: {min_horizon}, Max horizon: {self.max_horizon}")
         print(f"  Normalize: {normalize}")
         print(f"  Total samples: {len(self)}")
         print(f"  Cache: {'Loaded' if self.cache_file.exists() else 'Computed'}")
@@ -1224,10 +1367,18 @@ class TradingDataset(Dataset):
         print(f"  Split sizes - Train: {len(self.train_indices)}, "
               f"Val: {len(self.val_indices)}, Test: {len(self.test_indices)}")
         print(f"\n📊 Dataset Statistics (training set, {len(self.train_indices)} samples):")
-        print(f"  Full label (horizon, slope, intercept):")
+        full_names = (
+            ('horizon', 'slope', 'intercept')
+            if self.label_mode == LABEL_LINEAR_REGIME
+            else ('chance', 'wait')
+        )
+        print(f"  Full label {full_names}:")
         print(f"    Mean:  {self.stats['label']['mean'].tolist()}")
         print(f"    Std:   {self.stats['label']['std'].tolist()}")
-        print(f"  Model target {label_target_names(self.output_dim)}:")
+        print(
+            f"  Model target "
+            f"{label_target_names(self.label_mode, self.output_dim)}:"
+        )
         print(f"    Mean:  {self._label_stat_mean.tolist()}")
         print(f"    Std:   {self._label_stat_std.tolist()}")
         
@@ -1327,19 +1478,35 @@ class TradingDataset(Dataset):
                 future_for_label = future_prices
                 history_for_label = history_prices
 
-            best_h, best_slope, best_intercept, _best_h_past = find_linear_regime(
-                future_for_label,
-                history_for_label,
-                min_horizon=self.min_horizon,
-                max_horizon=self.max_horizon,
-                fitness_threshold=self.fitness_threshold,
-                mode=self.horizon_search,
-                max_past_horizon=self.max_past_horizon,
-                use_past=self.regime_use_past,
-            )
-
-            # Label stores future horizon only; past span is recovered at viz time.
-            label = torch.tensor([best_h, best_slope, best_intercept], dtype=torch.float32)
+            if self.label_mode == LABEL_LINEAR_REGIME:
+                best_h, best_slope, best_intercept, _best_h_past = find_linear_regime(
+                    future_for_label,
+                    history_for_label,
+                    min_horizon=self.min_trend_horizon,
+                    max_horizon=self.max_trend_future_horizon,
+                    fitness_threshold=self.fitness_threshold,
+                    mode=self.horizon_search,
+                    # Past max uses the same config as max_trend_future_horizon
+                    max_past_horizon=self.max_trend_future_horizon,
+                    use_past=self.regime_use_past,
+                )
+                # Full cache vector; model may slice to (m,b) when output_dim=2.
+                # Past span is recovered at viz time.
+                label = torch.tensor(
+                    [best_h, best_slope, best_intercept], dtype=torch.float32
+                )
+            elif self.label_mode == LABEL_SCATTERED_HOPE:
+                chance, wait = find_scattered_hope(
+                    future_for_label,
+                    history_for_label,
+                    min_yield_percent=self.min_yield_percent,
+                    max_hope_future_horizon=self.max_hope_future_horizon,
+                )
+                label = torch.tensor(
+                    [float(chance), float(wait)], dtype=torch.float32
+                )
+            else:
+                raise ValueError(f"Unknown label mode: {self.label_mode!r}")
 
             label_list.append(label)
 
@@ -1426,11 +1593,13 @@ class TradingDataset(Dataset):
                 'future_window': self.future_window,
                 'step': self.step,
                 'max_accum_deviation': self.max_accum_deviation,
-                'min_horizon': self.min_horizon,
-                'max_horizon': self.max_horizon,
-                'max_past_horizon': self.max_past_horizon,
+                'min_trend_horizon': self.min_trend_horizon,
+                'max_trend_future_horizon': self.max_trend_future_horizon,
+                'max_hope_future_horizon': self.max_hope_future_horizon,
                 'fitness_threshold': self.fitness_threshold,
                 'horizon_search': self.horizon_search,
+                'label': self.label_mode,
+                'min_yield_percent': self.min_yield_percent,
                 'normalize': self.normalize,
                 'price_feature_idx': self.price_feature_idx,
                 'cache_key': self.cache_key,
@@ -1482,9 +1651,9 @@ class TradingDataset(Dataset):
             num_samples=num_samples,
             figsize=figsize,
             interactive=interactive,
-            min_horizon=self.min_horizon,
-            max_horizon=self.max_horizon,
-            max_past_horizon=self.max_past_horizon,
+            min_horizon=self.min_trend_horizon,
+            max_horizon=self.max_trend_future_horizon,
+            max_past_horizon=self.max_trend_future_horizon,
             fitness_threshold=self.fitness_threshold,
             horizon_search=self.horizon_search,
             regime_use_past=self.regime_use_past,
@@ -1526,9 +1695,9 @@ class TradingDataset(Dataset):
         """
         Normalize a model-target label vector.
 
-        y must already be sliced to output_dim:
-          3 → (horizon, slope, intercept)
-          2 → (slope, intercept)
+        y must already be sliced to model target size:
+          linear_regime  → (h,m,b) or (m,b)
+          scattered_hope → (chance, wait)
         """
         mean = self._label_stat_mean
         std = self._label_stat_std
@@ -1588,13 +1757,16 @@ class TradingDataset(Dataset):
             std = torch.ones(self._F)
             shape = torch.zeros(self.num_shapes, self._F)
         
-        # Full label cache is always (horizon, slope, intercept); slice for model.
+        # Full label cache:
+        #   linear_regime  → (h, m, b) then slice by output_dim
+        #   scattered_hope → (chance, wait)  (slice is 0:2)
         y_full = self._label_tensor[idx]
         y = y_full[self._label_slice]
 
         # Normalize label, mean, std, and shape using dataset statistics
         y_normalized = self.normalize_y(y)
 
+        # Shared with both label modes: recent past prices for the model head.
         recent_prices = x_normalized[-self.max_past_horizon:, self.price_feature_idx]
         
         # Mean: (F,)

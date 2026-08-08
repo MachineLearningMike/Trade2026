@@ -102,7 +102,8 @@ def load_model(
 
     F = dataset.F
     n_max_past = int(
-        config.get('max_past_horizon')
+        config.get('max_trend_future_horizon')
+        or getattr(dataset, 'max_trend_future_horizon', None)
         or getattr(dataset, 'max_past_horizon', None)
         or 30
     )
@@ -140,7 +141,11 @@ def _collate_batch(dataset, indices: List[int]):
             x, p, mean, std, shape, y = sample
         else:
             x, y, mean, std, shape = sample
-            n_p = int(getattr(dataset, 'max_past_horizon', None) or 0)
+            n_p = int(
+                getattr(dataset, 'max_trend_future_horizon', None)
+                or getattr(dataset, 'max_past_horizon', None)
+                or 0
+            )
             p = x[-n_p:, getattr(dataset, 'price_feature_idx', 0)] if n_p else x.new_zeros(0)
         xs.append(x)
         ps.append(p)
@@ -326,9 +331,19 @@ def run_test(
     print(f"✓ Finished inference on {len(preds)} test samples", flush=True)
 
     out_dim = preds.shape[-1]
+    label_mode = config.get('label', getattr(dataset, 'label_mode', 'linear_regime'))
     print("\n📊 Test Set Results:")
     metrics = {}
-    if out_dim == 3:
+    if label_mode == 'scattered_hope' and out_dim == 2:
+        metrics['chance_mse'] = torch.nn.functional.mse_loss(
+            preds[:, 0], test_labels[:, 0]
+        ).item()
+        metrics['wait_mse'] = torch.nn.functional.mse_loss(
+            preds[:, 1], test_labels[:, 1]
+        ).item()
+        print(f"  Chance MSE:      {metrics['chance_mse']:.4f}")
+        print(f"  Wait MSE:        {metrics['wait_mse']:.4f}")
+    elif out_dim == 3:
         metrics['horizon_mse'] = torch.nn.functional.mse_loss(
             preds[:, 0], test_labels[:, 0]
         ).item()
@@ -354,7 +369,18 @@ def run_test(
         raise ValueError(f"Unexpected pred dim {out_dim}")
 
     print(f"\n📈 Sample Predictions (first 5):")
-    if out_dim == 3:
+    if label_mode == 'scattered_hope' and out_dim == 2:
+        print(
+            f"  {'Index':<6} {'True Chance':<12} {'Pred Chance':<12} "
+            f"{'True Wait':<12} {'Pred Wait':<12}"
+        )
+        print(f"  {'-'*6} {'-'*12} {'-'*12} {'-'*12} {'-'*12}")
+        for i in range(min(5, len(preds))):
+            print(
+                f"  {i:<6} {test_labels[i, 0].item():<12.4f} {preds[i, 0].item():<12.4f} "
+                f"{test_labels[i, 1].item():<12.4f} {preds[i, 1].item():<12.4f}"
+            )
+    elif out_dim == 3:
         print(
             f"  {'Index':<6} {'True H':<8} {'Pred H':<8} {'True Slope':<12} {'Pred Slope':<12} "
             f"{'True Intercept':<14} {'Pred Intercept':<14}"
@@ -378,6 +404,14 @@ def run_test(
                 f"{test_labels[i, 1].item():<14.2f} {preds[i, 1].item():<14.2f}"
             )
 
+    if visualize and label_mode == 'scattered_hope':
+        print(
+            "\n⚠ Skipping linear-regime visualization "
+            "(label=scattered_hope uses chance/wait targets).",
+            flush=True,
+        )
+        visualize = False
+
     if visualize:
         # Plot chosen test samples: actual prices + full label trend + inferred trend.
         # Labels for viz always use full (h,m,b) from the cache so horizon is available
@@ -394,9 +428,12 @@ def run_test(
         # When output_dim=2 the model does not predict horizon; draw the
         # inferred (m, b) line out to max_horizon.
         pred_horizon = int(
-            config.get('max_horizon')
-            if config.get('max_horizon') is not None
-            else getattr(dataset, 'max_horizon', dataset.future_window)
+            config.get('max_trend_future_horizon')
+            if config.get('max_trend_future_horizon') is not None
+            else getattr(
+                dataset, 'max_trend_future_horizon',
+                getattr(dataset, 'max_horizon', dataset.future_window),
+            )
         )
 
         visualize_linear_trends(
@@ -414,10 +451,17 @@ def run_test(
             fixed_order=True,
             sample_ids=list(used_indices),
             default_pred_horizon=pred_horizon,
-            min_horizon=config.get('min_horizon', getattr(dataset, 'min_horizon', 3)),
-            max_horizon=config.get('max_horizon', getattr(dataset, 'max_horizon', None)),
+            min_horizon=config.get(
+                'min_trend_horizon',
+                getattr(dataset, 'min_trend_horizon', getattr(dataset, 'min_horizon', 3)),
+            ),
+            max_horizon=config.get(
+                'max_trend_future_horizon',
+                getattr(dataset, 'max_trend_future_horizon', None),
+            ),
             max_past_horizon=config.get(
-                'max_past_horizon', getattr(dataset, 'max_past_horizon', None)
+                'max_trend_future_horizon',
+                getattr(dataset, 'max_trend_future_horizon', None),
             ),
             fitness_threshold=config.get(
                 'fitness_threshold', getattr(dataset, 'fitness_threshold', 0.75)
