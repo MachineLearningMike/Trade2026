@@ -672,14 +672,16 @@ def main(config):
     print(f"  Causal: {config['causal']}")
     print(f"  Use reconstruction: {config['use_reconstruction']}")
     
+    from data import resolve_model_past_len
+    _model_past_len = int(
+        getattr(dataset, 'model_past_len', resolve_model_past_len(config))
+    )
     model = MarketTransformerWithHeads(
         in_features=F,
         n_market_features=dataset.n_market_features,
         n_macro_features=dataset.n_macro_features,
         n_latent_macro_features=config['n_latent_macro_features'],
-        n_max_past_horizon=config.get(
-            'max_trend_future_horizon', config.get('max_past_horizon', 30)
-        ),
+        n_max_past_horizon=_model_past_len,
         patch_size=config['patch_size'],
         num_layers=config['num_layers'],
         num_heads=config['num_heads'],
@@ -699,11 +701,7 @@ def main(config):
     _probe_B = 2
     _probe_device = torch.device(config['device']) if config.get('device') else torch.device('cpu')
     model = model.to(_probe_device)
-    _probe_P = int(
-        config.get('max_trend_future_horizon')
-        or config.get('max_past_horizon')
-        or 30
-    )
+    _probe_P = _model_past_len
     check_all_weights_updated(
         model,
         sample_batch=(

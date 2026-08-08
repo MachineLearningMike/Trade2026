@@ -698,11 +698,8 @@ if __name__ == "__main__":
     print(f"  num_heads: {config['num_heads']}")
     print(f"  output_dim: {config['output_dim']}")
 
-    n_max_past = int(
-        config.get('max_trend_future_horizon')
-        or config.get('max_past_horizon')
-        or 30
-    )
+    from data import resolve_model_past_len
+    n_max_past = int(resolve_model_past_len(config))
     model = MarketTransformerWithHeads(
         in_features=F,
         n_market_features=n_market,

@@ -101,11 +101,10 @@ def load_model(
         max_seq_len = past_window // config['patch_size']
 
     F = dataset.F
+    from data import resolve_model_past_len
     n_max_past = int(
-        config.get('max_trend_future_horizon')
-        or getattr(dataset, 'max_trend_future_horizon', None)
-        or getattr(dataset, 'max_past_horizon', None)
-        or 30
+        getattr(dataset, 'model_past_len', None)
+        or resolve_model_past_len(config)
     )
     model = MarketTransformerWithHeads(
         in_features=F,
@@ -142,7 +141,7 @@ def _collate_batch(dataset, indices: List[int]):
         else:
             x, y, mean, std, shape = sample
             n_p = int(
-                getattr(dataset, 'max_trend_future_horizon', None)
+                getattr(dataset, 'model_past_len', None)
                 or getattr(dataset, 'max_past_horizon', None)
                 or 0
             )
@@ -404,76 +403,94 @@ def run_test(
                 f"{test_labels[i, 1].item():<14.2f} {preds[i, 1].item():<14.2f}"
             )
 
-    if visualize and label_mode == 'scattered_hope':
-        print(
-            "\n⚠ Skipping linear-regime visualization "
-            "(label=scattered_hope uses chance/wait targets).",
-            flush=True,
-        )
-        visualize = False
-
     if visualize:
-        # Plot chosen test samples: actual prices + full label trend + inferred trend.
-        # Labels for viz always use full (h,m,b) from the cache so horizon is available
-        # even when the model only predicts (m, b).
-        print("\n📈 Visualizing label vs inferred trends on chosen test samples...", flush=True)
         n_viz = len(used_indices)
         valid_starts = [dataset.valid_starts[i] for i in used_indices]
-        raw_means = torch.stack([dataset.mean_tensor[i] for i in used_indices])
-        raw_stds = torch.stack([dataset.std_tensor[i] for i in used_indices])
         full_labels = torch.stack(
             [dataset.label_tensor[i] for i in used_indices]
         )
+        pred_cpu = preds.detach().cpu()
 
-        # When output_dim=2 the model does not predict horizon; draw the
-        # inferred (m, b) line out to max_horizon.
-        pred_horizon = int(
-            config.get('max_trend_future_horizon')
-            if config.get('max_trend_future_horizon') is not None
-            else getattr(
-                dataset, 'max_trend_future_horizon',
-                getattr(dataset, 'max_horizon', dataset.future_window),
+        if label_mode == 'scattered_hope':
+            from data import visualize_scattered_hope
+            print(
+                "\n📈 Visualizing scattered-hope (chance/wait) on test samples...",
+                flush=True,
             )
-        )
-
-        visualize_linear_trends(
-            total_tensor=dataset.Total,
-            valid_starts=valid_starts,
-            label_tensor=full_labels,
-            mean_tensor=raw_means,
-            std_tensor=raw_stds,
-            price_feature_idx=dataset.price_feature_idx,
-            past_window=dataset.past_window,
-            future_window=dataset.future_window,
-            mode=config.get('horizon_mode', 'anchored'),
-            num_samples=min(6, n_viz),
-            pred_tensor=preds.detach().cpu(),
-            fixed_order=True,
-            sample_ids=list(used_indices),
-            default_pred_horizon=pred_horizon,
-            min_horizon=config.get(
-                'min_trend_horizon',
-                getattr(dataset, 'min_trend_horizon', getattr(dataset, 'min_horizon', 3)),
-            ),
-            max_horizon=config.get(
-                'max_trend_future_horizon',
-                getattr(dataset, 'max_trend_future_horizon', None),
-            ),
-            max_past_horizon=config.get(
-                'max_trend_future_horizon',
-                getattr(dataset, 'max_trend_future_horizon', None),
-            ),
-            fitness_threshold=config.get(
-                'fitness_threshold', getattr(dataset, 'fitness_threshold', 0.75)
-            ),
-            horizon_search=config.get(
-                'horizon_search', getattr(dataset, 'horizon_search', 'longest_linear')
-            ),
-            regime_use_past=config.get(
-                'regime_use_past', getattr(dataset, 'regime_use_past', True)
-            ),
-            normalize_prices=config.get('normalize', getattr(dataset, 'normalize', True)),
-        )
+            visualize_scattered_hope(
+                total_tensor=dataset.Total,
+                valid_starts=valid_starts,
+                label_tensor=full_labels,
+                price_feature_idx=dataset.price_feature_idx,
+                past_window=dataset.past_window,
+                future_window=dataset.future_window,
+                min_yield_percent=config.get(
+                    'min_yield_percent',
+                    getattr(dataset, 'min_yield_percent', 0.0),
+                ),
+                max_hope_future_horizon=config.get(
+                    'max_hope_future_horizon',
+                    getattr(dataset, 'max_hope_future_horizon', None),
+                ),
+                num_samples=min(6, n_viz),
+                pred_tensor=pred_cpu,
+                fixed_order=True,
+                sample_ids=list(used_indices),
+            )
+        else:
+            from data import visualize_linear_trends
+            print(
+                "\n📈 Visualizing label vs inferred trends on test samples...",
+                flush=True,
+            )
+            raw_means = torch.stack([dataset.mean_tensor[i] for i in used_indices])
+            raw_stds = torch.stack([dataset.std_tensor[i] for i in used_indices])
+            pred_horizon = int(
+                config.get('max_trend_future_horizon')
+                if config.get('max_trend_future_horizon') is not None
+                else getattr(
+                    dataset, 'max_trend_future_horizon',
+                    getattr(dataset, 'max_horizon', dataset.future_window),
+                )
+            )
+            visualize_linear_trends(
+                total_tensor=dataset.Total,
+                valid_starts=valid_starts,
+                label_tensor=full_labels,
+                mean_tensor=raw_means,
+                std_tensor=raw_stds,
+                price_feature_idx=dataset.price_feature_idx,
+                past_window=dataset.past_window,
+                future_window=dataset.future_window,
+                mode=config.get('horizon_mode', 'anchored'),
+                num_samples=min(6, n_viz),
+                pred_tensor=pred_cpu,
+                fixed_order=True,
+                sample_ids=list(used_indices),
+                default_pred_horizon=pred_horizon,
+                min_horizon=config.get(
+                    'min_trend_horizon',
+                    getattr(dataset, 'min_trend_horizon', getattr(dataset, 'min_horizon', 3)),
+                ),
+                max_horizon=config.get(
+                    'max_trend_future_horizon',
+                    getattr(dataset, 'max_trend_future_horizon', None),
+                ),
+                max_past_horizon=config.get(
+                    'max_trend_future_horizon',
+                    getattr(dataset, 'max_trend_future_horizon', None),
+                ),
+                fitness_threshold=config.get(
+                    'fitness_threshold', getattr(dataset, 'fitness_threshold', 0.75)
+                ),
+                horizon_search=config.get(
+                    'horizon_search', getattr(dataset, 'horizon_search', 'longest_linear')
+                ),
+                regime_use_past=config.get(
+                    'regime_use_past', getattr(dataset, 'regime_use_past', True)
+                ),
+                normalize_prices=config.get('normalize', getattr(dataset, 'normalize', True)),
+            )
 
     print(f"\n✓ Inference complete!", flush=True)
 

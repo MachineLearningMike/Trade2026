@@ -45,6 +45,12 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
         'output_dim': config.get('output_dim', 3),
         'max_trend_future_horizon': config.get('max_trend_future_horizon'),
         'max_hope_future_horizon': config.get('max_hope_future_horizon'),
+        # model p length (mode-dependent)
+        'model_past_len': (
+            config.get('max_hope_future_horizon')
+            if config.get('label') == 'scattered_hope'
+            else config.get('max_trend_future_horizon')
+        ),
         'label': config.get('label', 'linear_regime'),
         'causal': config.get('causal'),
         'use_reconstruction': config.get('use_reconstruction'),

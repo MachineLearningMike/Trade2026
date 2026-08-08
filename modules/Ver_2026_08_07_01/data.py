@@ -103,6 +103,17 @@ def resolve_future_window(config: dict) -> int:
     return int(config.get('max_trend_future_horizon', 50))
 
 
+def resolve_model_past_len(config: dict) -> int:
+    """
+    Length of recent-past price vector ``p`` fed to the model head.
+
+    Matches the active label mode's future horizon scale:
+      linear_regime  → max_trend_future_horizon
+      scattered_hope → max_hope_future_horizon
+    """
+    return resolve_future_window(config)
+
+
 # ═══════════════════════════════════════════════════════════
 # CONFIG-ONLY FEATURE LAYOUT + DATASET SIGNATURE
 # (no Binance download / no FSV time-series materialization)
@@ -248,10 +259,14 @@ def generate_dataset_signature(config: dict) -> str:
         # --- windowing / sampling ---
         'past_days': past_days,
         'future_window': future_window,
+        'model_past_len': resolve_model_past_len(config),
         'step': config.get('step', 1),
 
         # --- label algorithm ---
         'label': config.get('label', LABEL_LINEAR_REGIME),
+        # hope labels always use raw price %; linear uses z-score when normalize=True
+        'hope_label_price_space': 'raw',
+        'linear_label_price_space': 'zscore' if config.get('normalize', True) else 'raw',
         'min_yield_percent': config.get('min_yield_percent', 0.0),
         'max_hope_future_horizon': config.get('max_hope_future_horizon', 60),
         'min_trend_horizon': config.get('min_trend_horizon', 3),
@@ -1128,6 +1143,249 @@ def visualize_linear_trends(
     plt.show(block=True)
 
 
+def visualize_scattered_hope(
+    total_tensor: torch.Tensor,
+    valid_starts: List[int],
+    label_tensor: torch.Tensor,
+    price_feature_idx: int,
+    past_window: int,
+    future_window: int,
+    min_yield_percent: float = 0.0,
+    max_hope_future_horizon: Optional[int] = None,
+    num_samples: int = 6,
+    figsize: Tuple[int, int] = (15, 10),
+    interactive: bool = True,
+    pred_tensor: Optional[torch.Tensor] = None,
+    fixed_order: bool = False,
+    sample_ids: Optional[List[int]] = None,
+    past_context: int = 15,
+):
+    """
+    Visualize scattered-hope labels (chance, wait) in raw price space.
+
+    Each panel:
+      - recent past + future actual prices
+      - horizontal line at reference price history[-1]
+      - markers on future bars where yield % >= min_yield_percent
+      - label (chance, wait); optional pred (chance, wait)
+    """
+    if total_tensor.is_cuda:
+        total_tensor = total_tensor.cpu()
+    if label_tensor.is_cuda:
+        label_tensor = label_tensor.cpu()
+    if pred_tensor is not None and pred_tensor.is_cuda:
+        pred_tensor = pred_tensor.cpu()
+
+    num_available = int(label_tensor.shape[0])
+    if num_available == 0:
+        print("⚠ No samples available for hope visualization.")
+        return
+    if pred_tensor is not None and pred_tensor.shape[0] != num_available:
+        raise ValueError(
+            f"pred_tensor length ({pred_tensor.shape[0]}) must match "
+            f"label_tensor length ({num_available})"
+        )
+
+    num_samples = min(num_samples, num_available)
+    if num_samples < 1:
+        num_samples = 1
+    if not fixed_order and num_samples % 2 != 0 and num_samples >= 6:
+        num_samples = 6
+
+    n_cols = 3 if num_samples > 1 else 1
+    n_rows = max(1, (num_samples + n_cols - 1) // n_cols)
+    n_pages = (
+        max(1, (num_available + num_samples - 1) // num_samples)
+        if fixed_order else None
+    )
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+    axes = np.atleast_1d(axes).ravel()
+    if interactive:
+        fig.subplots_adjust(
+            left=0.07, right=0.98, top=0.88, bottom=0.14, hspace=0.50, wspace=0.25
+        )
+    else:
+        fig.subplots_adjust(
+            left=0.07, right=0.98, top=0.88, bottom=0.08, hspace=0.50, wspace=0.25
+        )
+
+    page_num = [0]
+    _widgets: List[Any] = []
+    max_h = (
+        int(max_hope_future_horizon)
+        if max_hope_future_horizon is not None
+        else int(future_window)
+    )
+    max_h = min(max_h, int(future_window))
+
+    def _page_indices(page: int) -> List[int]:
+        k = min(num_samples, num_available)
+        if fixed_order:
+            start_i = (page - 1) * num_samples
+            if start_i >= num_available:
+                start_i = 0
+            return list(range(start_i, min(start_i + num_samples, num_available)))
+        rng = random.Random(int(time.time() * 1000) + page)
+        return rng.sample(range(num_available), k)
+
+    def _as_pair(vec) -> Tuple[float, float]:
+        v = vec.detach().cpu().flatten() if hasattr(vec, 'detach') else vec
+        return float(v[0]), float(v[1])
+
+    def _draw_page():
+        page_num[0] += 1
+        if fixed_order and n_pages is not None and page_num[0] > n_pages:
+            page_num[0] = 1
+        indices = _page_indices(page_num[0])
+
+        for ax in axes:
+            ax.clear()
+            ax.set_visible(True)
+
+        for i, idx in enumerate(indices):
+            if i >= len(axes):
+                break
+            ax = axes[i]
+            start = valid_starts[idx]
+            y_start = start + past_window
+            y_end = y_start + future_window
+
+            history = total_tensor[start:y_start, price_feature_idx].float()
+            future = total_tensor[y_start:y_end, price_feature_idx].float()
+            ref = float(history[-1].item()) if history.numel() else 0.0
+            eps = 1e-8
+            denom = ref if abs(ref) > eps else (ref + eps if ref >= 0 else ref - eps)
+
+            # Context: recent past + full future
+            past_ctx = min(past_context, past_window, y_start)
+            ctx_start = y_start - past_ctx
+            actual = total_tensor[ctx_start:y_end, price_feature_idx].cpu().numpy()
+            t_axis = np.arange(-past_ctx, len(actual) - past_ctx)
+
+            if past_ctx > 0:
+                ax.plot(
+                    t_axis[: past_ctx + 1], actual[: past_ctx + 1],
+                    color='#8AB4D4', linewidth=2, label='Actual (past)', alpha=0.8,
+                )
+            ax.plot(
+                t_axis[past_ctx:], actual[past_ctx:],
+                'b-', linewidth=2, label='Actual (future)', alpha=0.8,
+            )
+
+            # Reference price at t=0 decision
+            ax.axhline(y=ref, color='gray', linestyle=':', linewidth=1.2, alpha=0.7,
+                       label=f'ref={ref:.2f}')
+            ax.axvline(x=0, color='gray', linestyle=':', linewidth=1.2, alpha=0.5)
+
+            # Event markers: yield % >= threshold within hope horizon
+            n_hope = min(max_h, int(future.shape[0]))
+            event_t, event_p, event_y = [], [], []
+            for t in range(n_hope):
+                yv = float(((future[t] - ref) / denom) * 100)
+                if yv >= min_yield_percent:
+                    event_t.append(t)
+                    event_p.append(float(future[t].item()))
+                    event_y.append(yv)
+            if event_t:
+                ax.scatter(
+                    event_t, event_p, c='orange', s=28, zorder=5,
+                    label=f'hits (≥{min_yield_percent:g}%)',
+                )
+                # Light connector from ref to each hit
+                for tt, pp in zip(event_t, event_p):
+                    ax.plot([0, tt], [ref, pp], color='orange', alpha=0.25, linewidth=1.0)
+
+            # Hope horizon band
+            if n_hope > 0:
+                ax.axvspan(0, max(n_hope - 1, 0), alpha=0.08, color='#FFE0B2')
+
+            chance_lbl, wait_lbl = _as_pair(label_tensor[idx])
+            title_l1 = f'chance={chance_lbl:.2f}, wait={wait_lbl:.2f}'
+            title_l2 = None
+            if pred_tensor is not None:
+                chance_prd, wait_prd = _as_pair(pred_tensor[idx])
+                title_l2 = f'pred chance={chance_prd:.2f}, wait={wait_prd:.2f}'
+                # Annotate corner so pred is visible without cluttering legend
+                ax.text(
+                    0.02, 0.98,
+                    f'pred c={chance_prd:.1f} w={wait_prd:.1f}',
+                    transform=ax.transAxes, va='top', ha='left', fontsize=8,
+                    color='green',
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7),
+                )
+
+            display_id = sample_ids[idx] if sample_ids is not None else idx
+            head = f'Sample {display_id}: {title_l1}'
+            ax.set_title(
+                head if title_l2 is None else f'{head}\n{title_l2}',
+                fontsize=9,
+            )
+            ax.set_xlabel('Time (min; t=0 = first future bar)')
+            ax.set_ylabel('Price (raw)')
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=7, loc='best')
+
+        for i in range(len(indices), len(axes)):
+            axes[i].clear()
+            axes[i].set_visible(False)
+
+        page_label = f'Page {page_num[0]}'
+        if fixed_order and n_pages is not None:
+            page_label = f'Page {page_num[0]}/{n_pages}'
+        line1 = f'Scattered Hope — min_yield={min_yield_percent:g}%  |  {page_label}'
+        line2_parts = [f'horizon={max_h}', 'orange=hits ≥ threshold']
+        if pred_tensor is not None:
+            line2_parts.append('green text=pred')
+        if fixed_order:
+            line2_parts.append('chosen samples only')
+        if interactive:
+            line2_parts.append('[Next] / [Quit]')
+        line2 = '  |  '.join(line2_parts)
+        fig.suptitle(f'{line1}\n{line2}', fontsize=12, fontweight='bold')
+        fig.canvas.draw_idle()
+        shown_ids = (
+            [sample_ids[i] for i in indices] if sample_ids is not None else list(indices)
+        )
+        print(f"  {page_label}: samples {shown_ids}")
+
+    if interactive:
+        ax_next = fig.add_axes([0.55, 0.02, 0.18, 0.055])
+        ax_quit = fig.add_axes([0.76, 0.02, 0.18, 0.055])
+        btn_next = Button(ax_next, 'Next')
+        btn_quit = Button(ax_quit, 'Quit')
+        _widgets.extend([btn_next, btn_quit, ax_next, ax_quit])
+
+        def _on_next(_event):
+            _draw_page()
+
+        def _on_quit(_event):
+            print("  Quit — closing hope browser.")
+            plt.close(fig)
+
+        btn_next.on_clicked(_on_next)
+        btn_quit.on_clicked(_on_quit)
+
+        def _on_key(event):
+            if event.key in ('n', 'right', ' '):
+                _draw_page()
+            elif event.key in ('q', 'escape'):
+                print("  Quit — closing hope browser.")
+                plt.close(fig)
+
+        fig.canvas.mpl_connect('key_press_event', _on_key)
+        if fixed_order:
+            print(
+                f"Hope browser ({num_available} chosen samples): "
+                f"[Next] or N/Space = next page · [Quit] or Q = exit"
+            )
+        else:
+            print("Hope browser: [Next] or N/Space = next page · [Quit] or Q = exit")
+
+    _draw_page()
+    plt.show(block=True)
+
+
 # ═══════════════════════════════════════════════════════════
 # NORMALIZATION FUNCTION (PUBLIC)
 # ═══════════════════════════════════════════════════════════
@@ -1242,9 +1500,9 @@ class TradingDataset(Dataset):
         if mtf is None:
             mtf = self.future_minutes
         self.max_trend_future_horizon = int(mtf)
-        # Past regime extent + model p length use the same max as trend future
-        # (config key max_trend_future_horizon; formerly max_past_horizon / max_horizon).
-        self.max_past_horizon = self.max_trend_future_horizon
+        # Model p length + regime past max follow the active label mode's horizon.
+        self.model_past_len = resolve_model_past_len(config)
+        self.max_past_horizon = self.model_past_len
         # Aliases used by older call sites / viz
         self.min_horizon = self.min_trend_horizon
         self.max_horizon = self.max_trend_future_horizon
@@ -1301,11 +1559,14 @@ class TradingDataset(Dataset):
         if self.max_trend_future_horizon < self.min_trend_horizon:
             self.max_trend_future_horizon = self.min_trend_horizon
             self.max_horizon = self.max_trend_future_horizon
-            self.max_past_horizon = self.max_trend_future_horizon
             print(
                 f"⚠ max_trend_future_horizon adjusted to min_trend_horizon "
                 f"({self.min_trend_horizon})"
             )
+            # Re-sync model past length only if still on linear_regime
+            if self.label_mode == LABEL_LINEAR_REGIME:
+                self.model_past_len = self.max_trend_future_horizon
+                self.max_past_horizon = self.model_past_len
         
         self.valid_starts = self._get_valid_starts()
         
@@ -1339,6 +1600,7 @@ class TradingDataset(Dataset):
               f"(from {'max_hope_future_horizon' if self.label_mode == LABEL_SCATTERED_HOPE else 'max_trend_future_horizon'})")
         print(f"  Step: {step}")
         print(f"  Label mode: {self.label_mode}")
+        print(f"  Model past vector p length: {self.model_past_len}")
         if self.label_mode == LABEL_LINEAR_REGIME:
             print(f"  Horizon search: {self.horizon_search}")
             print(f"  Fitness threshold: {self.fitness_threshold}")
@@ -1348,9 +1610,11 @@ class TradingDataset(Dataset):
                 f"  Min trend horizon: {self.min_trend_horizon}, "
                 f"Max trend future: {self.max_trend_future_horizon}"
             )
+            print(f"  Label price space: z-scored (past-window μ,σ)")
         else:
             print(f"  min_yield_percent: {self.min_yield_percent}")
             print(f"  max_hope_future_horizon: {self.max_hope_future_horizon}")
+            print(f"  Label price space: raw prices (true % yield)")
         print(
             f"  Model output_dim: {self.output_dim} "
             f"{label_target_names(self.label_mode, self.output_dim)}"
@@ -1468,17 +1732,17 @@ class TradingDataset(Dataset):
                 start:start + self.past_window, self.price_feature_idx
             ]
 
-            if self.normalize:
-                price_mean = mean[self.price_feature_idx]
-                price_std = std[self.price_feature_idx]
-                # Same scale for future and history so fitness uses consistent σ.
-                future_for_label = (future_prices - price_mean) / price_std
-                history_for_label = (history_prices - price_mean) / price_std
-            else:
-                future_for_label = future_prices
-                history_for_label = history_prices
-
             if self.label_mode == LABEL_LINEAR_REGIME:
+                # Continuity labels in z-scored space (dimensionless residuals).
+                if self.normalize:
+                    price_mean = mean[self.price_feature_idx]
+                    price_std = std[self.price_feature_idx]
+                    future_for_label = (future_prices - price_mean) / price_std
+                    history_for_label = (history_prices - price_mean) / price_std
+                else:
+                    future_for_label = future_prices
+                    history_for_label = history_prices
+
                 best_h, best_slope, best_intercept, _best_h_past = find_linear_regime(
                     future_for_label,
                     history_for_label,
@@ -1486,19 +1750,18 @@ class TradingDataset(Dataset):
                     max_horizon=self.max_trend_future_horizon,
                     fitness_threshold=self.fitness_threshold,
                     mode=self.horizon_search,
-                    # Past max uses the same config as max_trend_future_horizon
                     max_past_horizon=self.max_trend_future_horizon,
                     use_past=self.regime_use_past,
                 )
                 # Full cache vector; model may slice to (m,b) when output_dim=2.
-                # Past span is recovered at viz time.
                 label = torch.tensor(
                     [best_h, best_slope, best_intercept], dtype=torch.float32
                 )
             elif self.label_mode == LABEL_SCATTERED_HOPE:
+                # True % yield vs last raw price — never z-score for hope.
                 chance, wait = find_scattered_hope(
-                    future_for_label,
-                    history_for_label,
+                    future_prices,
+                    history_prices,
                     min_yield_percent=self.min_yield_percent,
                     max_hope_future_horizon=self.max_hope_future_horizon,
                 )
@@ -1621,7 +1884,7 @@ class TradingDataset(Dataset):
         interactive: bool = True,
     ):
         """
-        Explicitly visualize linear trends for the dataset.
+        Visualize labels for the active mode (linear regime or scattered hope).
 
         Args:
             num_samples: Samples per page
@@ -1633,6 +1896,26 @@ class TradingDataset(Dataset):
             return
 
         print("\n" + "=" * 60)
+        if self.label_mode == LABEL_SCATTERED_HOPE:
+            print("VISUALIZING SCATTERED HOPE (chance / wait)")
+            if interactive:
+                print("  Interactive: Next = new random page, Quit = exit")
+            print("=" * 60)
+            visualize_scattered_hope(
+                total_tensor=self.Total,
+                valid_starts=self.valid_starts,
+                label_tensor=self.label_tensor,
+                price_feature_idx=self.price_feature_idx,
+                past_window=self.past_window,
+                future_window=self.future_window,
+                min_yield_percent=self.min_yield_percent,
+                max_hope_future_horizon=self.max_hope_future_horizon,
+                num_samples=num_samples,
+                figsize=figsize,
+                interactive=interactive,
+            )
+            return
+
         print("VISUALIZING LINEAR TRENDS")
         if interactive:
             print("  Interactive: Next = new random page, Quit = exit")
@@ -1766,8 +2049,8 @@ class TradingDataset(Dataset):
         # Normalize label, mean, std, and shape using dataset statistics
         y_normalized = self.normalize_y(y)
 
-        # Shared with both label modes: recent past prices for the model head.
-        recent_prices = x_normalized[-self.max_past_horizon:, self.price_feature_idx]
+        # Shared architecture: recent past prices p (length = model_past_len).
+        recent_prices = x_normalized[-self.model_past_len:, self.price_feature_idx]
         
         # Mean: (F,)
         mean_normalized = (mean - self.stats['mean']['mean']) / (self.stats['mean']['std'] + 1e-8)
