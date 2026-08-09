@@ -331,9 +331,17 @@ def run_test(
 
     out_dim = preds.shape[-1]
     label_mode = config.get('label', getattr(dataset, 'label_mode', 'linear_regime'))
+    chance_only = bool(
+        config.get('chance_only', getattr(dataset, 'chance_only', False))
+    )
     print("\n📊 Test Set Results:")
     metrics = {}
-    if label_mode == 'scattered_hope' and out_dim == 2:
+    if label_mode == 'scattered_hope' and (chance_only or out_dim == 1):
+        metrics['chance_mse'] = torch.nn.functional.mse_loss(
+            preds[:, 0], test_labels[:, 0]
+        ).item()
+        print(f"  Chance MSE:      {metrics['chance_mse']:.4f}")
+    elif label_mode == 'scattered_hope' and out_dim == 2:
         metrics['chance_mse'] = torch.nn.functional.mse_loss(
             preds[:, 0], test_labels[:, 0]
         ).item()
@@ -368,7 +376,14 @@ def run_test(
         raise ValueError(f"Unexpected pred dim {out_dim}")
 
     print(f"\n📈 Sample Predictions (first 5):")
-    if label_mode == 'scattered_hope' and out_dim == 2:
+    if label_mode == 'scattered_hope' and (chance_only or out_dim == 1):
+        print(f"  {'Index':<6} {'True Chance':<12} {'Pred Chance':<12}")
+        print(f"  {'-'*6} {'-'*12} {'-'*12}")
+        for i in range(min(5, len(preds))):
+            print(
+                f"  {i:<6} {test_labels[i, 0].item():<12.4f} {preds[i, 0].item():<12.4f}"
+            )
+    elif label_mode == 'scattered_hope' and out_dim == 2:
         print(
             f"  {'Index':<6} {'True Chance':<12} {'Pred Chance':<12} "
             f"{'True Wait':<12} {'Pred Wait':<12}"
@@ -431,6 +446,7 @@ def run_test(
                     'max_hope_future_horizon',
                     getattr(dataset, 'max_hope_future_horizon', None),
                 ),
+                chance_only=chance_only,
                 num_samples=min(6, n_viz),
                 pred_tensor=pred_cpu,
                 fixed_order=True,

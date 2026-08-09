@@ -126,6 +126,21 @@ class TrainingState:
         self.save_every_n_minibatches = save_every_n_minibatches
         self.max_checkpoints = max_checkpoints
         self.state_file = self.save_dir / 'training_state.json'
+
+    def _list_checkpoint_files(self):
+        """
+        List weight files for cleanup / resume discovery.
+
+        New:    checkpoint_{step}_{YYYYMMDD}_{HHMMSS}.pt
+                emergency_{step}_{YYYYMMDD}_{HHMMSS}.pt
+        Legacy: checkpoint_minibatch{step}_... / emergency_minibatch{step}_...
+
+        ``checkpoint_*.pt`` / ``emergency_*.pt`` match both schemes.
+        """
+        return (
+            list(self.save_dir.glob('checkpoint_*.pt'))
+            + list(self.save_dir.glob('emergency_*.pt'))
+        )
         
     def save_checkpoint(self, model, optimizer, dataloader_state, epoch, batch_idx, 
                         total_minibatches_processed, loss, is_emergency=False):
@@ -143,9 +158,11 @@ class TrainingState:
             'is_emergency': is_emergency,
         }
         
+        # Filename drops the "minibatch" token; JSON still stores
+        # total_minibatches_processed for compatibility with older files.
         timestamp = time.strftime('%Y%m%d_%H%M%S')
         prefix = 'emergency' if is_emergency else 'checkpoint'
-        checkpoint_file = self.save_dir / f'{prefix}_minibatch{total_minibatches_processed}_{timestamp}.pt'
+        checkpoint_file = self.save_dir / f'{prefix}_{total_minibatches_processed}_{timestamp}.pt'
         
         # Atomic save: write to temp file, then rename
         temp_file = checkpoint_file.with_suffix('.tmp')
@@ -173,14 +190,14 @@ class TrainingState:
         
         if is_emergency:
             print(f"\n{'!'*60}")
-            print(f"EMERGENCY CHECKPOINT SAVED at minibatch {total_minibatches_processed}")
+            print(f"EMERGENCY CHECKPOINT SAVED at step {total_minibatches_processed}")
             print(f"  File: {checkpoint_file.name}")
             print(f"  Epoch: {epoch+1}, Batch: {batch_idx}")
             print(f"  Loss: {loss:.4f}")
             print(f"{'!'*60}")
         else:
             print(f"\n{'='*60}")
-            print(f"Checkpoint saved at minibatch {total_minibatches_processed}")
+            print(f"Checkpoint saved at step {total_minibatches_processed}")
             print(f"  File: {checkpoint_file.name}")
             print(f"  Epoch: {epoch+1}, Batch: {batch_idx}")
             print(f"  Loss: {loss:.4f}")
@@ -200,9 +217,14 @@ class TrainingState:
         
         latest_checkpoint = Path(state_info['latest_checkpoint'])
         
+        # If state points at a missing path, fall back to newest on disk
+        # (covers both new and legacy minibatch filenames).
         if not latest_checkpoint.exists():
-            print(f"⚠ Checkpoint file not found. Starting fresh.")
-            return None
+            on_disk = self._list_checkpoint_files()
+            if not on_disk:
+                print(f"⚠ Checkpoint file not found. Starting fresh.")
+                return None
+            latest_checkpoint = max(on_disk, key=lambda f: f.stat().st_mtime)
         
         print(f"Found checkpoint: {latest_checkpoint.name}")
         
@@ -229,7 +251,7 @@ class TrainingState:
                 print(f"⚠ Resuming from EMERGENCY checkpoint")
             else:
                 print(f"Resuming from checkpoint")
-            print(f"  Minibatch: {total_minibatches_processed}")
+            print(f"  Step: {total_minibatches_processed}")
             print(f"  Epoch {epoch+1}, batch {batch_idx}")
             print(f"  Loss: {loss:.4f}")
             
@@ -239,8 +261,7 @@ class TrainingState:
     
     def _cleanup_old_checkpoints(self):
         all_checkpoints = sorted(
-            list(self.save_dir.glob('checkpoint_minibatch*.pt')) + 
-            list(self.save_dir.glob('emergency_minibatch*.pt')),
+            self._list_checkpoint_files(),
             key=os.path.getmtime,
             reverse=True
         )

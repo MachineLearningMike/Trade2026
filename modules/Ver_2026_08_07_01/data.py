@@ -40,6 +40,7 @@ from labels import (
     label_target_names,
     resolve_future_window,
     resolve_model_past_len,
+    resolve_hope_output_dim,
     find_linear_regime,
     find_scattered_hope,
 )
@@ -203,6 +204,7 @@ def generate_dataset_signature(config: dict) -> str:
         'linear_label_price_space': 'zscore' if config.get('normalize', True) else 'raw',
         'min_yield_percent': config.get('min_yield_percent', 0.0),
         'max_hope_future_horizon': config.get('max_hope_future_horizon', 60),
+        'chance_only': bool(config.get('chance_only', False)),
         'min_trend_horizon': config.get('min_trend_horizon', 3),
         'max_trend_future_horizon': max_trend_future,
         'regime_use_past': config.get('regime_use_past', True),
@@ -521,6 +523,7 @@ class TradingDataset(Dataset):
         self.max_hope_future_horizon = int(
             config.get('max_hope_future_horizon', 60)
         )
+        self.chance_only = bool(config.get('chance_only', False))
 
         # future_window from label-mode max future horizon
         if future_minutes is None:
@@ -555,17 +558,21 @@ class TradingDataset(Dataset):
         self.regime_use_past = bool(config.get('regime_use_past', True))
         self.output_dim = int(config.get('output_dim', 3))
         if self.label_mode == LABEL_SCATTERED_HOPE:
-            if self.output_dim != 2:
+            hope_dim = resolve_hope_output_dim(self.chance_only)
+            if self.output_dim != hope_dim:
+                names = '(chance,)' if self.chance_only else '(chance, wait)'
                 print(
-                    f"⚠ label={LABEL_SCATTERED_HOPE}: forcing output_dim "
-                    f"{self.output_dim} → 2 (chance, wait)"
+                    f"⚠ label={LABEL_SCATTERED_HOPE} chance_only={self.chance_only}: "
+                    f"forcing output_dim {self.output_dim} → {hope_dim} {names}"
                 )
-                self.output_dim = 2
+                self.output_dim = hope_dim
         elif self.output_dim not in (2, 3):
             raise ValueError(
                 f"output_dim must be 2 or 3 for linear_regime, got {self.output_dim}"
             )
-        self._label_slice = label_target_slice(self.label_mode, self.output_dim)
+        self._label_slice = label_target_slice(
+            self.label_mode, self.output_dim, chance_only=self.chance_only
+        )
         self.horizon_mode = config.get('horizon_mode', 'floating')
         self.weight_type = config.get('weight_type', 'exponential')
         self.weight_decay = config.get('weight_decay', 0.9)
@@ -648,10 +655,11 @@ class TradingDataset(Dataset):
         else:
             print(f"  min_yield_percent: {self.min_yield_percent}")
             print(f"  max_hope_future_horizon: {self.max_hope_future_horizon}")
+            print(f"  chance_only: {self.chance_only}")
             print(f"  Label price space: raw prices (true % yield)")
         print(
             f"  Model output_dim: {self.output_dim} "
-            f"{label_target_names(self.label_mode, self.output_dim)}"
+            f"{label_target_names(self.label_mode, self.output_dim, self.chance_only)}"
         )
         print(f"  Horizon viz mode: {self.horizon_mode}")
         if self.horizon_mode == 'weighted':
@@ -668,14 +676,14 @@ class TradingDataset(Dataset):
         full_names = (
             ('horizon', 'slope', 'intercept')
             if self.label_mode == LABEL_LINEAR_REGIME
-            else ('chance', 'wait')
+            else (('chance',) if self.chance_only else ('chance', 'wait'))
         )
         print(f"  Full label {full_names}:")
         print(f"    Mean:  {self.stats['label']['mean'].tolist()}")
         print(f"    Std:   {self.stats['label']['std'].tolist()}")
         print(
             f"  Model target "
-            f"{label_target_names(self.label_mode, self.output_dim)}:"
+            f"{label_target_names(self.label_mode, self.output_dim, self.chance_only)}:"
         )
         print(f"    Mean:  {self._label_stat_mean.tolist()}")
         print(f"    Std:   {self._label_stat_std.tolist()}")
@@ -793,14 +801,15 @@ class TradingDataset(Dataset):
                 )
             elif self.label_mode == LABEL_SCATTERED_HOPE:
                 # True % yield vs last raw price — never z-score for hope.
-                chance, wait = find_scattered_hope(
+                hope_vals = find_scattered_hope(
                     future_prices,
                     history_prices,
                     min_yield_percent=self.min_yield_percent,
                     max_hope_future_horizon=self.max_hope_future_horizon,
+                    chance_only=self.chance_only,
                 )
                 label = torch.tensor(
-                    [float(chance), float(wait)], dtype=torch.float32
+                    [float(v) for v in hope_vals], dtype=torch.float32
                 )
             else:
                 raise ValueError(f"Unknown label mode: {self.label_mode!r}")
@@ -897,6 +906,7 @@ class TradingDataset(Dataset):
                 'horizon_search': self.horizon_search,
                 'label': self.label_mode,
                 'min_yield_percent': self.min_yield_percent,
+                'chance_only': self.chance_only,
                 'normalize': self.normalize,
                 'price_feature_idx': self.price_feature_idx,
                 'cache_key': self.cache_key,
@@ -931,7 +941,12 @@ class TradingDataset(Dataset):
 
         print("\n" + "=" * 60)
         if self.label_mode == LABEL_SCATTERED_HOPE:
-            print("VISUALIZING SCATTERED HOPE (chance / wait)")
+            title = (
+                "VISUALIZING SCATTERED HOPE (chance only)"
+                if self.chance_only
+                else "VISUALIZING SCATTERED HOPE (chance / wait)"
+            )
+            print(title)
             if interactive:
                 print("  Interactive: Next = new random page, Quit = exit")
             print("=" * 60)
@@ -944,6 +959,7 @@ class TradingDataset(Dataset):
                 future_window=self.future_window,
                 min_yield_percent=self.min_yield_percent,
                 max_hope_future_horizon=self.max_hope_future_horizon,
+                chance_only=self.chance_only,
                 num_samples=num_samples,
                 figsize=figsize,
                 interactive=interactive,

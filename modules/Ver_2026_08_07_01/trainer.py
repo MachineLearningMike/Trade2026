@@ -25,44 +25,28 @@ from config import get_config
 
 def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
     """
-    Hash everything that makes model weights / optimizer state non-transferable.
+    Hash model neural-network structure + dataset identity.
 
     `dataset_signature` already covers data source, windows, labels, splits,
     and normalization — do not re-list those here.
+
+    Only architecture params that change weight shapes / module layout are
+    included. Training hyperparams (dropout, loss weights, learning_rate,
+    batch_size, …) are intentionally omitted: they do not redefine the net.
     """
     key_params = {
-        # Data + labels (from TradingDataset._generate_cache_key)
         'dataset_signature': dataset_signature,
 
-        # Architecture (changes weight shapes / forward pass)
+        # Architecture only (weight shapes / module layout)
         'patch_size': config.get('patch_size'),
         'num_layers': config.get('num_layers'),
         'num_heads': config.get('num_heads'),
         'n_latent_macro_features': config.get('n_latent_macro_features'),
         'ff_dim_multiplier': config.get('ff_dim_multiplier'),
-        'dropout': config.get('dropout'),
         'head_hidden_dim_multiplier': config.get('head_hidden_dim_multiplier'),
         'output_dim': config.get('output_dim', 3),
-        'max_trend_future_horizon': config.get('max_trend_future_horizon'),
-        'max_hope_future_horizon': config.get('max_hope_future_horizon'),
-        # model p length (mode-dependent)
-        'model_past_len': (
-            config.get('max_hope_future_horizon')
-            if config.get('label') == 'scattered_hope'
-            else config.get('max_trend_future_horizon')
-        ),
-        'label': config.get('label', 'linear_regime'),
         'causal': config.get('causal'),
         'use_reconstruction': config.get('use_reconstruction'),
-
-        # Objective + optimizer (same weights, different training meaning)
-        'slope_loss_weight': config.get('slope_loss_weight'),
-        'intercept_loss_weight': config.get('intercept_loss_weight'),
-        'chance_loss_weight': config.get('chance_loss_weight'),
-        'wait_loss_weight': config.get('wait_loss_weight'),
-        'reconstruction_loss_weight': config.get('reconstruction_loss_weight'),
-        'learning_rate': config.get('learning_rate'),
-        'batch_size': config.get('batch_size'),
     }
 
     param_string = json.dumps(key_params, sort_keys=True, default=str)
@@ -90,12 +74,27 @@ class TrainingState:
         self.state_file = self.save_dir / 'training_state.json'
         self.checkpoint_key = checkpoint_key
         self.planned_total_epochs = None  # preserved across checkpoint saves
+
+    def _list_checkpoint_files(self):
+        """
+        List weight files for cleanup / resume discovery.
+
+        New scheme:  checkpoint_{step}_{YYYYMMDD}_{HHMMSS}.pt
+                     emergency_{step}_{YYYYMMDD}_{HHMMSS}.pt
+        Legacy:      checkpoint_minibatch{step}_{YYYYMMDD}_{HHMMSS}.pt
+                     emergency_minibatch{step}_{YYYYMMDD}_{HHMMSS}.pt
+
+        Patterns below match both (``checkpoint_*.pt`` includes ``*_minibatch*``).
+        """
+        return (
+            list(self.save_dir.glob('checkpoint_*.pt'))
+            + list(self.save_dir.glob('emergency_*.pt'))
+        )
     
     def _cleanup_old_checkpoints(self):
         """Clean up old checkpoint files, keeping only the most recent ones."""
         all_checkpoints = sorted(
-            list(self.save_dir.glob('checkpoint_minibatch*.pt')) + 
-            list(self.save_dir.glob('emergency_minibatch*.pt')),
+            self._list_checkpoint_files(),
             key=lambda f: f.stat().st_mtime,
             reverse=True
         )
@@ -166,9 +165,12 @@ class TrainingState:
         if latest_epoch_loss is not None and (is_emergency or training_finished):
             checkpoint['latest_epoch_loss'] = latest_epoch_loss
         
+        # Filename: {checkpoint|emergency}_{step}_{YYYYMMDD}_{HHMMSS}.pt
+        # (no "minibatch" token). JSON payload still uses total_minibatches_processed
+        # so older state/checkpoint contents remain readable.
         timestamp = time.strftime('%Y%m%d_%H%M%S')
         prefix = 'emergency' if is_emergency else 'checkpoint'
-        checkpoint_file = self.save_dir / f'{prefix}_minibatch{total_minibatches_processed}_{timestamp}.pt'
+        checkpoint_file = self.save_dir / f'{prefix}_{total_minibatches_processed}_{timestamp}.pt'
         
         temp_file = checkpoint_file.with_suffix('.tmp')
         torch.save(checkpoint, temp_file)
@@ -439,10 +441,9 @@ class TrainingState:
             print("⚠ State file corrupted. Starting fresh.")
             return None
         
-        # Find the most recent checkpoint file FIRST (we need it regardless)
-        checkpoint_files = list(self.save_dir.glob('checkpoint_minibatch*.pt'))
-        emergency_files = list(self.save_dir.glob('emergency_minibatch*.pt'))
-        all_files = checkpoint_files + emergency_files
+        # Find the most recent checkpoint file FIRST (we need it regardless).
+        # Matches both new names and legacy ``*_minibatch*`` files.
+        all_files = self._list_checkpoint_files()
         
         if not all_files:
             print(f"⚠ No checkpoint files found in {self.save_dir}. Starting fresh.")
@@ -1095,10 +1096,7 @@ class ResumableTrainer:
         progress_cont = float(self.state_manager.get_progress_epochs(total_batches, continuous=True))
 
         if progress == 0 and progress_cont == 0:
-            checkpoint_files = (
-                list(self.state_manager.save_dir.glob("checkpoint_minibatch*.pt"))
-                + list(self.state_manager.save_dir.glob("emergency_minibatch*.pt"))
-            )
+            checkpoint_files = self.state_manager._list_checkpoint_files()
             if checkpoint_files:
                 latest = max(checkpoint_files, key=lambda f: f.stat().st_mtime)
                 try:

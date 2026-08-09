@@ -45,15 +45,18 @@ config = {
     #   'linear_regime'   → (horizon, slope, intercept) via find_linear_regime
     #                        model may use output_dim 2 (m,b) or 3 (h,m,b)
     #   'scattered_hope'  → (chance, wait) via find_scattered_hope
-    #                        requires output_dim=2
+    #                        or (chance,) if chance_only=True
     'label': 'scattered_hope',
 
     # ------------------------------------------------------------
-    # SCATTERED HOPE (distrubution of chance and wait)
+    # SCATTERED HOPE (distribution of chance and wait)
     # ------------------------------------------------------------
-    'min_yield_percent': 0.3,
+    'min_yield_percent': 0.25,
     # Also sets the sample future_window when label=scattered_hope
     'max_hope_future_horizon': 60,
+    # If True: only chance is labeled / predicted / lost (output_dim forced to 1).
+    # wait is not computed or stored.
+    'chance_only': True,
 
     # ------------------------------------------------------------
     # TREND / LINEAR-REGIME HORIZONS (linear_regime)
@@ -142,8 +145,9 @@ config = {
     # ============================================================
     'head_hidden_dim_multiplier': 4,
     # Prediction head width. Must match label family:
-    #   linear_regime:  3 = (h,m,b),  2 = (m,b)
-    #   scattered_hope: 2 = (chance, wait)  [forced if mismatch]
+    #   linear_regime:   3 = (h,m,b),  2 = (m,b)
+    #   scattered_hope:  2 = (chance, wait),  1 = (chance,) if chance_only
+    #                    [forced from label / chance_only if mismatch]
     'output_dim': 2,
     
     # ============================================================
@@ -151,7 +155,7 @@ config = {
     # ============================================================
     'epochs': 200,
     'batch_size': 8,
-    'learning_rate': 0.0002,
+    'learning_rate': 0.0005,
     'save_every_n_minibatches': 5000,
     'checkpoint_dir': 'trading_checkpoints',
     'max_checkpoints': 3,

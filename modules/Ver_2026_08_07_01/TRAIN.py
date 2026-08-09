@@ -656,6 +656,7 @@ def main(config):
     _onames = label_target_names(
         getattr(dataset, 'label_mode', config.get('label', 'linear_regime')),
         _od,
+        chance_only=getattr(dataset, 'chance_only', config.get('chance_only', False)),
     )
     print(f"  Output: {_onames} - {_od} values (output_dim)")
     print(f"  Total samples: {len(dataset)}")
@@ -721,6 +722,7 @@ def main(config):
             label_mode=dataset.label_mode,
             chance_weight=config.get('chance_loss_weight', 1.0),
             wait_weight=config.get('wait_loss_weight', 1.0),
+            chance_only=getattr(dataset, 'chance_only', False),
         ),
         name="MarketTransformerWithHeads",
     )
@@ -744,6 +746,7 @@ def main(config):
             label_mode=dataset.label_mode,
             chance_weight=config.get('chance_loss_weight', 1.0),
             wait_weight=config.get('wait_loss_weight', 1.0),
+            chance_only=getattr(dataset, 'chance_only', False),
         ),
         optimizer=optimizer,
         dataloader=train_loader,
@@ -772,7 +775,8 @@ def main(config):
     if config.get('label', 'linear_regime') == 'scattered_hope':
         print(
             f"min_yield_percent: {config.get('min_yield_percent')}, "
-            f"max_hope_future_horizon: {config.get('max_hope_future_horizon')}"
+            f"max_hope_future_horizon: {config.get('max_hope_future_horizon')}, "
+            f"chance_only: {config.get('chance_only', False)}"
         )
     else:
         print(

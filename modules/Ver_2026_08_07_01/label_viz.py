@@ -401,6 +401,7 @@ def visualize_scattered_hope(
     future_window: int,
     min_yield_percent: float = 0.0,
     max_hope_future_horizon: Optional[int] = None,
+    chance_only: bool = False,
     num_samples: int = 6,
     figsize: Tuple[int, int] = (15, 10),
     interactive: bool = True,
@@ -410,13 +411,13 @@ def visualize_scattered_hope(
     past_context: int = 15,
 ):
     """
-    Visualize scattered-hope labels (chance, wait) in raw price space.
+    Visualize scattered-hope labels in raw price space.
 
     Each panel:
       - recent past + future actual prices
       - horizontal line at reference price history[-1]
       - markers on future bars where yield % >= min_yield_percent
-      - label (chance, wait); optional pred (chance, wait)
+      - label chance[, wait]; optional pred
     """
     if total_tensor.is_cuda:
         total_tensor = total_tensor.cpu()
@@ -478,9 +479,11 @@ def visualize_scattered_hope(
         rng = random.Random(int(time.time() * 1000) + page)
         return rng.sample(range(num_available), k)
 
-    def _as_pair(vec) -> Tuple[float, float]:
-        v = vec.detach().cpu().flatten() if hasattr(vec, 'detach') else vec
-        return float(v[0]), float(v[1])
+    def _as_components(vec) -> Tuple[float, ...]:
+        v = vec.detach().cpu().flatten() if hasattr(vec, 'detach') else np.asarray(vec).ravel()
+        if chance_only or len(v) == 1:
+            return (float(v[0]),)
+        return (float(v[0]), float(v[1]))
 
     def _draw_page():
         page_num[0] += 1
@@ -541,24 +544,31 @@ def visualize_scattered_hope(
                     event_t, event_p, c='orange', s=28, zorder=5,
                     label=f'hits (≥{min_yield_percent:g}%)',
                 )
-                # Light connector from ref to each hit
                 for tt, pp in zip(event_t, event_p):
                     ax.plot([0, tt], [ref, pp], color='orange', alpha=0.25, linewidth=1.0)
 
-            # Hope horizon band
             if n_hope > 0:
                 ax.axvspan(0, max(n_hope - 1, 0), alpha=0.08, color='#FFE0B2')
 
-            chance_lbl, wait_lbl = _as_pair(label_tensor[idx])
-            title_l1 = f'chance={chance_lbl:.2f}, wait={wait_lbl:.2f}'
+            comps_lbl = _as_components(label_tensor[idx])
+            if chance_only or len(comps_lbl) == 1:
+                title_l1 = f'chance={comps_lbl[0]:.2f}'
+            else:
+                title_l1 = f'chance={comps_lbl[0]:.2f}, wait={comps_lbl[1]:.2f}'
             title_l2 = None
             if pred_tensor is not None:
-                chance_prd, wait_prd = _as_pair(pred_tensor[idx])
-                title_l2 = f'pred chance={chance_prd:.2f}, wait={wait_prd:.2f}'
-                # Annotate corner so pred is visible without cluttering legend
+                comps_prd = _as_components(pred_tensor[idx])
+                if chance_only or len(comps_prd) == 1:
+                    title_l2 = f'pred chance={comps_prd[0]:.2f}'
+                    pred_txt = f'pred c={comps_prd[0]:.1f}'
+                else:
+                    title_l2 = (
+                        f'pred chance={comps_prd[0]:.2f}, wait={comps_prd[1]:.2f}'
+                    )
+                    pred_txt = f'pred c={comps_prd[0]:.1f} w={comps_prd[1]:.1f}'
                 ax.text(
                     0.02, 0.98,
-                    f'pred c={chance_prd:.1f} w={wait_prd:.1f}',
+                    pred_txt,
                     transform=ax.transAxes, va='top', ha='left', fontsize=8,
                     color='green',
                     bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7),
@@ -582,7 +592,10 @@ def visualize_scattered_hope(
         page_label = f'Page {page_num[0]}'
         if fixed_order and n_pages is not None:
             page_label = f'Page {page_num[0]}/{n_pages}'
-        line1 = f'Scattered Hope — min_yield={min_yield_percent:g}%  |  {page_label}'
+        mode_note = 'chance_only' if chance_only else 'chance+wait'
+        line1 = (
+            f'Scattered Hope ({mode_note}) — min_yield={min_yield_percent:g}%  |  {page_label}'
+        )
         line2_parts = [f'horizon={max_h}', 'orange=hits ≥ threshold']
         if pred_tensor is not None:
             line2_parts.append('green text=pred')

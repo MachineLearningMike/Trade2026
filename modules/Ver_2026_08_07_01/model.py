@@ -245,13 +245,13 @@ class PredictionHead(nn.Module):
     Prediction head (layout depends on config label / output_dim):
 
     linear_regime:   3 → (horizon, slope, intercept);  2 → (slope, intercept)
-    scattered_hope:  2 → (chance, wait)
+    scattered_hope:  2 → (chance, wait);  1 → (chance,) if chance_only
     """
 
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int = 3, dropout: float = 0.1):
         super().__init__()
-        if output_dim not in (2, 3):
-            raise ValueError(f"output_dim must be 2 or 3, got {output_dim}")
+        if output_dim not in (1, 2, 3):
+            raise ValueError(f"output_dim must be 1, 2, or 3, got {output_dim}")
         self.output_dim = output_dim
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, output_dim)
@@ -275,7 +275,7 @@ class MarketTransformerWithHeads(nn.Module):
 
     output_dim controls the head layout (see config ``label``):
       linear_regime:  3 → (h, m, b);  2 → (m, b)
-      scattered_hope: 2 → (chance, wait)
+      scattered_hope: 2 → (chance, wait);  1 → (chance,) if chance_only
 
     Window statistics (mean / std / shape moments) condition the decoder via
     x_stat tokens. Recent past prices ``p`` are shared by both label modes.
@@ -301,8 +301,8 @@ class MarketTransformerWithHeads(nn.Module):
         num_shapes: int = 4,
     ):
         super().__init__()
-        if output_dim not in (2, 3):
-            raise ValueError(f"output_dim must be 2 or 3, got {output_dim}")
+        if output_dim not in (1, 2, 3):
+            raise ValueError(f"output_dim must be 1, 2, or 3, got {output_dim}")
         self.patch_size = patch_size
         self.in_features = in_features
         self.n_market_features = n_market_features
