@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple
 from config import get_config
+from labels import custom_loss, resolve_model_past_len  # shared label objective / p length
 
 
 # ═══════════════════════════════════════════════════════════
@@ -593,78 +594,7 @@ class MarketTransformerWithHeads(nn.Module):
         return predictions, patch_map, recon
 
 
-# ═══════════════════════════════════════════════════════════
-# LOSS FUNCTION
-# ═══════════════════════════════════════════════════════════
-
-def custom_loss(
-    P,
-    X,
-    Y,
-    slope_weight=0.1,
-    intercept_weight=10,
-    recon_weight=0.01,
-    label_mode: str = 'linear_regime',
-    chance_weight: float = 1.0,
-    wait_weight: float = 1.0,
-):
-    """
-    Multi-output prediction loss with optional reconstruction term.
-
-    label_mode='linear_regime':
-      output_dim=3 → (horizon, slope, intercept)
-      output_dim=2 → (slope, intercept)
-    label_mode='scattered_hope':
-      output_dim=2 → (chance, wait)
-    """
-    predictions, patch_map, recon = P
-    out_dim = predictions.shape[-1]
-    if Y.shape[-1] != out_dim:
-        raise ValueError(
-            f"Target dim Y.shape[-1]={Y.shape[-1]} != predictions dim {out_dim}"
-        )
-
-    if label_mode == 'scattered_hope':
-        if out_dim != 2:
-            raise ValueError(
-                f"scattered_hope requires pred dim 2, got {out_dim}"
-            )
-        pred_chance, pred_wait = predictions[:, 0], predictions[:, 1]
-        true_chance, true_wait = Y[:, 0], Y[:, 1]
-        chance_loss = nn.functional.mse_loss(pred_chance, true_chance)
-        wait_loss = nn.functional.mse_loss(pred_wait, true_wait)
-        pred_loss = chance_weight * chance_loss + wait_weight * wait_loss
-    elif label_mode == 'linear_regime':
-        if out_dim == 3:
-            pred_horizon, pred_slope, pred_intercept = (
-                predictions[:, 0], predictions[:, 1], predictions[:, 2]
-            )
-            true_horizon, true_slope, true_intercept = Y[:, 0], Y[:, 1], Y[:, 2]
-            horizon_loss = nn.functional.mse_loss(pred_horizon, true_horizon)
-            slope_loss = nn.functional.mse_loss(pred_slope, true_slope)
-            intercept_loss = nn.functional.mse_loss(pred_intercept, true_intercept)
-            pred_loss = (
-                horizon_loss
-                + slope_weight * slope_loss
-                + intercept_weight * intercept_loss
-            )
-        elif out_dim == 2:
-            # linear_regime without horizon
-            pred_slope, pred_intercept = predictions[:, 0], predictions[:, 1]
-            true_slope, true_intercept = Y[:, 0], Y[:, 1]
-            slope_loss = nn.functional.mse_loss(pred_slope, true_slope)
-            intercept_loss = nn.functional.mse_loss(pred_intercept, true_intercept)
-            pred_loss = slope_weight * slope_loss + intercept_weight * intercept_loss
-        else:
-            raise ValueError(f"Unsupported prediction dim {out_dim}; expected 2 or 3")
-    else:
-        raise ValueError(f"Unsupported label mode")
-
-    if recon is not None:
-        recon_loss = nn.functional.mse_loss(recon, X)
-        return pred_loss + recon_weight * recon_loss
-
-    return pred_loss
+# custom_loss lives in labels.py (re-exported above for TRAIN / callers).
 
 
 # ═══════════════════════════════════════════════════════════
@@ -698,7 +628,6 @@ if __name__ == "__main__":
     print(f"  num_heads: {config['num_heads']}")
     print(f"  output_dim: {config['output_dim']}")
 
-    from data import resolve_model_past_len
     n_max_past = int(resolve_model_past_len(config))
     model = MarketTransformerWithHeads(
         in_features=F,

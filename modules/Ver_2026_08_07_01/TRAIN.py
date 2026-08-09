@@ -22,9 +22,14 @@ from data import (
     get_binance_data,
     generate_dataset_signature,
 )
+from labels import (
+    custom_loss,
+    label_target_names,
+    resolve_future_window,
+    resolve_model_past_len,
+)
 from model import (
     MarketTransformerWithHeads,
-    custom_loss,
     report_model_size,
     check_all_weights_updated,
 )
@@ -101,7 +106,6 @@ def get_dataset(config):
     test_ratio = 1.0 - train_ratio - val_ratio
     split_ratios = (train_ratio, val_ratio, test_ratio)
 
-    from data import resolve_future_window
     dataset = TradingDataset(
         features=features_for_dataset,
         n_market_features=n_market_features,
@@ -645,7 +649,6 @@ def main(config):
     
     # Keep config in sync if dataset forced output_dim (e.g. scattered_hope → 2)
     config['output_dim'] = dataset.output_dim
-    from data import label_target_names
     print(f"\nData shapes:")
     print(f"  Input x: (F={F}, past_window={past_window})")
     print(f"  Label mode: {getattr(dataset, 'label_mode', config.get('label', 'linear_regime'))}")
@@ -672,7 +675,6 @@ def main(config):
     print(f"  Causal: {config['causal']}")
     print(f"  Use reconstruction: {config['use_reconstruction']}")
     
-    from data import resolve_model_past_len
     _model_past_len = int(
         getattr(dataset, 'model_past_len', resolve_model_past_len(config))
     )

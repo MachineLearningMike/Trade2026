@@ -16,7 +16,8 @@ import torch.nn as nn
 
 from config import get_config
 from model import MarketTransformerWithHeads
-from data import visualize_linear_trends
+from labels import resolve_model_past_len
+from label_viz import visualize_linear_trends, visualize_scattered_hope
 from trainer import generate_checkpoint_key
 from TRAIN import get_dataset
 
@@ -101,7 +102,6 @@ def load_model(
         max_seq_len = past_window // config['patch_size']
 
     F = dataset.F
-    from data import resolve_model_past_len
     n_max_past = int(
         getattr(dataset, 'model_past_len', None)
         or resolve_model_past_len(config)
@@ -412,7 +412,6 @@ def run_test(
         pred_cpu = preds.detach().cpu()
 
         if label_mode == 'scattered_hope':
-            from data import visualize_scattered_hope
             print(
                 "\n📈 Visualizing scattered-hope (chance/wait) on test samples...",
                 flush=True,
@@ -438,7 +437,6 @@ def run_test(
                 sample_ids=list(used_indices),
             )
         else:
-            from data import visualize_linear_trends
             print(
                 "\n📈 Visualizing label vs inferred trends on test samples...",
                 flush=True,

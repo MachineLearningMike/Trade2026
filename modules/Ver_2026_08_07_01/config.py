@@ -10,7 +10,7 @@ config = {
     # ============================================================
     # DATA CONFIGURATION
     # ============================================================
-    'past_days': 2,     # 1, 2,
+    'past_days': 3,     # 1, 2,
     # future_window length is NOT set here — see label-mode horizons below:
     #   linear_regime  → max_trend_future_horizon
     #   scattered_hope → max_hope_future_horizon
@@ -151,7 +151,7 @@ config = {
     # ============================================================
     'epochs': 200,
     'batch_size': 8,
-    'learning_rate': 0.00002,
+    'learning_rate': 0.0002,
     'save_every_n_minibatches': 5000,
     'checkpoint_dir': 'trading_checkpoints',
     'max_checkpoints': 3,
