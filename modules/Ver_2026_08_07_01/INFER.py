@@ -451,6 +451,9 @@ def run_test(
                 pred_tensor=pred_cpu,
                 fixed_order=True,
                 sample_ids=list(used_indices),
+                # Train-set label stats so inset is model-normalized (z) space
+                label_mean=getattr(dataset, '_label_stat_mean', None),
+                label_std=getattr(dataset, '_label_stat_std', None),
             )
         else:
             print(

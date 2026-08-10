@@ -952,6 +952,8 @@ def visualize_yield(
     fixed_order: bool = False,
     sample_ids: Optional[List[int]] = None,
     past_context: int = 15,
+    label_mean: Optional[torch.Tensor] = None,
+    label_std: Optional[torch.Tensor] = None,
 ):
     """
     Visualize yield labels in raw price space.
@@ -961,9 +963,12 @@ def visualize_yield(
       - horizontal line at reference price history[-1]
       - orange markers on future bars where yield % >= min_yield_percent
         (decorative only — illustrates the threshold rule on the chart)
-      - title chance/wait from ``label_tensor`` (dataset cache; not recomputed)
-      - small chance×wait inset: truth (and pred if given) as scatter points
-        (skipped when ``chance_only`` / 1-D labels)
+      - title chance/wait from ``label_tensor`` (dataset cache; not recomputed;
+        values shown in natural/denorm units)
+      - small chance×wait inset in *normalized* (z-score) space using
+        ``label_mean`` / ``label_std`` (train label stats); truth + pred points
+        with center text for L2 / chance / wait distances (skipped when
+        ``chance_only`` / 1-D labels)
     """
     if total_tensor.is_cuda:
         total_tensor = total_tensor.cpu()
@@ -980,6 +985,48 @@ def visualize_yield(
         raise ValueError(
             f"pred_tensor length ({pred_tensor.shape[0]}) must match "
             f"label_tensor length ({num_available})"
+        )
+
+    # Label z-score stats for the chance×wait inset (model target space)
+    def _as_stat_vec(v, dim: int) -> np.ndarray:
+        if v is None:
+            return None
+        if hasattr(v, 'detach'):
+            arr = v.detach().cpu().float().flatten().numpy()
+        else:
+            arr = np.asarray(v, dtype=np.float64).ravel()
+        if arr.size < dim:
+            raise ValueError(
+                f"label stat length {arr.size} < required dim {dim}"
+            )
+        return arr[:dim].astype(np.float64)
+
+    out_dim_stats = 1 if chance_only else 2
+    _y_mean = _as_stat_vec(label_mean, out_dim_stats)
+    _y_std = _as_stat_vec(label_std, out_dim_stats)
+    if _y_mean is None or _y_std is None:
+        # Fallback: stats from the provided (denorm) label batch
+        lt = label_tensor.detach().cpu().float()
+        if lt.ndim == 1:
+            lt = lt.unsqueeze(-1)
+        d = min(out_dim_stats, lt.shape[-1])
+        _y_mean = lt[:, :d].mean(dim=0).numpy().astype(np.float64)
+        _y_std = lt[:, :d].std(dim=0).numpy().astype(np.float64)
+        _y_std = np.where(_y_std < 1e-8, 1.0, _y_std)
+        print(
+            "  (yield inset: label_mean/std not provided — "
+            "using batch label stats for normalization)"
+        )
+    else:
+        _y_std = np.where(_y_std < 1e-8, 1.0, _y_std)
+
+    def _normalize_cw(comps: Tuple[float, ...]) -> Tuple[float, ...]:
+        """Map denorm (chance[, wait]) → z-score using train label stats."""
+        if chance_only or len(comps) == 1 or out_dim_stats == 1:
+            return ((float(comps[0]) - _y_mean[0]) / (_y_std[0] + 1e-8),)
+        return (
+            (float(comps[0]) - _y_mean[0]) / (_y_std[0] + 1e-8),
+            (float(comps[1]) - _y_mean[1]) / (_y_std[1] + 1e-8),
         )
 
     num_samples = min(num_samples, num_available)
@@ -1133,46 +1180,70 @@ def visualize_yield(
                     bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7),
                 )
 
-            # Small chance × wait coordinate inset (truth + pred scatter)
-            if not (chance_only or len(comps_lbl) < 2):
-                ch_t, wt_t = float(comps_lbl[0]), float(comps_lbl[1])
-                ax_cw = ax.inset_axes([0.58, 0.10, 0.40, 0.38])
+            # Small chance × wait inset in *normalized* (z-score) space
+            if not (chance_only or len(comps_lbl) < 2 or out_dim_stats < 2):
+                ch_t_n, wt_t_n = _normalize_cw(comps_lbl)
+                ax_cw = ax.inset_axes([0.55, 0.08, 0.43, 0.42])
                 _inset_axes.append(ax_cw)
                 ax_cw.scatter(
-                    [ch_t], [wt_t],
+                    [ch_t_n], [wt_t_n],
                     c='#1f77b4', s=42, zorder=4, marker='o',
                     edgecolors='white', linewidths=0.6, label='truth',
                 )
-                xs_cw = [ch_t]
-                ys_cw = [wt_t]
+                xs_cw = [ch_t_n]
+                ys_cw = [wt_t_n]
                 if comps_prd is not None and len(comps_prd) >= 2:
-                    ch_p, wt_p = float(comps_prd[0]), float(comps_prd[1])
+                    ch_p_n, wt_p_n = _normalize_cw(comps_prd)
                     ax_cw.scatter(
-                        [ch_p], [wt_p],
+                        [ch_p_n], [wt_p_n],
                         c='#2ca02c', s=48, zorder=5, marker='x',
                         linewidths=1.6, label='pred',
                     )
                     ax_cw.plot(
-                        [ch_t, ch_p], [wt_t, wt_p],
+                        [ch_t_n, ch_p_n], [wt_t_n, wt_p_n],
                         color='gray', alpha=0.45, linewidth=0.9, zorder=3,
                     )
-                    xs_cw.append(ch_p)
-                    ys_cw.append(wt_p)
-                # Axis limits with padding; keep origin in view when values are small
-                x_lo, x_hi = min(xs_cw), max(xs_cw)
-                y_lo, y_hi = min(ys_cw), max(ys_cw)
-                x_pad = max(0.05 * (x_hi - x_lo), abs(x_hi) * 0.08, 0.15)
-                y_pad = max(0.05 * (y_hi - y_lo), abs(y_hi) * 0.08, 0.15)
+                    xs_cw.append(ch_p_n)
+                    ys_cw.append(wt_p_n)
+
+                    # Distances in normalized space (pred − truth)
+                    d_chance = float(ch_p_n - ch_t_n)
+                    d_wait = float(wt_p_n - wt_t_n)
+                    d_l2 = float(np.hypot(d_chance, d_wait))
+                    # Text in the middle of the coordinate plane
+                    ax_cw.text(
+                        0.5, 0.5,
+                        (
+                            f'‖Δ‖={d_l2:.3f}\n'
+                            f'Δc={d_chance:+.3f}\n'
+                            f'Δw={d_wait:+.3f}'
+                        ),
+                        transform=ax_cw.transAxes,
+                        ha='center', va='center', fontsize=6,
+                        color='#222222', zorder=6,
+                        bbox=dict(
+                            boxstyle='round,pad=0.25',
+                            facecolor='white',
+                            edgecolor='0.75',
+                            alpha=0.88,
+                        ),
+                    )
+
+                # Axis limits with padding; keep origin in view
+                x_lo, x_hi = min(xs_cw + [0.0]), max(xs_cw + [0.0])
+                y_lo, y_hi = min(ys_cw + [0.0]), max(ys_cw + [0.0])
+                x_pad = max(0.08 * (x_hi - x_lo), 0.35)
+                y_pad = max(0.08 * (y_hi - y_lo), 0.35)
                 ax_cw.set_xlim(x_lo - x_pad, x_hi + x_pad)
                 ax_cw.set_ylim(y_lo - y_pad, y_hi + y_pad)
                 ax_cw.axhline(0.0, color='0.7', linewidth=0.6, zorder=1)
                 ax_cw.axvline(0.0, color='0.7', linewidth=0.6, zorder=1)
-                ax_cw.set_xlabel('chance', fontsize=6, labelpad=1)
-                ax_cw.set_ylabel('wait', fontsize=6, labelpad=1)
+                ax_cw.set_xlabel('chance (norm)', fontsize=6, labelpad=1)
+                ax_cw.set_ylabel('wait (norm)', fontsize=6, labelpad=1)
                 ax_cw.tick_params(axis='both', labelsize=5, length=2, pad=1)
                 ax_cw.grid(True, alpha=0.35, linewidth=0.5)
-                ax_cw.set_title('chance × wait', fontsize=6, pad=2)
-                ax_cw.legend(fontsize=5, loc='best', framealpha=0.75, borderpad=0.2)
+                ax_cw.set_title('chance × wait (z)', fontsize=6, pad=2)
+                ax_cw.legend(fontsize=5, loc='upper right', framealpha=0.75, borderpad=0.2)
                 ax_cw.set_facecolor('#FAFAFA')
                 for spine in ax_cw.spines.values():
                     spine.set_linewidth(0.7)
@@ -1205,7 +1276,9 @@ def visualize_yield(
             'chance from dataset cache',
         ]
         if not chance_only:
-            line2_parts.append('inset: truth/pred on chance×wait')
+            line2_parts.append('inset: truth/pred in norm chance×wait')
+            if pred_tensor is not None:
+                line2_parts.append('center text: ||d||, dc, dw (norm)')
         if pred_tensor is not None:
             line2_parts.append('green text=pred (denorm)')
         if fixed_order:
