@@ -855,14 +855,31 @@ def get_value_age_array(config):
     print("Done!")
     print("=" * 60)
 
+    # Always return (n_channels, T) float32:
+    #   n_channels = 2 * num_features  (value, decay per feature)
+    # Empty catalog / failed range → (0, T) so callers can use shape[1].
     if arr.size == 0:
-        return arr, lookup.features
+        try:
+            t0 = pd.Timestamp(dt_from)
+            t1 = pd.Timestamp(dt_to)
+            T_empty = max(0, int((t1 - t0).total_seconds() // 60))
+        except Exception:
+            T_empty = 0
+        empty = np.zeros((0, T_empty), dtype=np.float32)
+        print(f"⚠ Returning empty macro array with shape {empty.shape}")
+        return empty, list(lookup.features)
+
+    if arr.ndim != 3 or arr.shape[-1] != 2:
+        raise ValueError(
+            f"Expected FSV array shape (n_features, T, 2); got {arr.shape}. "
+            f"Delete the FSV cache under data_dir and recompute."
+        )
 
     shape = arr.shape  # (num_features, num_minutes, 2)
     # (value_0, decay_0, value_1, decay_1, ...) rows × minutes
     reshaped = arr.transpose(0, 2, 1).reshape(-1, shape[1])
 
-    return reshaped, lookup.features
+    return reshaped, list(lookup.features)
 
 
 if __name__ == "__main__":

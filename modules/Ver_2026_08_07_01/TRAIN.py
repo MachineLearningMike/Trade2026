@@ -23,7 +23,7 @@ from data import (
     generate_dataset_signature,
 )
 from labels import (
-    custom_loss,
+    bind_label_loss,
     label_target_names,
     resolve_future_window,
     resolve_model_past_len,
@@ -57,6 +57,15 @@ def get_dataset(config):
     market_feature_names = None
 
     if config.get('use_binance_data', False):
+        start_s = config.get('binance_start_date')
+        end_s = config.get('binance_end_date')
+        if start_s and end_s and str(start_s) >= str(end_s):
+            # String compare works for 'YYYY-MM-DD HH:MM:SS' layout.
+            print(
+                f"⚠ binance_start_date ({start_s}) must be strictly before "
+                f"binance_end_date ({end_s}). Zero-length range yields T=0."
+            )
+            sys.exit(1)
         market_features, T, nForget, target_feature_id, market_feature_names = get_binance_data(config)
         if market_features is None or target_feature_id is None:
             print("⚠ Failed to fetch Binance data.")
@@ -66,6 +75,12 @@ def get_dataset(config):
             market_arr = np.stack(market_features, axis=0).astype(np.float32)
         else:
             market_arr = np.asarray(market_features, dtype=np.float32)
+        if market_arr.ndim != 2 or market_arr.shape[1] == 0:
+            print(
+                f"⚠ Market series is empty (shape={getattr(market_arr, 'shape', None)}). "
+                f"Check binance_start_date / binance_end_date and data availability."
+            )
+            sys.exit(1)
     else:
         T = 60 * 24 * config.get('total_synthetic_days', 30)
         F = config.get('num_features', 5)
@@ -79,24 +94,69 @@ def get_dataset(config):
     from fsv_03_query_value_age import get_value_age_array
     macro_features, macro_feature_names = get_value_age_array(config)
     macro_features = np.asarray(macro_features, dtype=np.float32)
+    if macro_features.ndim == 1:
+        # Legacy empty / corrupt cache: promote to (0, T) or fail clearly
+        if macro_features.size == 0:
+            macro_features = np.zeros((0, market_arr.shape[1]), dtype=np.float32)
+        else:
+            raise ValueError(
+                f"macro_features must be 2-D (n_channels, T); got 1-D shape "
+                f"{macro_features.shape}. Recompute FSV cache (delete "
+                f"{config.get('data_dir', 'dataset_cache')}/fsv_value_decay_*.npy)."
+            )
+    if macro_features.ndim != 2:
+        raise ValueError(
+            f"macro_features must be 2-D (n_channels, T); got shape "
+            f"{macro_features.shape}"
+        )
+
     macro_feature_names_full = []
-    for name in macro_feature_names:
+    for name in (macro_feature_names or []):
         macro_feature_names_full.append(name + "_value")
         macro_feature_names_full.append(name + "_decay")
 
-    # Align time lengths (market vs macro caches can differ slightly)
-    T = min(market_arr.shape[1], macro_features.shape[1])
-    if market_arr.shape[1] != macro_features.shape[1]:
+    if macro_features.shape[0] == 0:
         print(
-            f"⚠ Aligning time lengths: market T={market_arr.shape[1]}, "
-            f"macro T={macro_features.shape[1]} → using T={T}"
+            "⚠ No macro FSV channels loaded (empty feature list or FSV failure). "
+            "Continuing with market features only."
         )
-    market_arr = market_arr[:, :T]
-    macro_features = macro_features[:, :T]
+    elif macro_features.shape[0] != len(macro_feature_names_full):
+        print(
+            f"⚠ macro channel count {macro_features.shape[0]} != "
+            f"name count {len(macro_feature_names_full)}; "
+            f"trimming names/channels to the shorter length."
+        )
+        n_ch = min(macro_features.shape[0], len(macro_feature_names_full))
+        macro_features = macro_features[:n_ch]
+        macro_feature_names_full = macro_feature_names_full[:n_ch]
 
-    total_features = np.concatenate([market_arr, macro_features], axis=0)  # (F, T)
+    # Align time lengths (market vs macro caches can differ slightly)
+    if macro_features.shape[0] > 0:
+        T = min(int(market_arr.shape[1]), int(macro_features.shape[1]))
+        if market_arr.shape[1] != macro_features.shape[1]:
+            print(
+                f"⚠ Aligning time lengths: market T={market_arr.shape[1]}, "
+                f"macro T={macro_features.shape[1]} → using T={T}"
+            )
+        market_arr = market_arr[:, :T]
+        macro_features = macro_features[:, :T]
+        total_features = np.concatenate([market_arr, macro_features], axis=0)  # (F, T)
+    else:
+        T = int(market_arr.shape[1])
+        total_features = market_arr
     n_market_features = market_arr.shape[0]
     n_macro_features = macro_features.shape[0]
+
+    past_bars = 60 * 24 * int(config.get('past_days', 7))
+    future_bars = int(resolve_future_window(config))
+    need_T = past_bars + future_bars
+    if T < need_T:
+        print(
+            f"⚠ Time length T={T} is shorter than past+future "
+            f"({past_bars}+{future_bars}={need_T}). "
+            f"Widen binance_start_date..binance_end_date or reduce past_days / horizons."
+        )
+        sys.exit(1)
 
     # TradingDataset stacks list/rows on axis=1 → (T, F)
     features_for_dataset = [total_features[i] for i in range(total_features.shape[0])]
@@ -180,12 +240,12 @@ def main(config):
     parser.add_argument(
         '--max-trend-future-horizon', type=int,
         default=config.get('max_trend_future_horizon', 50),
-        help='Max future trend horizon (also future_window for linear_regime)',
+        help='Max future trend horizon (also future_window for trend)',
     )
     parser.add_argument(
         '--max-hope-future-horizon', type=int,
         default=config.get('max_hope_future_horizon', 60),
-        help='Max hope future horizon (also future_window for scattered_hope)',
+        help='Max hope future horizon (also future_window for yield)',
     )
     parser.add_argument('--batch-size', type=int, default=config['batch_size'], help='Batch size')
     parser.add_argument('--total-days', type=int, default=config['total_synthetic_days'], help='Total days of data')
@@ -200,11 +260,11 @@ def main(config):
     parser.add_argument(
         '--min-yield-percent', type=float,
         default=config.get('min_yield_percent', 0.0),
-        help='Minimum yield percent for scattered_hope',
+        help='Minimum yield percent for yield',
     )
     parser.add_argument(
-        '--label', type=str, default=config.get('label', 'linear_regime'),
-        choices=['linear_regime', 'scattered_hope'],
+        '--label', type=str, default=config.get('label', 'trend'),
+        choices=['trend', 'yield'],
         help='Label family',
     )
     parser.add_argument('--no-normalize', action='store_true', help='Disable per-window normalization')
@@ -647,14 +707,14 @@ def main(config):
     config['embed_dim'] = embed_dim
     config['max_seq_len'] = past_window // config['patch_size']
     
-    # Keep config in sync if dataset forced output_dim (e.g. scattered_hope → 2)
+    # Keep config in sync if dataset forced output_dim (e.g. yield → 2)
     config['output_dim'] = dataset.output_dim
     print(f"\nData shapes:")
     print(f"  Input x: (F={F}, past_window={past_window})")
-    print(f"  Label mode: {getattr(dataset, 'label_mode', config.get('label', 'linear_regime'))}")
+    print(f"  Label mode: {getattr(dataset, 'label_mode', config.get('label', 'trend'))}")
     _od = config['output_dim']
     _onames = label_target_names(
-        getattr(dataset, 'label_mode', config.get('label', 'linear_regime')),
+        getattr(dataset, 'label_mode', config.get('label', 'trend')),
         _od,
         chance_only=getattr(dataset, 'chance_only', config.get('chance_only', False)),
     )
@@ -705,6 +765,13 @@ def main(config):
     _probe_device = torch.device(config['device']) if config.get('device') else torch.device('cpu')
     model = model.to(_probe_device)
     _probe_P = _model_past_len
+    # Concrete label-class loss (trend or yield) — not a generic custom_loss.
+    loss_fn = bind_label_loss(
+        dataset.label_mode,
+        config,
+        chance_only=getattr(dataset, 'chance_only', config.get('chance_only', False)),
+    )
+
     check_all_weights_updated(
         model,
         sample_batch=(
@@ -714,16 +781,7 @@ def main(config):
             torch.randn(_probe_B, F, device=_probe_device).abs() + 1e-3,
             torch.randn(_probe_B, config.get('num_shapes', 4), F, device=_probe_device),
         ),
-        loss_fn=lambda P, X, Y: custom_loss(
-            P, X, Y,
-            slope_weight=config['slope_loss_weight'],
-            intercept_weight=config['intercept_loss_weight'],
-            recon_weight=config['reconstruction_loss_weight'],
-            label_mode=dataset.label_mode,
-            chance_weight=config.get('chance_loss_weight', 1.0),
-            wait_weight=config.get('wait_loss_weight', 1.0),
-            chance_only=getattr(dataset, 'chance_only', False),
-        ),
+        loss_fn=loss_fn,
         name="MarketTransformerWithHeads",
     )
 
@@ -738,16 +796,7 @@ def main(config):
     trainer = ResumableTrainer(
         dataset_signature=dataset.cache_key,
         model=model,
-        loss_fn=lambda P, X, Y: custom_loss(
-            P, X, Y,
-            slope_weight=config['slope_loss_weight'],
-            intercept_weight=config['intercept_loss_weight'],
-            recon_weight=config['reconstruction_loss_weight'],
-            label_mode=dataset.label_mode,
-            chance_weight=config.get('chance_loss_weight', 1.0),
-            wait_weight=config.get('wait_loss_weight', 1.0),
-            chance_only=getattr(dataset, 'chance_only', False),
-        ),
+        loss_fn=loss_fn,
         optimizer=optimizer,
         dataloader=train_loader,
         save_dir=config['checkpoint_dir'],
@@ -768,11 +817,11 @@ def main(config):
     print(f"  Val: {len(dataset.val_indices)} samples")
     print(f"  Test: {len(dataset.test_indices)} samples")
     print(f"Past days: {config['past_days']} ({past_window} minutes)")
-    print(f"Label mode: {config.get('label', 'linear_regime')}")
+    print(f"Label mode: {config.get('label', 'trend')}")
     print(f"Future window: {dataset.future_window} minutes")
     print(f"Step: {config['step']} minute(s)")
     print(f"Max accum deviation: {config['max_accum_deviation']}")
-    if config.get('label', 'linear_regime') == 'scattered_hope':
+    if config.get('label', 'trend') == 'yield':
         print(
             f"min_yield_percent: {config.get('min_yield_percent')}, "
             f"max_hope_future_horizon: {config.get('max_hope_future_horizon')}, "

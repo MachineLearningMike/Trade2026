@@ -859,6 +859,13 @@ class ResumableTrainer:
     """
     Trainer with robust handling of all interruption scenarios and validation.
     Optimized for speed with reduced overhead.
+
+    ``loss_fn`` must be the concrete label objective already, with signature::
+
+        loss_fn(x, y_pred, y_truth) -> scalar Tensor
+
+    typically ``labels.bind_label_loss(...)`` (bound ``Label_Trend.loss`` or
+    ``Label_Yield.loss``). The trainer does not dispatch on label mode.
     """
     
     def __init__(self, dataset_signature,
@@ -1027,7 +1034,8 @@ class ResumableTrainer:
                 shape = shape.to(self.device, non_blocking=True)
                 
                 P = self.model(x, p, mean, std, shape)
-                L = self.loss_fn(P, x, y)
+                y_pred = P[0] if isinstance(P, (tuple, list)) else P
+                L = self.loss_fn(x, y_pred, y)
                 
                 total_loss += L.item()
                 num_batches += 1
@@ -1646,7 +1654,8 @@ class ResumableTrainer:
             
             optimizer.zero_grad()
             P = model(x, p, mean, std, shape)
-            L = loss_fn(P, x, y)
+            y_pred = P[0] if isinstance(P, (tuple, list)) else P
+            L = loss_fn(x, y_pred, y)
             L.backward()
             optimizer.step()
             
@@ -1682,8 +1691,9 @@ class ResumableTrainer:
 
                 pbar.update(batch_idx - pbar.n)
                 # tqdm already prefixes postfix with ", ".
+                # loss = batch / running-average  (e.g. 2.2345/3.4567)
                 pbar.set_postfix_str(
-                    f'loss={avg_loss:.4f}, '
+                    f'loss={batch_loss:.4f}/{avg_loss:.4f}, '
                     f'wait={avg_wait:.0f}ms, '
                     f'comp={avg_comp:.0f}ms',
                     refresh=False,
@@ -1813,8 +1823,8 @@ if __name__ == "__main__":
     train_loader = DummyLoader(train_dataset)
     val_loader = DummyLoader(val_dataset)
     
-    def dummy_loss(P, X, Y):
-        return nn.functional.mse_loss(P, Y)
+    def dummy_loss(x, y_pred, y_truth):
+        return nn.functional.mse_loss(y_pred, y_truth)
     
     trainer = ResumableTrainer(
         model=model,

@@ -12,8 +12,8 @@ config = {
     # ============================================================
     'past_days': 3,     # 1, 2,
     # future_window length is NOT set here — see label-mode horizons below:
-    #   linear_regime  → max_trend_future_horizon
-    #   scattered_hope → max_hope_future_horizon
+    #   trend  → max_trend_future_horizon
+    #   yield → max_hope_future_horizon
     'step': 5,
     'num_features': 5,
     'num_shapes': 4,
@@ -42,29 +42,29 @@ config = {
     # LABEL FAMILY
     # ============================================================
     # Choose how supervised targets are built from the future price window:
-    #   'linear_regime'   → (horizon, slope, intercept) via find_linear_regime
+    #   'trend'   → (horizon, slope, intercept) via find_trend
     #                        model may use output_dim 2 (m,b) or 3 (h,m,b)
-    #   'scattered_hope'  → (chance, wait) via find_scattered_hope
+    #   'yield'  → (chance, wait) via find_yield
     #                        or (chance,) if chance_only=True
-    'label': 'scattered_hope',
+    'label': 'yield',
 
     # ------------------------------------------------------------
-    # SCATTERED HOPE (distribution of chance and wait)
+    # YIELD (distribution of chance and wait)
     # ------------------------------------------------------------
     'min_yield_percent': 0.25,
-    # Also sets the sample future_window when label=scattered_hope
+    # Also sets the sample future_window when label=yield
     'max_hope_future_horizon': 60,
     # If True: only chance is labeled / predicted / lost (output_dim forced to 1).
     # wait is not computed or stored.
-    'chance_only': True,
+    'chance_only': False,
 
     # ------------------------------------------------------------
-    # TREND / LINEAR-REGIME HORIZONS (linear_regime)
+    # TREND HORIZONS (label=trend)
     # ------------------------------------------------------------
     'max_accum_deviation': 0.35,   # legacy alias; prefer fitness_threshold
     'min_trend_horizon': 3,
     # Max future bars for the linear regime search; also:
-    #   - sample future_window when label=linear_regime
+    #   - sample future_window when label=trend
     #   - max past extent for joint past+future regime + model p vector
     'max_trend_future_horizon': 50,
     'regime_use_past': True,
@@ -72,7 +72,7 @@ config = {
     'fitness_threshold': 0.75,
 
     # ============================================================
-    # HORIZON SEARCH RULE (linear_regime)
+    # HORIZON SEARCH RULE (trend)
     # ============================================================
     # Free (unanchored) OLS on joint [recent past ‖ nearest future].
     #   'longest_linear'         - grow while fitness <= threshold; keep last good
@@ -101,7 +101,9 @@ config = {
     'use_binance_data': True,
     'binance_datatype': 'klines',
     'binance_interval': '1m',
-    'binance_start_date': '2024-01-01 00:00:00',
+    # Half-open-ish span in minutes: need end > start. Past window alone is
+    # past_days * 1440 bars (e.g. 3 days → 4320) plus future_horizon.
+    'binance_start_date': '2026-01-01 00:00:00',
     'binance_end_date': '2026-07-01 00:00:00',
     'binance_symbols': {
         "BTCUSDT": ["Close", "Volume"],
@@ -145,8 +147,8 @@ config = {
     # ============================================================
     'head_hidden_dim_multiplier': 4,
     # Prediction head width. Must match label family:
-    #   linear_regime:   3 = (h,m,b),  2 = (m,b)
-    #   scattered_hope:  2 = (chance, wait),  1 = (chance,) if chance_only
+    #   trend:   3 = (h,m,b),  2 = (m,b)
+    #   yield:  2 = (chance, wait),  1 = (chance,) if chance_only
     #                    [forced from label / chance_only if mismatch]
     'output_dim': 2,
     
@@ -174,10 +176,10 @@ config = {
     # ============================================================
     # LOSS WEIGHT CONFIGURATION
     # ============================================================
-    # linear_regime (dim 3 uses horizon unweighted; dim 2 omits horizon):
+    # trend (dim 3 uses horizon unweighted; dim 2 omits horizon):
     'slope_loss_weight': 1.0,
     'intercept_loss_weight': 10.0,
-    # scattered_hope:
+    # yield:
     'chance_loss_weight': 1.0,
     'wait_loss_weight': 1.0,
     'reconstruction_loss_weight': 0.01,

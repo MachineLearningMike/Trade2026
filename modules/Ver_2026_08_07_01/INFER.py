@@ -17,7 +17,7 @@ import torch.nn as nn
 from config import get_config
 from model import MarketTransformerWithHeads
 from labels import resolve_model_past_len
-from label_viz import visualize_linear_trends, visualize_scattered_hope
+from labels import visualize_trend, visualize_yield
 from trainer import generate_checkpoint_key
 from TRAIN import get_dataset
 
@@ -330,18 +330,18 @@ def run_test(
     print(f"✓ Finished inference on {len(preds)} test samples", flush=True)
 
     out_dim = preds.shape[-1]
-    label_mode = config.get('label', getattr(dataset, 'label_mode', 'linear_regime'))
+    label_mode = config.get('label', getattr(dataset, 'label_mode', 'trend'))
     chance_only = bool(
         config.get('chance_only', getattr(dataset, 'chance_only', False))
     )
     print("\n📊 Test Set Results:")
     metrics = {}
-    if label_mode == 'scattered_hope' and (chance_only or out_dim == 1):
+    if label_mode == 'yield' and (chance_only or out_dim == 1):
         metrics['chance_mse'] = torch.nn.functional.mse_loss(
             preds[:, 0], test_labels[:, 0]
         ).item()
         print(f"  Chance MSE:      {metrics['chance_mse']:.4f}")
-    elif label_mode == 'scattered_hope' and out_dim == 2:
+    elif label_mode == 'yield' and out_dim == 2:
         metrics['chance_mse'] = torch.nn.functional.mse_loss(
             preds[:, 0], test_labels[:, 0]
         ).item()
@@ -376,14 +376,14 @@ def run_test(
         raise ValueError(f"Unexpected pred dim {out_dim}")
 
     print(f"\n📈 Sample Predictions (first 5):")
-    if label_mode == 'scattered_hope' and (chance_only or out_dim == 1):
+    if label_mode == 'yield' and (chance_only or out_dim == 1):
         print(f"  {'Index':<6} {'True Chance':<12} {'Pred Chance':<12}")
         print(f"  {'-'*6} {'-'*12} {'-'*12}")
         for i in range(min(5, len(preds))):
             print(
                 f"  {i:<6} {test_labels[i, 0].item():<12.4f} {preds[i, 0].item():<12.4f}"
             )
-    elif label_mode == 'scattered_hope' and out_dim == 2:
+    elif label_mode == 'yield' and out_dim == 2:
         print(
             f"  {'Index':<6} {'True Chance':<12} {'Pred Chance':<12} "
             f"{'True Wait':<12} {'Pred Wait':<12}"
@@ -426,12 +426,12 @@ def run_test(
         )
         pred_cpu = preds.detach().cpu()
 
-        if label_mode == 'scattered_hope':
+        if label_mode == 'yield':
             print(
-                "\n📈 Visualizing scattered-hope (chance/wait) on test samples...",
+                "\n📈 Visualizing yield labels (chance/wait) on test samples...",
                 flush=True,
             )
-            visualize_scattered_hope(
+            visualize_yield(
                 total_tensor=dataset.Total,
                 valid_starts=valid_starts,
                 label_tensor=full_labels,
@@ -467,7 +467,11 @@ def run_test(
                     getattr(dataset, 'max_horizon', dataset.future_window),
                 )
             )
-            visualize_linear_trends(
+            h_past_full = getattr(dataset, 'h_past_tensor', None)
+            h_past_viz = None
+            if h_past_full is not None:
+                h_past_viz = h_past_full[list(used_indices)]
+            visualize_trend(
                 total_tensor=dataset.Total,
                 valid_starts=valid_starts,
                 label_tensor=full_labels,
@@ -482,6 +486,7 @@ def run_test(
                 fixed_order=True,
                 sample_ids=list(used_indices),
                 default_pred_horizon=pred_horizon,
+                h_past_tensor=h_past_viz,
                 min_horizon=config.get(
                     'min_trend_horizon',
                     getattr(dataset, 'min_trend_horizon', getattr(dataset, 'min_horizon', 3)),

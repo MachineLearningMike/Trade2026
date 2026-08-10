@@ -1,26 +1,32 @@
 # labels.py
-# Label modes, target construction, and training loss.
+# Label modes, target construction, training loss, and visualization.
 #
-# Shared by data.py (label cache / dataset) and model.py (objective).
-# Keep free of matplotlib and dataset I/O.
+# Shared by data.py (label cache / dataset), model.py (objective), and INFER.
 #
-# Each label family is a class (find + loss). custom_loss dispatches to them.
+# Each label family is a class (find + loss). Bind Label_*.loss for training.
+# Visualization helpers (formerly label_viz.py) live at the bottom.
 
+import random
+import time
+from typing import Any, List, Optional, Tuple, Type
+
+import numpy as np
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple, Type
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
 
 # Default label fitness threshold (overridden by config['fitness_threshold']).
 LABEL_FITNESS_THRESHOLD = 0.75
 
 # Label family ids (config key ``label``).
-LABEL_LINEAR_REGIME = 'linear_regime'
-LABEL_SCATTERED_HOPE = 'scattered_hope'
-VALID_LABEL_MODES = (LABEL_LINEAR_REGIME, LABEL_SCATTERED_HOPE)
+LABEL_TREND = 'trend'
+LABEL_YIELD = 'yield'
+VALID_LABEL_MODES = (LABEL_TREND, LABEL_YIELD)
 
-LABEL_FULL_DIM_LINEAR = 3
-LABEL_FULL_DIM_SCATTERED = 2
-LABEL_FULL_DIM_SCATTERED_CHANCE = 1
+LABEL_FULL_DIM_TREND = 3
+LABEL_FULL_DIM_YIELD = 2
+LABEL_FULL_DIM_YIELD_CHANCE = 1
 
 # Horizon search rules for linear trend (free OLS, no f[0] anchor).
 HORIZON_SEARCH_LONGEST_LINEAR = 'longest_linear'
@@ -81,19 +87,19 @@ def _regime_segment(history: torch.Tensor, future: torch.Tensor, h_past: int, h_
 
 
 # ═══════════════════════════════════════════════════════════
-# LABEL FAMILY: LINEAR TREND
+# LABEL FAMILY: TREND
 # ═══════════════════════════════════════════════════════════
 
-class Label_Linear_Trend:
+class Label_Trend:
     """
-    Linear-regime labels: full cache (horizon, slope, intercept).
+    Trend labels: full cache (horizon, slope, intercept).
 
-    Config id: 'linear_regime'
+    Config id: 'trend'
     Price space: typically z-scored (caller responsibility).
     """
 
-    name = LABEL_LINEAR_REGIME
-    full_dim = LABEL_FULL_DIM_LINEAR
+    name = LABEL_TREND
+    full_dim = LABEL_FULL_DIM_TREND
 
     @classmethod
     def resolve_future_window(cls, config: dict) -> int:
@@ -245,32 +251,56 @@ class Label_Linear_Trend:
         return best_h_fut, best_slope, best_intercept, best_h_past
 
     @classmethod
+    def make_auxiliary(cls, config: Optional[dict] = None, **overrides) -> dict:
+        """
+        Class-private loss knobs for trend.
+
+        Keys (only used inside Label_Trend.loss):
+          slope_weight, intercept_weight
+        """
+        cfg = config or {}
+        aux = {
+            'slope_weight': float(cfg.get('slope_loss_weight', 0.1)),
+            'intercept_weight': float(cfg.get('intercept_loss_weight', 10.0)),
+        }
+        aux.update(overrides)
+        return aux
+
+    @classmethod
     def loss(
         cls,
-        predictions: torch.Tensor,
-        targets: torch.Tensor,
-        slope_weight: float = 0.1,
-        intercept_weight: float = 10.0,
-        **_kwargs,
+        x: torch.Tensor,
+        y_pred: torch.Tensor,
+        y_truth: torch.Tensor,
+        auxiliary: Optional[dict] = None,
     ) -> torch.Tensor:
-        """MSE on (h,m,b) or (m,b) depending on last dim."""
-        out_dim = predictions.shape[-1]
-        if targets.shape[-1] != out_dim:
+        """
+        Uniform signature: loss(x, y_pred, y_truth, auxiliary).
+
+        MSE on (h,m,b) or (m,b). ``x`` unused for trend (kept for API uniformity).
+        ``auxiliary`` may contain slope_weight / intercept_weight.
+        """
+        aux = auxiliary or {}
+        slope_weight = float(aux.get('slope_weight', 0.1))
+        intercept_weight = float(aux.get('intercept_weight', 10.0))
+
+        out_dim = y_pred.shape[-1]
+        if y_truth.shape[-1] != out_dim:
             raise ValueError(
-                f"{cls.name} loss: target dim {targets.shape[-1]} != pred dim {out_dim}"
+                f"{cls.name} loss: target dim {y_truth.shape[-1]} != pred dim {out_dim}"
             )
         if out_dim == 3:
-            horizon_loss = nn.functional.mse_loss(predictions[:, 0], targets[:, 0])
-            slope_loss = nn.functional.mse_loss(predictions[:, 1], targets[:, 1])
-            intercept_loss = nn.functional.mse_loss(predictions[:, 2], targets[:, 2])
+            horizon_loss = nn.functional.mse_loss(y_pred[:, 0], y_truth[:, 0])
+            slope_loss = nn.functional.mse_loss(y_pred[:, 1], y_truth[:, 1])
+            intercept_loss = nn.functional.mse_loss(y_pred[:, 2], y_truth[:, 2])
             return (
                 horizon_loss
                 + slope_weight * slope_loss
                 + intercept_weight * intercept_loss
             )
         if out_dim == 2:
-            slope_loss = nn.functional.mse_loss(predictions[:, 0], targets[:, 0])
-            intercept_loss = nn.functional.mse_loss(predictions[:, 1], targets[:, 1])
+            slope_loss = nn.functional.mse_loss(y_pred[:, 0], y_truth[:, 0])
+            intercept_loss = nn.functional.mse_loss(y_pred[:, 1], y_truth[:, 1])
             return slope_weight * slope_loss + intercept_weight * intercept_loss
         raise ValueError(
             f"{cls.name} loss: unsupported pred dim {out_dim}; expected 2 or 3"
@@ -278,25 +308,25 @@ class Label_Linear_Trend:
 
 
 # ═══════════════════════════════════════════════════════════
-# LABEL FAMILY: SCATTERED HOPE
+# LABEL FAMILY: YIELD
 # ═══════════════════════════════════════════════════════════
 
-class Label_Scattered_Hope:
+class Label_Yield:
     """
-    Scattered-hope labels on raw prices: (chance, wait) or (chance,).
+    Yield labels on raw prices: (chance, wait) or (chance,).
 
-    Config id: 'scattered_hope'
+    Config id: 'yield'
     Price space: raw (true % yield); caller must not z-score inputs.
     """
 
-    name = LABEL_SCATTERED_HOPE
+    name = LABEL_YIELD
 
     @classmethod
     def full_dim(cls, chance_only: bool = False) -> int:
         return (
-            LABEL_FULL_DIM_SCATTERED_CHANCE
+            LABEL_FULL_DIM_YIELD_CHANCE
             if chance_only
-            else LABEL_FULL_DIM_SCATTERED
+            else LABEL_FULL_DIM_YIELD
         )
 
     @classmethod
@@ -339,7 +369,16 @@ class Label_Scattered_Hope:
         chance_only: bool = False,
     ):
         """
-        Thresholded yield events vs history[-1].
+        Thresholded yield events vs the last raw price history[-1].
+
+        Inputs MUST be raw prices (not window z-scores). Percent yield at bar t:
+            yv = 100 * (future[t] - current) / current
+        For every t in [0, n) with yv >= min_yield_percent:
+            chance += (yv - min_yield_percent)   # excess % above threshold
+            wait   += t / yv                     # unless chance_only
+
+        So chance == 0 when there are no hits, and grows with how far each hit
+        exceeds the threshold (not with z-score artifacts).
 
         Returns:
             chance_only=False → (chance, wait)
@@ -362,7 +401,7 @@ class Label_Scattered_Hope:
 
         for t in range(n):
             yv = float(((future[t] - current) / denom) * 100)
-            if yv < min_yield_percent:
+            if yv <= min_yield_percent:
                 continue
             chance += (yv - min_yield_percent)
             if not chance_only:
@@ -373,20 +412,45 @@ class Label_Scattered_Hope:
         return (float(chance), float(wait))
 
     @classmethod
+    def make_auxiliary(cls, config: Optional[dict] = None, **overrides) -> dict:
+        """
+        Class-private loss knobs for yield.
+
+        Keys (only used inside Label_Yield.loss):
+          chance_weight, wait_weight, chance_only
+        """
+        cfg = config or {}
+        aux = {
+            'chance_weight': float(cfg.get('chance_loss_weight', 1.0)),
+            'wait_weight': float(cfg.get('wait_loss_weight', 1.0)),
+            'chance_only': bool(cfg.get('chance_only', False)),
+        }
+        aux.update(overrides)
+        return aux
+
+    @classmethod
     def loss(
         cls,
-        predictions: torch.Tensor,
-        targets: torch.Tensor,
-        chance_weight: float = 1.0,
-        wait_weight: float = 1.0,
-        chance_only: bool = False,
-        **_kwargs,
+        x: torch.Tensor,
+        y_pred: torch.Tensor,
+        y_truth: torch.Tensor,
+        auxiliary: Optional[dict] = None,
     ) -> torch.Tensor:
-        """MSE on (chance[, wait])."""
-        out_dim = predictions.shape[-1]
-        if targets.shape[-1] != out_dim:
+        """
+        Uniform signature: loss(x, y_pred, y_truth, auxiliary).
+
+        MSE on (chance[, wait]). ``x`` unused for yield (kept for API uniformity).
+        ``auxiliary`` may contain chance_weight / wait_weight / chance_only.
+        """
+        aux = auxiliary or {}
+        chance_weight = float(aux.get('chance_weight', 1.0))
+        wait_weight = float(aux.get('wait_weight', 1.0))
+        chance_only = bool(aux.get('chance_only', False))
+
+        out_dim = y_pred.shape[-1]
+        if y_truth.shape[-1] != out_dim:
             raise ValueError(
-                f"{cls.name} loss: target dim {targets.shape[-1]} != pred dim {out_dim}"
+                f"{cls.name} loss: target dim {y_truth.shape[-1]} != pred dim {out_dim}"
             )
         if chance_only or out_dim == 1:
             if out_dim != 1:
@@ -394,11 +458,11 @@ class Label_Scattered_Hope:
                     f"chance_only requires pred dim 1, got {out_dim}"
                 )
             return chance_weight * nn.functional.mse_loss(
-                predictions[:, 0], targets[:, 0]
+                y_pred[:, 0], y_truth[:, 0]
             )
         if out_dim == 2:
-            chance_loss = nn.functional.mse_loss(predictions[:, 0], targets[:, 0])
-            wait_loss = nn.functional.mse_loss(predictions[:, 1], targets[:, 1])
+            chance_loss = nn.functional.mse_loss(y_pred[:, 0], y_truth[:, 0])
+            wait_loss = nn.functional.mse_loss(y_pred[:, 1], y_truth[:, 1])
             return chance_weight * chance_loss + wait_weight * wait_loss
         raise ValueError(
             f"{cls.name} loss: require dim 1 (chance_only) or 2, got {out_dim}"
@@ -410,10 +474,12 @@ class Label_Scattered_Hope:
 # ═══════════════════════════════════════════════════════════
 
 LABEL_CLASSES: dict[str, Type] = {
-    LABEL_LINEAR_REGIME: Label_Linear_Trend,
-    LABEL_SCATTERED_HOPE: Label_Scattered_Hope,
-    # aliases used in older configs / prose
-    'linear_trend': Label_Linear_Trend,
+    LABEL_TREND: Label_Trend,
+    LABEL_YIELD: Label_Yield,
+    # legacy aliases (pre-rename configs / caches)
+    'linear_regime': Label_Trend,
+    'linear_trend': Label_Trend,
+    'scattered_hope': Label_Yield,
 }
 
 
@@ -426,8 +492,8 @@ def get_label_class(label_mode: str) -> Type:
 
 
 def resolve_hope_output_dim(chance_only: bool) -> int:
-    """Scattered-hope head / label width: 1 if chance_only else 2."""
-    return Label_Scattered_Hope.resolve_output_dim(chance_only)
+    """Yield head / label width: 1 if chance_only else 2."""
+    return Label_Yield.resolve_output_dim(chance_only)
 
 
 def label_target_slice(
@@ -451,60 +517,690 @@ def label_target_names(
 
 
 def resolve_future_window(config: dict) -> int:
-    mode = config.get('label', LABEL_LINEAR_REGIME)
+    mode = config.get('label', LABEL_TREND)
     return get_label_class(mode).resolve_future_window(config)
 
 
 def resolve_model_past_len(config: dict) -> int:
-    mode = config.get('label', LABEL_LINEAR_REGIME)
+    mode = config.get('label', LABEL_TREND)
     return get_label_class(mode).resolve_model_past_len(config)
 
 
 # Backward-compatible free functions (delegate to classes)
 
-def find_linear_regime(*args, **kwargs):
-    return Label_Linear_Trend.find(*args, **kwargs)
+def find_trend(*args, **kwargs):
+    return Label_Trend.find(*args, **kwargs)
 
 
-def find_scattered_hope(*args, **kwargs):
-    return Label_Scattered_Hope.find(*args, **kwargs)
+def find_yield(*args, **kwargs):
+    return Label_Yield.find(*args, **kwargs)
 
 
-def custom_loss(
-    P,
-    X,
-    Y,
-    slope_weight=0.1,
-    intercept_weight=10,
-    recon_weight=0.01,
-    label_mode: str = 'linear_regime',
-    chance_weight: float = 1.0,
-    wait_weight: float = 1.0,
-    chance_only: bool = False,
+# Legacy names
+find_linear_regime = find_trend
+find_scattered_hope = find_yield
+
+
+def bind_label_loss(
+    label_mode: str,
+    config: Optional[dict] = None,
+    **overrides,
 ):
     """
-    Multi-output prediction loss; delegates to the active label class.
-    Optional reconstruction term uses X vs recon.
+    Return the concrete label-class loss, ready for ResumableTrainer.
+
+    Resulting callable has signature::
+
+        loss_fn(x, y_pred, y_truth) -> Tensor
+
+    which is ``Label_*.loss`` with class-private ``auxiliary`` already bound
+    (from config / overrides via Label_*.make_auxiliary). No generic dispatcher
+    at train time — the active class is fixed here.
     """
-    predictions, patch_map, recon = P
-    out_dim = predictions.shape[-1]
-    if Y.shape[-1] != out_dim:
+    label_cls = get_label_class(label_mode)
+    auxiliary = label_cls.make_auxiliary(config, **overrides)
+
+    def loss_fn(
+        x: torch.Tensor,
+        y_pred: torch.Tensor,
+        y_truth: torch.Tensor,
+    ) -> torch.Tensor:
+        return label_cls.loss(x, y_pred, y_truth, auxiliary)
+
+    loss_fn.label_cls = label_cls  # type: ignore[attr-defined]
+    loss_fn.auxiliary = auxiliary  # type: ignore[attr-defined]
+    return loss_fn
+
+
+# ═══════════════════════════════════════════════════════════
+# VISUALIZATION (formerly label_viz.py)
+# ═══════════════════════════════════════════════════════════
+
+def _as_float(v) -> float:
+    return float(v.item() if hasattr(v, 'item') else v)
+
+
+def _trend_to_price_space(vec, price_mean: float, price_std: float, default_horizon: int = 0):
+    """
+    Map a trend vector from price-normalized space to price space.
+
+    Accepts:
+      len 3 → (horizon, slope, intercept)
+      len 2 → (slope, intercept); horizon = default_horizon
+    """
+    if hasattr(vec, 'detach'):
+        vec = vec.detach().cpu().flatten()
+    n = len(vec)
+    if n == 3:
+        horizon = max(0, int(round(_as_float(vec[0]))))
+        slope_norm = _as_float(vec[1])
+        intercept_norm = _as_float(vec[2])
+    elif n == 2:
+        horizon = max(0, int(default_horizon))
+        slope_norm = _as_float(vec[0])
+        intercept_norm = _as_float(vec[1])
+    else:
+        raise ValueError(f"Trend vector must have length 2 or 3, got {n}")
+    if price_std == 0:
+        price_std = 1.0
+    slope = slope_norm * price_std
+    intercept = intercept_norm * price_std + price_mean
+    return horizon, slope, intercept
+
+
+def visualize_trend(
+    total_tensor: torch.Tensor,
+    valid_starts: List[int],
+    label_tensor: torch.Tensor,
+    mean_tensor: torch.Tensor,
+    std_tensor: torch.Tensor,
+    price_feature_idx: int,
+    past_window: int,
+    future_window: int,
+    mode: str = 'anchored',
+    num_samples: int = 6,
+    figsize: Tuple[int, int] = (15, 10),
+    interactive: bool = True,
+    pred_tensor: Optional[torch.Tensor] = None,
+    fixed_order: bool = False,
+    sample_ids: Optional[List[int]] = None,
+    default_pred_horizon: Optional[int] = None,
+    h_past_tensor: Optional[torch.Tensor] = None,
+    # Kept for call-site compatibility; not used (labels come from cache).
+    min_horizon: int = 3,
+    max_horizon: Optional[int] = None,
+    max_past_horizon: Optional[int] = None,
+    fitness_threshold: float = LABEL_FITNESS_THRESHOLD,
+    horizon_search: str = HORIZON_SEARCH_LONGEST_LINEAR,
+    regime_use_past: bool = True,
+    normalize_prices: bool = True,
+):
+    """
+    Visualize joint past+future linear regimes from the dataset cache.
+
+    Plots for each panel:
+      - actual prices (recent past + full future)
+      - label regime line on t ∈ [-h_past, h_fut)  (from cache; t=0 = first future)
+      - inferred trend (from pred_tensor), if provided — future span only
+
+    label_tensor is the cached natural-unit label (not recomputed):
+      len 3 → (horizon, slope, intercept) in window price-z space for m,b
+      len 2 → (slope, intercept); horizon from default_pred_horizon
+    h_past_tensor: optional cached past extent (same length as label_tensor).
+      If None, past extent is drawn as 0 (future-only segment).
+
+    When fixed_order=True, pages sequentially through the provided samples only
+    (no random re-sampling). Otherwise interactive Next draws random batches.
+
+    sample_ids: optional dataset indices for titles (aligned with label_tensor rows).
+    Keyboard: N / Right / Space = Next, Q / Escape = Quit.
+    """
+    if total_tensor.is_cuda:
+        total_tensor = total_tensor.cpu()
+    if pred_tensor is not None and pred_tensor.is_cuda:
+        pred_tensor = pred_tensor.cpu()
+    if label_tensor.is_cuda:
+        label_tensor = label_tensor.cpu()
+    if mean_tensor.is_cuda:
+        mean_tensor = mean_tensor.cpu()
+    if std_tensor.is_cuda:
+        std_tensor = std_tensor.cpu()
+    if h_past_tensor is not None and h_past_tensor.is_cuda:
+        h_past_tensor = h_past_tensor.cpu()
+
+    num_available = int(label_tensor.shape[0])
+    if num_available == 0:
+        print("⚠ No samples available for trend visualization.")
+        return
+
+    if pred_tensor is not None and pred_tensor.shape[0] != num_available:
         raise ValueError(
-            f"Target dim Y.shape[-1]={Y.shape[-1]} != predictions dim {out_dim}"
+            f"pred_tensor length ({pred_tensor.shape[0]}) must match "
+            f"label_tensor length ({num_available})"
+        )
+    if h_past_tensor is not None and int(h_past_tensor.shape[0]) != num_available:
+        raise ValueError(
+            f"h_past_tensor length ({h_past_tensor.shape[0]}) must match "
+            f"label_tensor length ({num_available})"
         )
 
-    label_cls = get_label_class(label_mode)
-    pred_loss = label_cls.loss(
-        predictions,
-        Y,
-        slope_weight=slope_weight,
-        intercept_weight=intercept_weight,
-        chance_weight=chance_weight,
-        wait_weight=wait_weight,
-        chance_only=chance_only,
+    num_samples = min(num_samples, num_available)
+    if num_samples < 1:
+        num_samples = 1
+    # Prefer a full 2x3 grid when possible (only for random browsing)
+    if not fixed_order and num_samples % 2 != 0 and num_samples >= 6:
+        num_samples = 6
+
+    n_cols = 3 if num_samples > 1 else 1
+    n_rows = max(1, (num_samples + n_cols - 1) // n_cols)
+    n_pages = max(1, (num_available + num_samples - 1) // num_samples) if fixed_order else None
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+    axes = np.atleast_1d(axes).ravel()
+
+    # Room for buttons at the bottom in interactive mode
+    if interactive:
+        fig.subplots_adjust(left=0.07, right=0.98, top=0.90, bottom=0.14, hspace=0.45, wspace=0.25)
+    else:
+        fig.subplots_adjust(left=0.07, right=0.98, top=0.90, bottom=0.08, hspace=0.45, wspace=0.25)
+
+    page_num = [0]  # 1-based after first draw
+    # Keep button refs alive (matplotlib GC otherwise disconnects them)
+    _widgets: List[Any] = []
+
+    def _page_indices(page: int) -> List[int]:
+        """0-based row indices into label/pred tensors for this page."""
+        k = min(num_samples, num_available)
+        if fixed_order:
+            start_i = (page - 1) * num_samples
+            if start_i >= num_available:
+                start_i = 0
+            return list(range(start_i, min(start_i + num_samples, num_available)))
+        rng = random.Random(int(time.time() * 1000) + page)
+        return rng.sample(range(num_available), k)
+
+    def _draw_page():
+        page_num[0] += 1
+        if fixed_order and n_pages is not None and page_num[0] > n_pages:
+            page_num[0] = 1  # wrap
+        indices = _page_indices(page_num[0])
+
+        for ax in axes:
+            ax.clear()
+            ax.set_visible(True)
+
+        max_h = int(max_horizon) if max_horizon is not None else int(future_window)
+
+        for i, idx in enumerate(indices):
+            if i >= len(axes):
+                break
+            ax = axes[i]
+            start = valid_starts[idx]
+            mean = mean_tensor[idx].flatten()
+            std = std_tensor[idx].flatten()
+
+            price_mean = float(mean[price_feature_idx].item())
+            price_std = float(std[price_feature_idx].item())
+            if price_std == 0:
+                price_std = 1.0
+
+            # Labels from cache only (never re-run find_trend here).
+            h_lbl, m_lbl, b_lbl = _trend_to_price_space(
+                label_tensor[idx], price_mean, price_std,
+                default_horizon=int(max_h),
+            )
+            if h_past_tensor is not None:
+                h_past_lbl = int(max(0, round(float(h_past_tensor[idx].item()))))
+            else:
+                h_past_lbl = 0
+
+            y_start = start + past_window
+            y_end = y_start + future_window
+
+            # Actual prices: enough past to cover regime past (min 15 for context).
+            past_context = max(15, h_past_lbl)
+            past_ctx = min(past_context, past_window, y_start)
+            ctx_start = y_start - past_ctx
+            actual_prices = total_tensor[
+                ctx_start:y_end, price_feature_idx
+            ].cpu().numpy()
+            time_steps = np.arange(-past_ctx, len(actual_prices) - past_ctx)
+
+            if past_ctx > 0:
+                ax.plot(
+                    time_steps[: past_ctx + 1],
+                    actual_prices[: past_ctx + 1],
+                    color='#8AB4D4',
+                    linewidth=2,
+                    label='Actual (past)',
+                    alpha=0.75,
+                )
+            ax.plot(
+                time_steps[past_ctx:],
+                actual_prices[past_ctx:],
+                'b-',
+                linewidth=2,
+                label='Actual (future)',
+                alpha=0.75,
+            )
+
+            # Label joint regime: t = -h_past .. h_fut-1 (intercept at t=0)
+            if h_lbl > 0 or h_past_lbl > 0:
+                t0 = -h_past_lbl
+                t1 = max(h_lbl, 1)
+                t_lbl = np.arange(t0, t1)
+                if len(t_lbl) > 0:
+                    ax.plot(
+                        t_lbl,
+                        m_lbl * t_lbl + b_lbl,
+                        'r-',
+                        linewidth=2.5,
+                        label=(
+                            f'Label regime: past={h_past_lbl}, H={h_lbl}, '
+                            f'm={m_lbl:.4f}, b={b_lbl:.2f}'
+                        ),
+                    )
+                if h_past_lbl > 0:
+                    ax.axvline(
+                        x=-h_past_lbl, color='red', linestyle=':',
+                        linewidth=1.2, alpha=0.65,
+                    )
+                if h_lbl > 0:
+                    ax.axvline(
+                        x=h_lbl - 1, color='red', linestyle='--',
+                        linewidth=1.3, alpha=0.65,
+                    )
+                # Regime bands: slightly different tint for past vs future (match price split)
+                if h_past_lbl > 0:
+                    ax.axvspan(
+                        -h_past_lbl, 0,
+                        alpha=0.12, color='#B8D4E8',  # soft blue — past regime
+                    )
+                if h_lbl > 0:
+                    ax.axvspan(
+                        0, max(h_lbl - 1, 0),
+                        alpha=0.12, color='#FFCC80',  # soft orange — future regime
+                    )
+
+            # Inferred trend (model): future side only; t=0..H-1
+            if pred_tensor is not None:
+                pred_h_default = (
+                    default_pred_horizon
+                    if default_pred_horizon is not None
+                    else max_h
+                )
+                h_prd, m_prd, b_prd = _trend_to_price_space(
+                    pred_tensor[idx],
+                    price_mean,
+                    price_std,
+                    default_horizon=pred_h_default,
+                )
+                if h_prd > 0:
+                    t_prd = np.arange(h_prd)
+                    ax.plot(
+                        t_prd, m_prd * t_prd + b_prd, 'g-', linewidth=2.5,
+                        label=f'Inferred: H={h_prd}, m={m_prd:.4f}, b={b_prd:.2f}',
+                    )
+                    ax.axvline(
+                        x=h_prd - 1, color='green', linestyle='--',
+                        linewidth=1.3, alpha=0.65,
+                    )
+                title_line2 = (
+                    f'pred H={h_prd}, m={m_prd:.4f}, b={b_prd:.2f}'
+                )
+            else:
+                title_line2 = None
+
+            ax.axvline(x=0, color='gray', linestyle=':', linewidth=1.2, alpha=0.5)
+
+            display_id = sample_ids[idx] if sample_ids is not None else idx
+            title_line1 = (
+                f'Sample {display_id}: past={h_past_lbl}, H={h_lbl}, '
+                f'm={m_lbl:.4f}, b={b_lbl:.2f}'
+            )
+            ax.set_title(
+                title_line1 if title_line2 is None else f'{title_line1}\n{title_line2}',
+                fontsize=9,
+            )
+            ax.set_xlabel('Time (min; t=0 = first future bar)')
+            ax.set_ylabel('Price')
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=7, loc='best')
+
+        for i in range(len(indices), len(axes)):
+            axes[i].clear()
+            axes[i].set_visible(False)
+
+        page_label = f'Page {page_num[0]}'
+        if fixed_order and n_pages is not None:
+            page_label = f'Page {page_num[0]}/{n_pages}'
+        line1 = f'Trend Visualization — Mode: {mode.upper()}  |  {page_label}'
+        line2_parts = ['labels from dataset cache']
+        if h_past_tensor is not None:
+            line2_parts.append('h_past from cache')
+        elif regime_use_past:
+            line2_parts.append('h_past=0 (no cache)')
+        if pred_tensor is not None:
+            line2_parts.append('red=label regime  green=inferred')
+        if fixed_order:
+            line2_parts.append('chosen samples only')
+        if interactive:
+            line2_parts.append('[Next] / [Quit]')
+        line2 = '  |  '.join(line2_parts) if line2_parts else ''
+        fig.suptitle(
+            line1 if not line2 else f'{line1}\n{line2}',
+            fontsize=12,
+            fontweight='bold',
+        )
+        fig.canvas.draw_idle()
+        shown_ids = (
+            [sample_ids[i] for i in indices] if sample_ids is not None else list(indices)
+        )
+        print(f"  {page_label}: samples {shown_ids}")
+
+    if interactive:
+        ax_next = fig.add_axes([0.55, 0.02, 0.18, 0.055])
+        ax_quit = fig.add_axes([0.76, 0.02, 0.18, 0.055])
+        btn_next = Button(ax_next, 'Next')
+        btn_quit = Button(ax_quit, 'Quit')
+        _widgets.extend([btn_next, btn_quit, ax_next, ax_quit])
+
+        def _on_next(_event):
+            _draw_page()
+
+        def _on_quit(_event):
+            print("  Quit — closing trend browser.")
+            plt.close(fig)
+
+        btn_next.on_clicked(_on_next)
+        btn_quit.on_clicked(_on_quit)
+
+        def _on_key(event):
+            if event.key in ('n', 'right', ' '):
+                _draw_page()
+            elif event.key in ('q', 'escape'):
+                print("  Quit — closing trend browser.")
+                plt.close(fig)
+
+        fig.canvas.mpl_connect('key_press_event', _on_key)
+        if fixed_order:
+            print(
+                f"Trend browser ({num_available} chosen samples): "
+                f"[Next] or N/Space = next page · [Quit] or Q = exit"
+            )
+        else:
+            print("Trend browser: [Next] or N/Space = next page · [Quit] or Q = exit")
+
+    _draw_page()
+    plt.show(block=True)
+
+
+def visualize_yield(
+    total_tensor: torch.Tensor,
+    valid_starts: List[int],
+    label_tensor: torch.Tensor,
+    price_feature_idx: int,
+    past_window: int,
+    future_window: int,
+    min_yield_percent: float = 0.0,
+    max_hope_future_horizon: Optional[int] = None,
+    chance_only: bool = False,
+    num_samples: int = 6,
+    figsize: Tuple[int, int] = (15, 10),
+    interactive: bool = True,
+    pred_tensor: Optional[torch.Tensor] = None,
+    fixed_order: bool = False,
+    sample_ids: Optional[List[int]] = None,
+    past_context: int = 15,
+):
+    """
+    Visualize yield labels in raw price space.
+
+    Each panel:
+      - recent past + future actual prices
+      - horizontal line at reference price history[-1]
+      - orange markers on future bars where yield % >= min_yield_percent
+        (decorative only — illustrates the threshold rule on the chart)
+      - title chance/wait from ``label_tensor`` (dataset cache; not recomputed)
+    """
+    if total_tensor.is_cuda:
+        total_tensor = total_tensor.cpu()
+    if label_tensor.is_cuda:
+        label_tensor = label_tensor.cpu()
+    if pred_tensor is not None and pred_tensor.is_cuda:
+        pred_tensor = pred_tensor.cpu()
+
+    num_available = int(label_tensor.shape[0])
+    if num_available == 0:
+        print("⚠ No samples available for yield visualization.")
+        return
+    if pred_tensor is not None and pred_tensor.shape[0] != num_available:
+        raise ValueError(
+            f"pred_tensor length ({pred_tensor.shape[0]}) must match "
+            f"label_tensor length ({num_available})"
+        )
+
+    num_samples = min(num_samples, num_available)
+    if num_samples < 1:
+        num_samples = 1
+    if not fixed_order and num_samples % 2 != 0 and num_samples >= 6:
+        num_samples = 6
+
+    n_cols = 3 if num_samples > 1 else 1
+    n_rows = max(1, (num_samples + n_cols - 1) // n_cols)
+    n_pages = (
+        max(1, (num_available + num_samples - 1) // num_samples)
+        if fixed_order else None
     )
 
-    if recon is not None:
-        recon_loss = nn.functional.mse_loss(recon, X)
-        return pred_loss + recon_weight * recon_loss
-    return pred_loss
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+    axes = np.atleast_1d(axes).ravel()
+    if interactive:
+        fig.subplots_adjust(
+            left=0.07, right=0.98, top=0.88, bottom=0.14, hspace=0.50, wspace=0.25
+        )
+    else:
+        fig.subplots_adjust(
+            left=0.07, right=0.98, top=0.88, bottom=0.08, hspace=0.50, wspace=0.25
+        )
+
+    page_num = [0]
+    _widgets: List[Any] = []
+    max_h = (
+        int(max_hope_future_horizon)
+        if max_hope_future_horizon is not None
+        else int(future_window)
+    )
+    max_h = min(max_h, int(future_window))
+
+    def _page_indices(page: int) -> List[int]:
+        k = min(num_samples, num_available)
+        if fixed_order:
+            start_i = (page - 1) * num_samples
+            if start_i >= num_available:
+                start_i = 0
+            return list(range(start_i, min(start_i + num_samples, num_available)))
+        rng = random.Random(int(time.time() * 1000) + page)
+        return rng.sample(range(num_available), k)
+
+    def _as_components(vec) -> Tuple[float, ...]:
+        v = vec.detach().cpu().flatten() if hasattr(vec, 'detach') else np.asarray(vec).ravel()
+        if chance_only or len(v) == 1:
+            return (float(v[0]),)
+        return (float(v[0]), float(v[1]))
+
+    def _draw_page():
+        page_num[0] += 1
+        if fixed_order and n_pages is not None and page_num[0] > n_pages:
+            page_num[0] = 1
+        indices = _page_indices(page_num[0])
+
+        for ax in axes:
+            ax.clear()
+            ax.set_visible(True)
+
+        for i, idx in enumerate(indices):
+            if i >= len(axes):
+                break
+            ax = axes[i]
+            start = valid_starts[idx]
+            y_start = start + past_window
+            y_end = y_start + future_window
+
+            history = total_tensor[start:y_start, price_feature_idx].float()
+            future = total_tensor[y_start:y_end, price_feature_idx].float()
+            ref = float(history[-1].item()) if history.numel() else 0.0
+            eps = 1e-8
+            denom = ref if abs(ref) > eps else (ref + eps if ref >= 0 else ref - eps)
+
+            # Context: recent past + full future
+            past_ctx = min(past_context, past_window, y_start)
+            ctx_start = y_start - past_ctx
+            actual = total_tensor[ctx_start:y_end, price_feature_idx].cpu().numpy()
+            t_axis = np.arange(-past_ctx, len(actual) - past_ctx)
+
+            if past_ctx > 0:
+                ax.plot(
+                    t_axis[: past_ctx + 1], actual[: past_ctx + 1],
+                    color='#8AB4D4', linewidth=2, label='Actual (past)', alpha=0.8,
+                )
+            ax.plot(
+                t_axis[past_ctx:], actual[past_ctx:],
+                'b-', linewidth=2, label='Actual (future)', alpha=0.8,
+            )
+
+            # Reference price at t=0 decision
+            ax.axhline(y=ref, color='gray', linestyle=':', linewidth=1.2, alpha=0.7,
+                       label=f'ref={ref:.2f}')
+            ax.axvline(x=0, color='gray', linestyle=':', linewidth=1.2, alpha=0.5)
+
+            # Hit markers (chart decoration only; chance comes from label_tensor)
+            n_hope = min(max_h, int(future.shape[0]))
+            event_t, event_p = [], []
+            for t in range(n_hope):
+                yv = float(((future[t] - ref) / denom) * 100)
+                if yv <= min_yield_percent:
+                    continue
+                event_t.append(t)
+                event_p.append(float(future[t].item()))
+            if event_t:
+                ax.scatter(
+                    event_t, event_p, c='orange', s=28, zorder=5,
+                    label=f'hits={len(event_t)} (≥{min_yield_percent:g}%)',
+                )
+                for tt, pp in zip(event_t, event_p):
+                    ax.plot([-1, tt], [ref, pp], color='orange', alpha=0.25, linewidth=1.0)
+
+            if n_hope > 0:
+                ax.axvspan(0, max(n_hope - 1, 0), alpha=0.08, color='#FFE0B2')
+
+            # Labels: always from stored dataset cache (not recomputed here)
+            comps_lbl = _as_components(label_tensor[idx])
+            if chance_only or len(comps_lbl) == 1:
+                title_l1 = f'chance={comps_lbl[0]:.2f}'
+            else:
+                title_l1 = f'chance={comps_lbl[0]:.2f}, wait={comps_lbl[1]:.2f}'
+            title_l2 = None
+            if pred_tensor is not None:
+                comps_prd = _as_components(pred_tensor[idx])
+                if chance_only or len(comps_prd) == 1:
+                    title_l2 = f'pred chance={comps_prd[0]:.2f}'
+                    pred_txt = f'pred c={comps_prd[0]:.1f}'
+                else:
+                    title_l2 = (
+                        f'pred chance={comps_prd[0]:.2f}, wait={comps_prd[1]:.2f}'
+                    )
+                    pred_txt = f'pred c={comps_prd[0]:.1f} w={comps_prd[1]:.1f}'
+                ax.text(
+                    0.02, 0.98,
+                    pred_txt,
+                    transform=ax.transAxes, va='top', ha='left', fontsize=8,
+                    color='green',
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7),
+                )
+
+            display_id = sample_ids[idx] if sample_ids is not None else idx
+            head = f'Sample {display_id}: {title_l1}'
+            ax.set_title(
+                head if title_l2 is None else f'{head}\n{title_l2}',
+                fontsize=9,
+            )
+            ax.set_xlabel('Time (min; t=0 = first future bar)')
+            ax.set_ylabel('Price (raw)')
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=7, loc='best')
+
+        for i in range(len(indices), len(axes)):
+            axes[i].clear()
+            axes[i].set_visible(False)
+
+        page_label = f'Page {page_num[0]}'
+        if fixed_order and n_pages is not None:
+            page_label = f'Page {page_num[0]}/{n_pages}'
+        mode_note = 'chance_only' if chance_only else 'chance+wait'
+        line1 = (
+            f'Yield ({mode_note}) — min_yield={min_yield_percent:g}%  |  {page_label}'
+        )
+        line2_parts = [
+            f'horizon={max_h}',
+            'orange=hits ≥ threshold',
+            'chance from dataset cache',
+        ]
+        if pred_tensor is not None:
+            line2_parts.append('green text=pred (denorm)')
+        if fixed_order:
+            line2_parts.append('chosen samples only')
+        if interactive:
+            line2_parts.append('[Next] / [Quit]')
+        line2 = '  |  '.join(line2_parts)
+        fig.suptitle(f'{line1}\n{line2}', fontsize=11, fontweight='bold')
+        fig.canvas.draw_idle()
+        shown_ids = (
+            [sample_ids[i] for i in indices] if sample_ids is not None else list(indices)
+        )
+        print(f"  {page_label}: samples {shown_ids}")
+
+    if interactive:
+        ax_next = fig.add_axes([0.55, 0.02, 0.18, 0.055])
+        ax_quit = fig.add_axes([0.76, 0.02, 0.18, 0.055])
+        btn_next = Button(ax_next, 'Next')
+        btn_quit = Button(ax_quit, 'Quit')
+        _widgets.extend([btn_next, btn_quit, ax_next, ax_quit])
+
+        def _on_next(_event):
+            _draw_page()
+
+        def _on_quit(_event):
+            print("  Quit — closing yield browser.")
+            plt.close(fig)
+
+        btn_next.on_clicked(_on_next)
+        btn_quit.on_clicked(_on_quit)
+
+        def _on_key(event):
+            if event.key in ('n', 'right', ' '):
+                _draw_page()
+            elif event.key in ('q', 'escape'):
+                print("  Quit — closing yield browser.")
+                plt.close(fig)
+
+        fig.canvas.mpl_connect('key_press_event', _on_key)
+        if fixed_order:
+            print(
+                f"Yield browser ({num_available} chosen samples): "
+                f"[Next] or N/Space = next page · [Quit] or Q = exit"
+            )
+        else:
+            print("Yield browser: [Next] or N/Space = next page · [Quit] or Q = exit")
+
+    _draw_page()
+    plt.show(block=True)
+
+
+# ═══════════════════════════════════════════════════════════
+
+
+
+# Legacy names
+visualize_linear_trends = visualize_trend
+visualize_scattered_hope = visualize_yield

@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple
 from config import get_config
-from labels import custom_loss, resolve_model_past_len  # shared label objective / p length
+from labels import Label_Trend, resolve_model_past_len  # shared label objective / p length
 
 
 # ═══════════════════════════════════════════════════════════
@@ -139,8 +139,8 @@ def check_all_weights_updated(
     Args:
         model:        module under test
         sample_batch: (x, p, mean, std, shape) matching model.forward
-        loss_fn:      optional callable(P, X, Y) -> scalar; if None, uses
-                      predictions.sum() (+ recon.sum() if present)
+        loss_fn:      optional callable(x, y_pred, y_truth) -> scalar; if None,
+                      uses predictions.sum() (+ recon.sum() if present)
         name:         label for log lines
 
     Returns:
@@ -178,7 +178,7 @@ def check_all_weights_updated(
     if loss_fn is not None:
         # Dummy targets matching prediction layout (2 or 3 dims)
         Y = torch.zeros(predictions.shape[0], predictions.shape[1], device=device)
-        loss = loss_fn(P, x, Y)
+        loss = loss_fn(x, predictions, Y)
     else:
         loss = predictions.sum()
         if recon is not None:
@@ -244,8 +244,8 @@ class PredictionHead(nn.Module):
     """
     Prediction head (layout depends on config label / output_dim):
 
-    linear_regime:   3 → (horizon, slope, intercept);  2 → (slope, intercept)
-    scattered_hope:  2 → (chance, wait);  1 → (chance,) if chance_only
+    trend:   3 → (horizon, slope, intercept);  2 → (slope, intercept)
+    yield:  2 → (chance, wait);  1 → (chance,) if chance_only
     """
 
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int = 3, dropout: float = 0.1):
@@ -274,8 +274,8 @@ class MarketTransformerWithHeads(nn.Module):
     reconstruction.
 
     output_dim controls the head layout (see config ``label``):
-      linear_regime:  3 → (h, m, b);  2 → (m, b)
-      scattered_hope: 2 → (chance, wait);  1 → (chance,) if chance_only
+      trend:  3 → (h, m, b);  2 → (m, b)
+      yield: 2 → (chance, wait);  1 → (chance,) if chance_only
 
     Window statistics (mean / std / shape moments) condition the decoder via
     x_stat tokens. Recent past prices ``p`` are shared by both label modes.
@@ -594,7 +594,7 @@ class MarketTransformerWithHeads(nn.Module):
         return predictions, patch_map, recon
 
 
-# custom_loss lives in labels.py (re-exported above for TRAIN / callers).
+# Label objectives live in labels.py (Label_*.loss / bind_label_loss).
 
 
 # ═══════════════════════════════════════════════════════════
@@ -659,11 +659,14 @@ if __name__ == "__main__":
     std = torch.randn(B, F, device=device).abs() + 1e-3
     shape = torch.randn(B, num_shapes, F, device=device)
 
+    _trend_aux = Label_Trend.make_auxiliary(
+        {'slope_loss_weight': 0.1, 'intercept_loss_weight': 0.01}
+    )
     check_all_weights_updated(
         model,
         sample_batch=(x, p, mean, std, shape),
-        loss_fn=lambda P, X, Y: custom_loss(
-            P, X, Y, slope_weight=0.1, intercept_weight=0.01, recon_weight=0.01
+        loss_fn=lambda x_, y_pred, y_truth: Label_Trend.loss(
+            x_, y_pred, y_truth, _trend_aux
         ),
         name="MarketTransformerWithHeads",
     )
