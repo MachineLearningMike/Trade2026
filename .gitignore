@@ -214,6 +214,7 @@ __marimo__/
 *.npy
 *.csv
 *.png
+*.html
 trading_checkpoints/
 autoformer/pic/
 
