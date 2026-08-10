@@ -962,6 +962,8 @@ def visualize_yield(
       - orange markers on future bars where yield % >= min_yield_percent
         (decorative only — illustrates the threshold rule on the chart)
       - title chance/wait from ``label_tensor`` (dataset cache; not recomputed)
+      - small chance×wait inset: truth (and pred if given) as scatter points
+        (skipped when ``chance_only`` / 1-D labels)
     """
     if total_tensor.is_cuda:
         total_tensor = total_tensor.cpu()
@@ -1006,6 +1008,7 @@ def visualize_yield(
 
     page_num = [0]
     _widgets: List[Any] = []
+    _inset_axes: List[Any] = []  # chance×wait insets; removed on each redraw
     max_h = (
         int(max_hope_future_horizon)
         if max_hope_future_horizon is not None
@@ -1029,12 +1032,21 @@ def visualize_yield(
             return (float(v[0]),)
         return (float(v[0]), float(v[1]))
 
+    def _clear_insets():
+        while _inset_axes:
+            ia = _inset_axes.pop()
+            try:
+                ia.remove()
+            except Exception:
+                pass
+
     def _draw_page():
         page_num[0] += 1
         if fixed_order and n_pages is not None and page_num[0] > n_pages:
             page_num[0] = 1
         indices = _page_indices(page_num[0])
 
+        _clear_insets()
         for ax in axes:
             ax.clear()
             ax.set_visible(True)
@@ -1096,13 +1108,15 @@ def visualize_yield(
 
             # Labels: always from stored dataset cache (not recomputed here)
             comps_lbl = _as_components(label_tensor[idx])
+            comps_prd = (
+                _as_components(pred_tensor[idx]) if pred_tensor is not None else None
+            )
             if chance_only or len(comps_lbl) == 1:
                 title_l1 = f'chance={comps_lbl[0]:.2f}'
             else:
                 title_l1 = f'chance={comps_lbl[0]:.2f}, wait={comps_lbl[1]:.2f}'
             title_l2 = None
-            if pred_tensor is not None:
-                comps_prd = _as_components(pred_tensor[idx])
+            if comps_prd is not None:
                 if chance_only or len(comps_prd) == 1:
                     title_l2 = f'pred chance={comps_prd[0]:.2f}'
                     pred_txt = f'pred c={comps_prd[0]:.1f}'
@@ -1118,6 +1132,50 @@ def visualize_yield(
                     color='green',
                     bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7),
                 )
+
+            # Small chance × wait coordinate inset (truth + pred scatter)
+            if not (chance_only or len(comps_lbl) < 2):
+                ch_t, wt_t = float(comps_lbl[0]), float(comps_lbl[1])
+                ax_cw = ax.inset_axes([0.58, 0.10, 0.40, 0.38])
+                _inset_axes.append(ax_cw)
+                ax_cw.scatter(
+                    [ch_t], [wt_t],
+                    c='#1f77b4', s=42, zorder=4, marker='o',
+                    edgecolors='white', linewidths=0.6, label='truth',
+                )
+                xs_cw = [ch_t]
+                ys_cw = [wt_t]
+                if comps_prd is not None and len(comps_prd) >= 2:
+                    ch_p, wt_p = float(comps_prd[0]), float(comps_prd[1])
+                    ax_cw.scatter(
+                        [ch_p], [wt_p],
+                        c='#2ca02c', s=48, zorder=5, marker='x',
+                        linewidths=1.6, label='pred',
+                    )
+                    ax_cw.plot(
+                        [ch_t, ch_p], [wt_t, wt_p],
+                        color='gray', alpha=0.45, linewidth=0.9, zorder=3,
+                    )
+                    xs_cw.append(ch_p)
+                    ys_cw.append(wt_p)
+                # Axis limits with padding; keep origin in view when values are small
+                x_lo, x_hi = min(xs_cw), max(xs_cw)
+                y_lo, y_hi = min(ys_cw), max(ys_cw)
+                x_pad = max(0.05 * (x_hi - x_lo), abs(x_hi) * 0.08, 0.15)
+                y_pad = max(0.05 * (y_hi - y_lo), abs(y_hi) * 0.08, 0.15)
+                ax_cw.set_xlim(x_lo - x_pad, x_hi + x_pad)
+                ax_cw.set_ylim(y_lo - y_pad, y_hi + y_pad)
+                ax_cw.axhline(0.0, color='0.7', linewidth=0.6, zorder=1)
+                ax_cw.axvline(0.0, color='0.7', linewidth=0.6, zorder=1)
+                ax_cw.set_xlabel('chance', fontsize=6, labelpad=1)
+                ax_cw.set_ylabel('wait', fontsize=6, labelpad=1)
+                ax_cw.tick_params(axis='both', labelsize=5, length=2, pad=1)
+                ax_cw.grid(True, alpha=0.35, linewidth=0.5)
+                ax_cw.set_title('chance × wait', fontsize=6, pad=2)
+                ax_cw.legend(fontsize=5, loc='best', framealpha=0.75, borderpad=0.2)
+                ax_cw.set_facecolor('#FAFAFA')
+                for spine in ax_cw.spines.values():
+                    spine.set_linewidth(0.7)
 
             display_id = sample_ids[idx] if sample_ids is not None else idx
             head = f'Sample {display_id}: {title_l1}'
@@ -1146,6 +1204,8 @@ def visualize_yield(
             'orange=hits ≥ threshold',
             'chance from dataset cache',
         ]
+        if not chance_only:
+            line2_parts.append('inset: truth/pred on chance×wait')
         if pred_tensor is not None:
             line2_parts.append('green text=pred (denorm)')
         if fixed_order:

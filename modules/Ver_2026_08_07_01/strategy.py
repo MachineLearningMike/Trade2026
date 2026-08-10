@@ -1,12 +1,16 @@
 """
-EWMA Signal-Based Trading Strategy - Integrated with Lot-Based Portfolio Management
-Adds:
-- EWMA probability smoothing
-- Dynamic lot quantity based on signal strength
-- TP/SL exit logic per lot
-- Market order execution
+SMA Signal-Based Trading Strategy — Adaptive Percentile Threshold
 
-Run a self-contained demo (mock price + probability placeholders)::
+Every minute (per symbol):
+  1. Get model prediction p_t  (P(+0.5% within model horizon, e.g. 60 min))
+  2. Maintain rolling SMA window (default 10 minutes of predictions)
+  3. Append SMA to history; set threshold = percentile(history) (default 80th)
+  4. BUY if SMA > threshold (quantity scales with signal strength)
+  5. SELL each open lot on gross TP (+0.5%) or SL (-0.3%) — no time exit
+
+Integrated with lot-based PortfolioManagerV2.
+
+Run a self-contained demo::
 
     python strategy.py
 """
@@ -67,7 +71,6 @@ class PlaceholderPriceFeed:
 
     def __call__(self, symbol: str) -> float:
         px = float(self.prices.get(symbol, 50_000.0))
-        # Log-normal-ish step so TP/SL can eventually fire in demos
         shock = float(self.rng.normal(0.0, self.vol))
         px = max(1e-8, px * (1.0 + shock))
         self.prices[symbol] = px
@@ -79,11 +82,10 @@ class PlaceholderPriceFeed:
 
 class PlaceholderProbabilityFeed:
     """
-    Synthetic "P(favorable move)" in [0, 1].
+    Synthetic P(favorable move) in [0, 1].
 
-    Mean is biased above the default EWMA threshold so the demo buys;
-    noise keeps the path interesting. Replace with model inference via
-    ``get_probability_func=...``.
+    Mean is biased high so the adaptive-threshold demo eventually buys.
+    Replace with model inference via ``get_probability_func=...``.
     """
 
     def __init__(
@@ -97,172 +99,222 @@ class PlaceholderProbabilityFeed:
         self.rng = rng or np.random.default_rng(1)
 
     def __call__(self, symbol: str) -> float:
-        # symbol reserved for multi-asset model routing later
         p = self.mean + float(self.rng.normal(0.0, self.noise))
         return float(np.clip(p, 0.0, 1.0))
 
 
 # ============================================================================
-# CONFIGURATION EXTENSION
+# CONFIGURATION
 # ============================================================================
 
 class TradingConfig:
-    """Trading parameters for the EWMA signal strategy."""
-    
-    # EWMA parameters
-    EWMA_ALPHA = 0.2           # Decay factor (0.2 = ~10-minute half-life)
-    EWMA_THRESHOLD = 0.6       # Buy when smoothed prob exceeds this level
-    
-    # TP/SL parameters as *net* fractional return after round-trip fees
-    TAKE_PROFIT = 0.005        # 0.5% net take-profit
-    STOP_LOSS = -0.003         # -0.3% net stop-loss
-    
+    """Trading parameters for the SMA + adaptive-threshold strategy."""
+
+    # Model / signal
+    # Model window is conceptual (e.g. 60 min horizon) — provided by the model feed
+    SMA_WINDOW = 10                 # minutes of predictions in rolling SMA
+    PERCENTILE = 0.80               # adaptive threshold = this quantile of SMA history
+    THRESHOLD_MIN_HISTORY = 10      # need at least this many SMAs before adapting
+    THRESHOLD_UPDATE_FREQUENCY = 10  # recompute percentile every N steps
+    HISTORY_LIMIT = 10_000          # cap on sma_history length
+    INITIAL_THRESHOLD = 0.50        # fallback until history is ready
+
+    # TP/SL as *gross* fractional price moves (fees applied on settle only)
+    TAKE_PROFIT = 0.005             # +0.5%
+    STOP_LOSS = -0.003              # -0.3%
+
     # Position sizing
-    Q_MAX = 0.01               # Maximum quantity per lot (units)
-    
-    # Fees (constant)
-    BUY_FEE = 0.001            # 0.1% buy fee
-    SELL_FEE = 0.001           # 0.1% sell fee
-    TOTAL_FEES = BUY_FEE + SELL_FEE  # 0.2% round-trip
-    
-    # Order execution
-    USE_MARKET_ORDERS = True   # True = market orders, False = limit orders
-    
+    Q_MAX = 0.01                    # max quantity per lot
+
+    # Fees
+    BUY_FEE = 0.001                 # 0.1% entry
+    SELL_FEE = 0.001                # 0.1% exit
+    TOTAL_FEES = BUY_FEE + SELL_FEE
+
+    # Execution
+    USE_MARKET_ORDERS = True
+
     # Risk limits
-    MAX_INVENTORY_LOTS = 10    # Maximum lots per symbol
-    MAX_DAILY_TRADES = 50      # Maximum trades per day
+    MAX_INVENTORY_LOTS = 10
+    MAX_DAILY_TRADES = 50
 
 
 # ============================================================================
-# EWMA STRATEGY ENGINE
+# PER-SYMBOL SIGNAL ENGINE (SMA + adaptive threshold)
 # ============================================================================
 
-class EWMAStrategyEngine:
+class SMAStrategyEngine:
     """
-    EWMA-based trading strategy engine.
-    Calculates smoothed probability and determines buy/sell decisions.
+    Per-symbol signal state:
+
+      predictions → rolling SMA → sma_history → percentile threshold
+      buy size scales with (SMA - θ) / (1 - θ)
+      sell on gross TP / SL only
     """
-    
+
     def __init__(self, config: Dict = None, symbol: str = ''):
         self.config = config or {}
         self.symbol = symbol
-        
-        # EWMA state
-        self.ewma = 0.0
-        self._ewma_initialized = False
-        self.alpha = float(self.config.get('ewma_alpha', TradingConfig.EWMA_ALPHA))
-        self.threshold = float(self.config.get('ewma_threshold', TradingConfig.EWMA_THRESHOLD))
+
+        self.sma_window = int(self.config.get('sma_window', TradingConfig.SMA_WINDOW))
+        self.percentile = float(self.config.get('percentile', TradingConfig.PERCENTILE))
+        self.threshold_min_history = int(
+            self.config.get('threshold_min_history', TradingConfig.THRESHOLD_MIN_HISTORY)
+        )
+        self.threshold_update_frequency = int(
+            self.config.get(
+                'threshold_update_frequency',
+                TradingConfig.THRESHOLD_UPDATE_FREQUENCY,
+            )
+        )
+        self.history_limit = int(
+            self.config.get('history_limit', TradingConfig.HISTORY_LIMIT)
+        )
+        self.threshold = float(
+            self.config.get('initial_threshold', TradingConfig.INITIAL_THRESHOLD)
+        )
+
+        if self.sma_window < 1:
+            raise ValueError(f"sma_window must be >= 1; got {self.sma_window}")
+        if not (0.0 < self.percentile < 1.0):
+            raise ValueError(
+                f"percentile must be in (0, 1); got {self.percentile}"
+            )
         if not (0.0 <= self.threshold < 1.0):
             raise ValueError(
-                f"ewma_threshold must be in [0, 1); got {self.threshold}"
+                f"initial_threshold must be in [0, 1); got {self.threshold}"
             )
-        if not (0.0 < self.alpha <= 1.0):
-            raise ValueError(f"ewma_alpha must be in (0, 1]; got {self.alpha}")
-        
-        # TP/SL parameters
-        self.take_profit = self.config.get('take_profit', TradingConfig.TAKE_PROFIT)
-        self.stop_loss = self.config.get('stop_loss', TradingConfig.STOP_LOSS)
-        
-        # Position sizing
-        self.q_max = self.config.get('q_max', TradingConfig.Q_MAX)
-        
-        # Fees: entry + exit charged once each (not double-counted)
+
+        self.take_profit = float(
+            self.config.get('take_profit', TradingConfig.TAKE_PROFIT)
+        )
+        self.stop_loss = float(self.config.get('stop_loss', TradingConfig.STOP_LOSS))
+        self.q_max = float(self.config.get('q_max', TradingConfig.Q_MAX))
+
         self.buy_fee = float(self.config.get('buy_fee', TradingConfig.BUY_FEE))
         self.sell_fee = float(self.config.get('sell_fee', TradingConfig.SELL_FEE))
         self.total_fees = float(
             self.config.get('total_fees', self.buy_fee + self.sell_fee)
         )
-        
-        # Performance tracking
+
+        # Rolling window of model predictions and SMA history
+        self.predictions: List[float] = []
+        self.sma_history: List[float] = []
+        self.sma: float = 0.0
+        self.step_count: int = 0
+
+        # Performance
         self.trade_count = 0
         self.win_count = 0
         self.total_pnl = 0.0
-        
-        # History for backtesting
-        self.ewma_history: List[float] = []
         self.signal_history: List[Dict] = []
-        
+
         logger.info(
-            f"EWMAStrategyEngine[{symbol or '*'}] initialized: "
-            f"alpha={self.alpha}, threshold={self.threshold}, "
-            f"TP={self.take_profit:.2%}, SL={self.stop_loss:.2%}"
+            f"SMAStrategyEngine[{symbol or '*'}] initialized: "
+            f"sma_window={self.sma_window}, percentile={self.percentile:.0%}, "
+            f"thr0={self.threshold:.3f}, TP={self.take_profit:.2%}, SL={self.stop_loss:.2%}"
         )
-    
-    def update_ewma(self, probability: float) -> float:
-        """Update EWMA; first observation seeds the filter (no cold-start bias)."""
+
+    # --- signal path ---
+
+    def update_signal(self, probability: float) -> float:
+        """
+        Append p_t, recompute SMA, extend history, maybe refresh threshold.
+
+        Returns current SMA.
+        """
         p = float(probability)
-        if not self._ewma_initialized:
-            self.ewma = p
-            self._ewma_initialized = True
-        else:
-            self.ewma = self.alpha * p + (1.0 - self.alpha) * self.ewma
-        self.ewma_history.append(self.ewma)
-        return self.ewma
-    
-    def calculate_quantity(self) -> float:
+        if not math.isfinite(p) or not (0.0 <= p <= 1.0):
+            raise ValueError(f"probability must be in [0, 1]; got {p}")
+
+        self.step_count += 1
+        self.predictions.append(p)
+        if len(self.predictions) > self.sma_window:
+            self.predictions.pop(0)
+
+        self.sma = self.calculate_sma()
+        self.sma_history.append(self.sma)
+        if len(self.sma_history) > self.history_limit:
+            self.sma_history = self.sma_history[-self.history_limit :]
+
+        if (
+            self.threshold_update_frequency > 0
+            and self.step_count % self.threshold_update_frequency == 0
+        ):
+            self.update_threshold()
+
+        return self.sma
+
+    def calculate_sma(self) -> float:
+        if not self.predictions:
+            return 0.0
+        return float(sum(self.predictions) / len(self.predictions))
+
+    def update_threshold(self) -> float:
+        """Set threshold to configured percentile of SMA history."""
+        if len(self.sma_history) < self.threshold_min_history:
+            return self.threshold
+        sorted_hist = sorted(self.sma_history)
+        # nearest-rank style index in [0, n-1]
+        idx = int(self.percentile * len(sorted_hist))
+        idx = min(max(idx, 0), len(sorted_hist) - 1)
+        self.threshold = float(sorted_hist[idx])
+        # keep quantity formula safe
+        if self.threshold >= 1.0:
+            self.threshold = 0.999
+        return self.threshold
+
+    def calculate_quantity(self, sma: Optional[float] = None) -> float:
         """
-        Calculate buy quantity based on EWMA signal strength.
-        Q = Q_MAX × (EWMA - threshold) / (1 - threshold)
+        Q = Q_max × (SMA − θ) / (1 − θ), clipped to Q_max.
         """
+        s = self.sma if sma is None else float(sma)
         if self.threshold >= 1.0:
             return 0.0
-        if self.ewma <= self.threshold:
+        if s <= self.threshold:
             return 0.0
-        
-        q = self.q_max * (self.ewma - self.threshold) / (1.0 - self.threshold)
-        return min(q, self.q_max)
-    
-    def should_buy(self, current_inventory_count: int, max_lots: int = 10) -> Tuple[bool, float]:
-        """
-        Determine if we should buy.
-        Returns: (should_buy, quantity)
-        """
+        q = self.q_max * (s - self.threshold) / (1.0 - self.threshold)
+        return float(min(q, self.q_max))
+
+    def should_buy(
+        self, current_inventory_count: int, max_lots: int = 10
+    ) -> Tuple[bool, float]:
         if current_inventory_count >= max_lots:
             return False, 0.0
-        
-        if self.ewma <= self.threshold:
+        if self.sma <= self.threshold:
             return False, 0.0
-        
-        quantity = self.calculate_quantity()
+        quantity = self.calculate_quantity(self.sma)
         return quantity > 0, quantity
-    
-    def net_return(self, buy_price: float, sell_price: float) -> float:
-        """
-        Net fractional return after fees once each side:
-          gross = (sell - buy) / buy
-          net   = gross - buy_fee - sell_fee
-        """
-        if buy_price <= 0:
-            return 0.0
-        gross_pl = (sell_price - buy_price) / buy_price
-        return gross_pl - self.buy_fee - self.sell_fee
 
     def should_sell_lot(self, lot, current_price: float) -> Tuple[bool, str]:
         """
-        Determine if a specific lot should be sold using *net* return
-        (gross price move minus buy_fee and sell_fee).
+        Gross TP/SL on price only (fees settle on close, not in the trigger).
 
-        Returns: (should_sell, reason: 'TP' or 'SL')
+        Returns: (should_sell, reason 'TP'|'SL'|'')
         """
-        # Prefer lot.entry_fee rate if stored; else use engine fee rates
-        entry_fee_rate = self.buy_fee
-        if getattr(lot, 'quantity', 0) and getattr(lot, 'entry_fee', 0):
-            notional = lot.quantity * lot.entry_price
-            if notional > 0:
-                entry_fee_rate = float(lot.entry_fee) / notional
         if lot.entry_price <= 0:
             return False, ''
-        gross = (current_price - lot.entry_price) / lot.entry_price
-        net_pl = gross - entry_fee_rate - self.sell_fee
-
-        if net_pl >= self.take_profit:
+        gross_pl = (float(current_price) - lot.entry_price) / lot.entry_price
+        if gross_pl >= self.take_profit:
             return True, 'TP'
-        if net_pl <= self.stop_loss:
+        if gross_pl <= self.stop_loss:
             return True, 'SL'
         return False, ''
-    
+
+    def tp_price(self, buy_price: float) -> float:
+        return float(buy_price) * (1.0 + self.take_profit)
+
+    def sl_price(self, buy_price: float) -> float:
+        return float(buy_price) * (1.0 + self.stop_loss)
+
+    def net_return(self, buy_price: float, sell_price: float) -> float:
+        """Net fractional return after round-trip fees (analytics only)."""
+        if buy_price <= 0:
+            return 0.0
+        gross = (sell_price - buy_price) / buy_price
+        return gross - self.buy_fee - self.sell_fee
+
     def calculate_net_pnl(self, buy_price: float, sell_price: float) -> float:
-        """Alias for net_return (fractional)."""
         return self.net_return(buy_price, sell_price)
 
     def entry_fee(self, price: float, quantity: float) -> float:
@@ -270,86 +322,103 @@ class EWMAStrategyEngine:
 
     def exit_fee(self, price: float, quantity: float) -> float:
         return float(price) * float(quantity) * self.sell_fee
-    
+
     def record_trade(self, net_pnl: float):
-        """Record trade performance (pass net PnL only — fees already deducted)."""
         self.trade_count += 1
         self.total_pnl += net_pnl
         if net_pnl > 0:
             self.win_count += 1
-    
+
     def get_statistics(self) -> Dict:
-        """Get strategy statistics."""
         return {
             'symbol': self.symbol,
-            'current_ewma': self.ewma,
+            'current_sma': self.sma,
+            'current_threshold': self.threshold,
+            'sma_history_count': len(self.sma_history),
+            'prediction_window': len(self.predictions),
+            'step_count': self.step_count,
             'trade_count': self.trade_count,
             'win_count': self.win_count,
             'win_rate': self.win_count / max(self.trade_count, 1),
             'total_pnl': self.total_pnl,
             'avg_pnl': self.total_pnl / max(self.trade_count, 1),
-            'ewma_history_length': len(self.ewma_history),
+            # legacy aliases
+            'current_ewma': self.sma,
+            'ewma_history_length': len(self.sma_history),
         }
-    
+
     def reset(self):
-        """Reset strategy state."""
-        self.ewma = 0.0
-        self._ewma_initialized = False
-        self.ewma_history = []
+        self.predictions = []
+        self.sma_history = []
+        self.sma = 0.0
+        self.step_count = 0
+        self.threshold = float(
+            self.config.get('initial_threshold', TradingConfig.INITIAL_THRESHOLD)
+        )
         self.signal_history = []
         self.trade_count = 0
         self.win_count = 0
         self.total_pnl = 0.0
+
+    # --- legacy EWMA-shaped aliases (tests / old call sites) ---
+
+    @property
+    def ewma(self) -> float:
+        return self.sma
+
+    def update_ewma(self, probability: float) -> float:
+        return self.update_signal(probability)
+
+
+# Back-compat name
+EWMAStrategyEngine = SMAStrategyEngine
 
 
 # ============================================================================
 # INTEGRATED TRADING ENGINE
 # ============================================================================
 
-class EWMATradingEngine:
+class SMATradingEngine:
     """
-    Full trading engine integrating EWMA strategy with portfolio management.
+    SMA + adaptive-threshold engine wired to PortfolioManagerV2.
 
-    One ``EWMAStrategyEngine`` per symbol (no cross-symbol EWMA bleed).
+    One ``SMAStrategyEngine`` per symbol (no cross-symbol signal bleed).
     """
-    
+
     def __init__(self, portfolio: 'PortfolioManagerV2', config: Dict = None):
         """
         Args:
             portfolio: PortfolioManagerV2 instance
-            config: Configuration dict with trading parameters.
+            config: Trading parameters.
 
                 Required for non-demo use (fail-closed):
                   get_price_func(symbol) -> float
                   get_probability_func(symbol) -> float in [0, 1]
 
-                Set allow_placeholders=True to use Placeholder* feeds (demo only).
+                Set allow_placeholders=True for demo feeds only.
         """
         self.portfolio = portfolio
         self.config = config or {}
-        
-        # Trading state
+
         self._running = False
         self._lock = threading.RLock()
         self._last_run_time: Optional[datetime] = None
         self._trade_log: List[Dict] = []
-        
-        # Extract symbols to trade (normalized BASE/QUOTE)
+
         raw_symbols = list(self.config.get('symbols', ['BTC/USD']))
         self.symbols = [normalize_symbol(s) for s in raw_symbols]
         self.exchange = self.config.get('exchange', 'binance')
-        
-        # Per-symbol strategy engines (never share EWMA across symbols)
-        self.strategies: Dict[str, EWMAStrategyEngine] = {
-            sym: EWMAStrategyEngine(self.config, symbol=sym) for sym in self.symbols
+
+        self.strategies: Dict[str, SMAStrategyEngine] = {
+            sym: SMAStrategyEngine(self.config, symbol=sym) for sym in self.symbols
         }
-        
-        # Risk limits
-        self.max_lots = self.config.get('max_lots', TradingConfig.MAX_INVENTORY_LOTS)
-        self.max_daily_trades = self.config.get(
-            'max_daily_trades', TradingConfig.MAX_DAILY_TRADES
+
+        self.max_lots = int(
+            self.config.get('max_lots', TradingConfig.MAX_INVENTORY_LOTS)
         )
-        # Per-symbol daily trade cap (default = global max)
+        self.max_daily_trades = int(
+            self.config.get('max_daily_trades', TradingConfig.MAX_DAILY_TRADES)
+        )
         self.max_daily_trades_per_symbol = int(
             self.config.get('max_daily_trades_per_symbol', self.max_daily_trades)
         )
@@ -362,8 +431,7 @@ class EWMATradingEngine:
             s: 0 for s in self.symbols
         }
         self._last_reset_day = datetime.now().date()
-        
-        # Price / probability feeds — fail closed unless placeholders allowed
+
         allow_ph = bool(self.config.get('allow_placeholders', False))
         price_fn = self.config.get('get_price_func')
         prob_fn = self.config.get('get_probability_func')
@@ -384,43 +452,37 @@ class EWMATradingEngine:
             logger.warning("Using PlaceholderProbabilityFeed (demo only).")
         self.price_feed: Callable[[str], float] = price_fn
         self.probability_feed: Callable[[str], float] = prob_fn
-        
-        logger.info(f"EWMATradingEngine initialized for {self.symbols} on {self.exchange}")
 
-    def _strategy_for(self, symbol: str) -> EWMAStrategyEngine:
+        logger.info(
+            f"SMATradingEngine initialized for {self.symbols} on {self.exchange}"
+        )
+
+    def _strategy_for(self, symbol: str) -> SMAStrategyEngine:
         symbol = normalize_symbol(symbol)
         if symbol not in self.strategies:
-            self.strategies[symbol] = EWMAStrategyEngine(self.config, symbol=symbol)
+            self.strategies[symbol] = SMAStrategyEngine(self.config, symbol=symbol)
             if symbol not in self.symbols:
                 self.symbols.append(symbol)
             self.daily_trade_count_by_symbol.setdefault(symbol, 0)
         return self.strategies[symbol]
 
     @property
-    def strategy(self) -> EWMAStrategyEngine:
-        """
-        Deprecated single-engine accessor.
-
-        Raises if more than one symbol is configured — use
-        ``strategies[symbol]`` or ``_strategy_for(symbol)``.
-        """
+    def strategy(self) -> SMAStrategyEngine:
         if len(self.strategies) != 1:
             raise AttributeError(
                 "self.strategy is ambiguous with multiple symbols; "
                 "use engine.strategies[symbol] or engine._strategy_for(symbol)"
             )
         return next(iter(self.strategies.values()))
-    
+
     def _get_lot_count(self, symbol: str) -> int:
-        """Get number of open lots for a symbol."""
         symbol = normalize_symbol(symbol)
         position = self.portfolio.get_position(self.exchange, symbol)
         if not position:
             return 0
         return len([l for l in position.lots if l.is_active])
-    
+
     def _reset_daily_counter(self):
-        """Reset daily trade counters if a new day has started."""
         today = datetime.now().date()
         if today > self._last_reset_day:
             self.daily_trade_count = 0
@@ -432,7 +494,10 @@ class EWMATradingEngine:
         symbol = normalize_symbol(symbol)
         if self.daily_trade_count >= self.max_daily_trades:
             return False
-        if self.daily_trade_count_by_symbol.get(symbol, 0) >= self.max_daily_trades_per_symbol:
+        if (
+            self.daily_trade_count_by_symbol.get(symbol, 0)
+            >= self.max_daily_trades_per_symbol
+        ):
             return False
         return True
 
@@ -442,11 +507,19 @@ class EWMATradingEngine:
         self.daily_trade_count_by_symbol[symbol] = (
             self.daily_trade_count_by_symbol.get(symbol, 0) + 1
         )
-    
-    def _log_trade(self, trade_type: str, lot, price: float, pnl: float,
-                   reason: str = '', symbol: str = '', quantity: float = 0.0,
-                   ewma: float = 0.0):
-        """Log a trade for record keeping."""
+
+    def _log_trade(
+        self,
+        trade_type: str,
+        lot,
+        price: float,
+        pnl: float,
+        reason: str = '',
+        symbol: str = '',
+        quantity: float = 0.0,
+        sma: float = 0.0,
+        threshold: float = 0.0,
+    ):
         self._trade_log.append({
             'timestamp': datetime.now().isoformat(),
             'type': trade_type,
@@ -457,77 +530,93 @@ class EWMATradingEngine:
             'pnl': pnl,
             'reason': reason,
             'lot_id': getattr(lot, 'lot_id', None) if lot is not None else None,
-            'ewma': ewma,
+            'sma': sma,
+            'threshold': threshold,
+            'ewma': sma,  # legacy field name
         })
 
     def _mark_price(self, symbol: str, price: float) -> None:
-        """Keep portfolio mark-to-market in sync with the price feed (under portfolio lock)."""
         self.portfolio.update_mark(symbol, float(price), exchange=self.exchange)
         ex = self.portfolio.exchanges.get(self.exchange)
         if ex is not None and hasattr(ex, 'update_price'):
             ex.update_price(symbol, float(price))
-    
+
     def step(self, symbol: str) -> Dict:
         """
-        Execute one trading step (one minute) for a symbol.
-        
-        Returns:
-            Dict with actions taken this step
+        One trading step (one minute) for a symbol.
+
+        1. p_t from model
+        2. rolling SMA + adaptive θ
+        3. sell lots on gross TP/SL
+        4. buy if SMA > θ and no sells this minute
         """
         with self._lock:
             self._reset_daily_counter()
             symbol = normalize_symbol(symbol)
             strat = self._strategy_for(symbol)
-            
+
             result = {
                 'symbol': symbol,
                 'timestamp': datetime.now().isoformat(),
                 'actions': [],
-                'ewma': strat.ewma,
+                'sma': strat.sma,
+                'threshold': strat.threshold,
                 'probability': 0.0,
                 'price': 0.0,
                 'bought': False,
+                'buy_quantity': 0.0,
                 'sold': 0,
+                'lot_count': 0,
+                'threshold_updated': False,
+                # legacy keys
+                'ewma': strat.sma,
             }
-            
-            # --- Get current price and probability ---
+
             current_price = float(self.price_feed(symbol))
             probability = float(self.probability_feed(symbol))
             result['probability'] = probability
-            
+
             if not math.isfinite(current_price) or current_price <= 0:
                 raise ValueError(f"Invalid price for {symbol}: {current_price}")
             if not math.isfinite(probability) or not (0.0 <= probability <= 1.0):
                 raise ValueError(
                     f"Probability for {symbol} must be in [0, 1]; got {probability}"
                 )
-            
+
             result['price'] = current_price
             self._mark_price(symbol, current_price)
-            
-            # --- Update per-symbol EWMA ---
-            ewma = strat.update_ewma(probability)
-            result['ewma'] = ewma
-            
-            # --- SELL PHASE: close the exact lots that hit TP/SL (net of fees) ---
+
+            # --- Signal: rolling SMA + adaptive threshold ---
+            prev_step = strat.step_count
+            sma = strat.update_signal(probability)
+            result['sma'] = sma
+            result['ewma'] = sma
+            result['threshold'] = strat.threshold
+            result['threshold_updated'] = (
+                strat.threshold_update_frequency > 0
+                and strat.step_count % strat.threshold_update_frequency == 0
+                and strat.step_count > prev_step
+            )
+            result['sma_history_count'] = len(strat.sma_history)
+
+            # --- SELL PHASE (gross TP/SL per lot) ---
             position = self.portfolio.get_position(self.exchange, symbol)
-            lots_to_sell = []
-            
+            lots_to_sell: List[Tuple[Any, str]] = []
+
             if position:
-                for lot in position.lots:
+                for lot in list(position.lots):
                     if not lot.is_active:
                         continue
                     should_sell, reason = strat.should_sell_lot(lot, current_price)
                     if should_sell:
                         lots_to_sell.append((lot, reason))
-            
+
             sold_count = 0
             for lot, reason in lots_to_sell:
                 try:
                     qty = float(lot.remaining_quantity)
-                    # Exit fee only; entry fee is on the lot and applied in close_partial
                     fee = strat.exit_fee(current_price, qty)
-                    
+
                     if self.use_market_orders:
                         lot_strategy = SpecificLotStrategy([lot.lot_id])
                         results = self.portfolio.close_lots(
@@ -535,16 +624,14 @@ class EWMATradingEngine:
                             qty, current_price,
                             lot_strategy, fee,
                         )
-                        
                         for closed_lot, pnl in results:
                             strat.record_trade(pnl)
                             self._note_trade(symbol)
                             sold_count += 1
                             self._log_trade(
                                 'SELL', closed_lot, current_price, pnl, reason,
-                                ewma=ewma,
+                                sma=sma, threshold=strat.threshold,
                             )
-                            
                             if abs(pnl) > 10:
                                 sev = (
                                     AlertSeverity.INFO if pnl > 0
@@ -569,26 +656,30 @@ class EWMATradingEngine:
                             time_in_force=OrderTimeInForce.GTC,
                         )
                         self._log_trade(
-                            'SELL_LIMIT', lot, current_price, 0, reason, ewma=ewma,
+                            'SELL_LIMIT', lot, current_price, 0, reason,
+                            sma=sma, threshold=strat.threshold,
                         )
                         result['actions'].append(
-                            {'sell_limit': order_id, 'reason': reason, 'lot_id': lot.lot_id}
+                            {
+                                'sell_limit': order_id,
+                                'reason': reason,
+                                'lot_id': lot.lot_id,
+                            }
                         )
-                        
                 except Exception as e:
                     logger.error(f"Error selling lot {lot.lot_id}: {e}")
                     self.portfolio.alert_system.add_alert(
-                        AlertSeverity.ERROR, 'Trade Execution', 
-                        'Sell Failed', f'Error selling {symbol}: {e}'
+                        AlertSeverity.ERROR, 'Trade Execution',
+                        'Sell Failed', f'Error selling {symbol}: {e}',
                     )
-            
+
             result['sold'] = sold_count
-            
-            # --- BUY PHASE (only if no sells this step) ---
+
+            # --- BUY PHASE (skip if any sell this minute) ---
             if sold_count == 0:
                 lot_count = self._get_lot_count(symbol)
                 should_buy, quantity = strat.should_buy(lot_count, self.max_lots)
-                
+
                 if should_buy and self._can_trade_today(symbol):
                     try:
                         entry_fee = strat.entry_fee(current_price, quantity)
@@ -598,9 +689,7 @@ class EWMATradingEngine:
                                 fee=entry_fee,
                             )
                             if not ok:
-                                result['actions'].append(
-                                    {'buy_blocked': reason}
-                                )
+                                result['actions'].append({'buy_blocked': reason})
                                 logger.info(f"Buy blocked {symbol}: {reason}")
                                 should_buy = False
 
@@ -608,39 +697,46 @@ class EWMATradingEngine:
                             lot_id = self.portfolio.add_lot(
                                 self.exchange, symbol,
                                 quantity, current_price,
-                                tags=['ewma_signal'],
+                                tags=['sma_signal'],
                                 fee=entry_fee,
                                 strategy_metadata={
-                                    'ewma': ewma,
+                                    'sma': sma,
+                                    'threshold': strat.threshold,
                                     'probability': probability,
+                                    'tp_price': strat.tp_price(current_price),
+                                    'sl_price': strat.sl_price(current_price),
                                     'entry_fee': entry_fee,
                                     'buy_fee_rate': strat.buy_fee,
                                     'timestamp': datetime.now().isoformat(),
-                                }
+                                },
                             )
                             self._mark_price(symbol, current_price)
                             self._log_trade(
                                 'BUY',
                                 self.portfolio.get_lot(lot_id),
-                                current_price, 0.0, 'EWMA Signal',
-                                symbol=symbol, quantity=quantity, ewma=ewma,
+                                current_price, 0.0, 'SMA Signal',
+                                symbol=symbol, quantity=quantity,
+                                sma=sma, threshold=strat.threshold,
                             )
                             result['bought'] = True
                             result['buy_quantity'] = quantity
                             result['entry_fee'] = entry_fee
                             self._note_trade(symbol)
-                            
                             logger.info(
                                 f"Bought {quantity:.4f} {symbol} at "
-                                f"${current_price:.2f} (EWMA={ewma:.3f}, "
+                                f"${current_price:.2f} (SMA={sma:.3f}, "
+                                f"thr={strat.threshold:.3f}, "
                                 f"entry_fee=${entry_fee:.4f})"
                             )
-                            
                         elif should_buy and not self.use_market_orders:
-                            ok, reason = self.portfolio.risk_manager.check_buy(
-                                self.exchange, symbol, quantity, current_price,
-                                fee=entry_fee,
-                            ) if self.enforce_risk else (True, None)
+                            ok, reason = (
+                                self.portfolio.risk_manager.check_buy(
+                                    self.exchange, symbol, quantity, current_price,
+                                    fee=entry_fee,
+                                )
+                                if self.enforce_risk
+                                else (True, None)
+                            )
                             if not ok:
                                 result['actions'].append({'buy_blocked': reason})
                             else:
@@ -648,40 +744,36 @@ class EWMATradingEngine:
                                     self.exchange, symbol,
                                     OrderSide.BUY, OrderType.LIMIT,
                                     quantity, current_price,
-                                    time_in_force=OrderTimeInForce.GTC
+                                    time_in_force=OrderTimeInForce.GTC,
                                 )
                                 result['bought'] = True
                                 result['buy_order'] = order_id
-                            
+                                result['buy_quantity'] = quantity
                     except Exception as e:
                         logger.error(f"Error buying {symbol}: {e}")
                         self.portfolio.alert_system.add_alert(
                             AlertSeverity.ERROR, 'Trade Execution',
-                            'Buy Failed', f'Error buying {symbol}: {e}'
+                            'Buy Failed', f'Error buying {symbol}: {e}',
                         )
-            
-            # --- Record signal history (per-symbol engine) ---
+
+            result['lot_count'] = self._get_lot_count(symbol)
+
             strat.signal_history.append({
                 'timestamp': result['timestamp'],
                 'symbol': symbol,
-                'ewma': ewma,
+                'sma': sma,
+                'threshold': strat.threshold,
                 'probability': probability,
                 'price': current_price,
                 'bought': result['bought'],
                 'sold': sold_count,
-                'inventory_count': self._get_lot_count(symbol),
+                'inventory_count': result['lot_count'],
             })
-            
+
             self._last_run_time = datetime.now()
             return result
-    
+
     def run_cycle(self) -> Dict:
-        """
-        Run one full cycle (all symbols).
-        
-        Returns:
-            Dict with results for all symbols
-        """
         results = {}
         for symbol in self.symbols:
             try:
@@ -689,55 +781,47 @@ class EWMATradingEngine:
             except Exception as e:
                 logger.exception(f"Error processing {symbol}")
                 results[symbol] = {'error': str(e)}
-        
         return results
-    
+
     def run_loop(self, interval_seconds: float = 60.0):
-        """Run the trading loop continuously."""
         self._running = True
         logger.info(f"Starting trading loop (interval={interval_seconds}s)")
-        
+
         while self._running:
             start_time = datetime.now()
-            
             try:
                 results = self.run_cycle()
-                
                 if results:
                     for symbol, result in results.items():
                         if result.get('bought') or result.get('sold', 0) > 0:
                             logger.info(
                                 f"Cycle: {symbol} - Bought: {result.get('bought', False)}, "
                                 f"Sold: {result.get('sold', 0)}, "
-                                f"EWMA: {result.get('ewma', 0):.3f}"
+                                f"SMA: {result.get('sma', 0):.3f}, "
+                                f"thr: {result.get('threshold', 0):.3f}"
                             )
-                
                 self.portfolio.sync_with_exchanges()
-                
             except Exception as e:
                 logger.exception(f"Error in trading loop: {e}")
-            
+
             elapsed = (datetime.now() - start_time).total_seconds()
             sleep_time = max(0, interval_seconds - elapsed)
             if sleep_time > 0 and self._running:
                 time.sleep(sleep_time)
-        
+
         logger.info("Trading loop stopped")
-    
+
     def stop(self):
-        """Stop the trading loop."""
         self._running = False
-    
+
     def get_stats(self) -> Dict:
-        """Get comprehensive statistics (per-symbol strategy + portfolio)."""
         by_symbol = {
             sym: eng.get_statistics() for sym, eng in self.strategies.items()
         }
-        # Aggregate closed-trade stats across symbols
         trade_count = sum(s['trade_count'] for s in by_symbol.values())
         win_count = sum(s['win_count'] for s in by_symbol.values())
         total_pnl = sum(s['total_pnl'] for s in by_symbol.values())
-        stats = {
+        return {
             'strategy': {
                 'by_symbol': by_symbol,
                 'trade_count': trade_count,
@@ -747,7 +831,9 @@ class EWMATradingEngine:
                 'avg_pnl': total_pnl / max(trade_count, 1),
             },
             'trading': {
-                'last_run': self._last_run_time.isoformat() if self._last_run_time else None,
+                'last_run': (
+                    self._last_run_time.isoformat() if self._last_run_time else None
+                ),
                 'daily_trades': self.daily_trade_count,
                 'daily_trades_by_symbol': dict(self.daily_trade_count_by_symbol),
                 'max_daily_trades': self.max_daily_trades,
@@ -765,13 +851,15 @@ class EWMATradingEngine:
                 ),
                 'open_lots': len(self.portfolio.get_open_lots()),
                 'archived_lots': len(self.portfolio.get_archived_lots()),
-            }
+            },
         }
-        return stats
-    
+
     def get_recent_trades(self, count: int = 20) -> List[Dict]:
-        """Get recent trade logs."""
         return self._trade_log[-count:]
+
+
+# Back-compat name
+EWMATradingEngine = SMATradingEngine
 
 
 # ============================================================================
@@ -782,7 +870,7 @@ def build_demo_engine(
     symbols: Optional[List[str]] = None,
     n_steps_hint: int = 30,
     seed: int = 42,
-) -> Tuple[EWMATradingEngine, PortfolioManagerV2, PlaceholderPriceFeed, PlaceholderProbabilityFeed]:
+) -> Tuple[SMATradingEngine, PortfolioManagerV2, PlaceholderPriceFeed, PlaceholderProbabilityFeed]:
     """
     Wire MockExchange + portfolio + placeholder price/probability feeds.
 
@@ -795,7 +883,6 @@ def build_demo_engine(
     exchanges = {'binance': MockExchange('binance')}
     portfolio = PortfolioManagerV2(exchanges)
 
-    # Seed portfolio cash / inventory from the mock exchange balances
     for exchange_name, exchange in exchanges.items():
         for currency, data in exchange.get_balances().items():
             portfolio._balances[f"{exchange_name}:{currency}"] = Balance(
@@ -803,43 +890,47 @@ def build_demo_engine(
             )
 
     price_feed = PlaceholderPriceFeed(
-        base_prices={s: exchanges['binance'].prices.get(s, 50_000.0) for s in symbols},
+        base_prices={
+            s: exchanges['binance'].prices.get(s, 50_000.0) for s in symbols
+        },
         rng=rng_px,
         vol=0.002,
     )
-    # Mean above EWMA threshold so the demo actually enters
-    probability_feed = PlaceholderProbabilityFeed(mean=0.75, noise=0.10, rng=rng_p)
+    # High mean so SMA eventually sits above adaptive threshold
+    probability_feed = PlaceholderProbabilityFeed(mean=0.78, noise=0.08, rng=rng_p)
 
     config = {
         'symbols': symbols,
         'exchange': 'binance',
         'max_lots': 10,
-        'ewma_alpha': 0.2,
-        'ewma_threshold': 0.6,
-        'take_profit': 0.005,    # 0.5%
-        'stop_loss': -0.003,     # -0.3%
-        'q_max': 0.01,
+        'sma_window': TradingConfig.SMA_WINDOW,
+        'percentile': TradingConfig.PERCENTILE,
+        'threshold_min_history': TradingConfig.THRESHOLD_MIN_HISTORY,
+        'threshold_update_frequency': TradingConfig.THRESHOLD_UPDATE_FREQUENCY,
+        'initial_threshold': TradingConfig.INITIAL_THRESHOLD,
+        'take_profit': TradingConfig.TAKE_PROFIT,
+        'stop_loss': TradingConfig.STOP_LOSS,
+        'q_max': TradingConfig.Q_MAX,
         'buy_fee': TradingConfig.BUY_FEE,
         'sell_fee': TradingConfig.SELL_FEE,
         'use_market_orders': True,
         'max_daily_trades': 50,
         'max_daily_trades_per_symbol': 50,
         'enforce_risk': True,
-        'allow_placeholders': True,  # demo only — real path must pass feeds
+        'allow_placeholders': True,
         'get_price_func': price_feed,
         'get_probability_func': probability_feed,
     }
 
-    engine = EWMATradingEngine(portfolio, config)
-    _ = n_steps_hint  # reserved for future scripted scenarios
+    engine = SMATradingEngine(portfolio, config)
+    _ = n_steps_hint
     return engine, portfolio, price_feed, probability_feed
 
 
-def run_integrated_demo(n_steps: int = 25, symbols: Optional[List[str]] = None):
+def run_integrated_demo(n_steps: int = 40, symbols: Optional[List[str]] = None):
     """
-    Run a self-contained demo with placeholder price & probability feeds.
+    Self-contained demo with placeholder price & probability feeds.
 
-    Usage:
         python strategy.py
     """
     logging.basicConfig(
@@ -848,16 +939,22 @@ def run_integrated_demo(n_steps: int = 25, symbols: Optional[List[str]] = None):
     )
 
     print("\n" + "=" * 70)
-    print("  EWMA STRATEGY DEMO  (placeholder price + probability)")
+    print("  SMA + ADAPTIVE THRESHOLD DEMO  (placeholder price + probability)")
     print("=" * 70)
 
     engine, portfolio, price_feed, prob_feed = build_demo_engine(symbols=symbols)
     print(f"  Symbols:      {engine.symbols}")
     print(f"  Price feed:   {type(price_feed).__name__}")
-    print(f"  Prob feed:    {type(prob_feed).__name__}  "
-          f"(mean={prob_feed.mean}, noise={prob_feed.noise})")
+    print(
+        f"  Prob feed:    {type(prob_feed).__name__}  "
+        f"(mean={prob_feed.mean}, noise={prob_feed.noise})"
+    )
     s0 = next(iter(engine.strategies.values()))
-    print(f"  EWMA alpha/thr: {s0.alpha} / {s0.threshold}")
+    print(
+        f"  SMA window/pct: {s0.sma_window} / {s0.percentile:.0%}  "
+        f"(thr0={s0.threshold:.3f})"
+    )
+    print(f"  TP/SL (gross): {s0.take_profit:.2%} / {s0.stop_loss:.2%}")
     print(f"  Per-symbol engines: {list(engine.strategies.keys())}")
     print(f"  Risk enforce: {engine.enforce_risk}")
     print(f"  Steps:        {n_steps}")
@@ -865,7 +962,7 @@ def run_integrated_demo(n_steps: int = 25, symbols: Optional[List[str]] = None):
     print("\n  Running trading steps...")
     print(
         f"  {'step':>4}  {'symbol':<10}  {'price':>10}  {'prob':>6}  "
-        f"{'ewma':>6}  {'buy':>4}  {'sold':>4}  {'lots':>4}"
+        f"{'sma':>6}  {'thr':>6}  {'buy':>4}  {'sold':>4}  {'lots':>4}"
     )
     for i in range(n_steps):
         cycle = engine.run_cycle()
@@ -878,7 +975,8 @@ def run_integrated_demo(n_steps: int = 25, symbols: Optional[List[str]] = None):
                 f"  {i+1:4d}  {symbol:<10}  "
                 f"${data.get('price', 0):>9.2f}  "
                 f"{data.get('probability', 0):>6.3f}  "
-                f"{data.get('ewma', 0):>6.3f}  "
+                f"{data.get('sma', 0):>6.3f}  "
+                f"{data.get('threshold', 0):>6.3f}  "
                 f"{'Y' if data.get('bought') else '-':>4}  "
                 f"{data.get('sold', 0):>4}  "
                 f"{lots:>4}"
@@ -891,8 +989,9 @@ def run_integrated_demo(n_steps: int = 25, symbols: Optional[List[str]] = None):
     print(f"    Total PnL:    ${stats['strategy']['total_pnl']:.2f}")
     for sym, st in stats['strategy']['by_symbol'].items():
         print(
-            f"    [{sym}] ewma={st['current_ewma']:.4f}  "
-            f"trades={st['trade_count']}  pnl=${st['total_pnl']:.2f}"
+            f"    [{sym}] sma={st['current_sma']:.4f}  thr={st['current_threshold']:.4f}  "
+            f"hist={st['sma_history_count']}  trades={st['trade_count']}  "
+            f"pnl=${st['total_pnl']:.2f}"
         )
     print(f"    Open lots:    {stats['portfolio']['open_lots']}")
     print(f"    Equity:       ${stats['portfolio']['total_equity']:.2f}")
@@ -932,9 +1031,7 @@ def make_model_probability_feed(
     """
     Adapter for a trained model probability head.
 
-    ``model_fn(symbol) -> float in [0, 1]`` should run your checkpoint
-    (e.g. yield-mode chance after denormalize / sigmoid). If omitted, raises
-    so the real path cannot silently fall back to random placeholders.
+    ``model_fn(symbol) -> float in [0, 1]`` (e.g. yield-mode chance after denorm).
     """
     if model_fn is None:
         def _missing(symbol: str) -> float:
@@ -961,21 +1058,12 @@ def make_infer_probability_feed(
     """
     Wire a trained yield/trend head into the strategy.
 
-    ``predict_fn(symbol)`` should return a raw model score for that symbol
-    (e.g. denormalized ``chance`` from the yield label head, or a sigmoid
-    probability). Mapping:
+    ``predict_fn(symbol)`` returns a raw model score; mapped via clip01 or sigmoid.
 
-      clip01  — clip raw score to [0, 1] (chance already a mass / score)
-      sigmoid — 1 / (1 + exp(-x)) for unbounded logits
-
-    Example (after you load a checkpoint in TRAIN/INFER style)::
-
-        def predict(symbol: str) -> float:
-            # run model on latest window for symbol; return denormalized chance
-            return float(chance)
+    Example::
 
         feed = make_infer_probability_feed(predict, chance_to_prob='clip01')
-        engine = EWMATradingEngine(portfolio, {
+        engine = SMATradingEngine(portfolio, {
             'get_probability_func': feed,
             'get_price_func': live_ticker,
             ...
@@ -987,7 +1075,6 @@ def make_infer_probability_feed(
     def _map(x: float) -> float:
         if chance_to_prob == 'sigmoid':
             return float(1.0 / (1.0 + np.exp(-float(x))))
-        # default: treat as already a probability-like score
         return float(np.clip(x, 0.0, 1.0))
 
     def _feed(symbol: str) -> float:
@@ -1001,25 +1088,18 @@ def make_infer_probability_feed(
 
 
 def real_usage_example():
-    """
-    Sketch of a real deployment: same engine, live ticker + model probability.
-
-    Fail-closed: omit allow_placeholders; both feeds are required.
-    """
+    """Sketch: live ticker + model probability, fail-closed feeds."""
     def get_price(symbol: str) -> float:
-        # TODO: exchange.get_ticker(normalize_symbol(symbol))['last']
         raise NotImplementedError("Wire a live ticker here")
 
-    # TODO: load checkpoint once, then:
-    # def predict(symbol): return denormalized_chance_from_infer(symbol)
     get_prob = make_infer_probability_feed(predict_fn=None)
 
     config = {
-        'symbols': ['BTCUSDT', 'ETHUSDT'],  # normalized to BTC/USD, ETH/USD
+        'symbols': ['BTCUSDT', 'ETHUSDT'],
         'exchange': 'binance',
         'max_lots': 10,
-        'ewma_alpha': 0.2,
-        'ewma_threshold': 0.6,
+        'sma_window': 10,
+        'percentile': 0.80,
         'take_profit': 0.005,
         'stop_loss': -0.003,
         'q_max': 0.01,
@@ -1031,11 +1111,10 @@ def real_usage_example():
         'max_daily_trades': 50,
         'max_daily_trades_per_symbol': 20,
         'enforce_risk': True,
-        # allow_placeholders deliberately omitted → fail closed without feeds
     }
     _ = config
     # portfolio = PortfolioManagerV2({'binance': live_adapter})
-    # engine = EWMATradingEngine(portfolio, config)
+    # engine = SMATradingEngine(portfolio, config)
     # engine.run_loop(interval_seconds=60.0)
 
 

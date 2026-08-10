@@ -35,7 +35,12 @@ from portfolio import (
     RiskMetrics,
     normalize_symbol,
 )
-from strategy import EWMAStrategyEngine, EWMATradingEngine
+from strategy import (
+    EWMAStrategyEngine,
+    EWMATradingEngine,
+    SMAStrategyEngine,
+    SMATradingEngine,
+)
 
 class TestLotSystem(unittest.TestCase):
     """Complete unit tests for the lot-based portfolio system."""
@@ -515,7 +520,7 @@ class TestLotSystem(unittest.TestCase):
         self.assertAlmostEqual(data['summary']['total_realized_pnl'], 200.0, places=2)
 
     def test_strategy_rejects_nan_price(self):
-        engine = EWMATradingEngine(
+        engine = SMATradingEngine(
             self.portfolio,
             {
                 'symbols': ['BTC/USD'],
@@ -530,13 +535,62 @@ class TestLotSystem(unittest.TestCase):
 
     def test_strategy_threshold_validation(self):
         with self.assertRaises(ValueError):
-            EWMAStrategyEngine({'ewma_threshold': 1.0})
+            SMAStrategyEngine({'percentile': 1.0})
         with self.assertRaises(ValueError):
-            EWMAStrategyEngine({'ewma_threshold': -0.1})
-        eng = EWMAStrategyEngine({'ewma_threshold': 0.6})
-        eng.ewma = 0.9
-        eng._ewma_initialized = True
+            SMAStrategyEngine({'percentile': -0.1})
+        with self.assertRaises(ValueError):
+            SMAStrategyEngine({'initial_threshold': 1.0})
+        eng = SMAStrategyEngine({'initial_threshold': 0.6, 'sma_window': 10})
+        eng.sma = 0.9
+        eng.threshold = 0.6
         self.assertGreater(eng.calculate_quantity(), 0)
+        # Legacy aliases still construct
+        self.assertIs(EWMAStrategyEngine, SMAStrategyEngine)
+        self.assertIs(EWMATradingEngine, SMATradingEngine)
+
+    def test_sma_adaptive_threshold_and_gross_tpsl(self):
+        """SMA window, percentile θ, quantity scaling, gross TP/SL."""
+        eng = SMAStrategyEngine({
+            'sma_window': 3,
+            'percentile': 0.80,
+            'threshold_min_history': 5,
+            'threshold_update_frequency': 1,
+            'initial_threshold': 0.50,
+            'take_profit': 0.005,
+            'stop_loss': -0.003,
+            'q_max': 0.01,
+        })
+        # Warm up window with flat high probs
+        for _ in range(5):
+            eng.update_signal(0.90)
+        self.assertAlmostEqual(eng.sma, 0.90, places=5)
+        self.assertGreater(len(eng.sma_history), 0)
+        # Adaptive θ should sit at high end of history after enough samples
+        eng.update_threshold()
+        self.assertGreaterEqual(eng.threshold, 0.5)
+
+        # Quantity scales above θ
+        eng.threshold = 0.80
+        eng.sma = 0.90
+        q = eng.calculate_quantity()
+        expected = 0.01 * (0.90 - 0.80) / (1.0 - 0.80)
+        self.assertAlmostEqual(q, expected, places=6)
+
+        # Gross TP/SL (fees do not change trigger)
+        class _Lot:
+            entry_price = 100.0
+            entry_fee = 0.0
+            quantity = 1.0
+        sell_tp, reason_tp = eng.should_sell_lot(_Lot(), 100.50)  # +0.5%
+        self.assertTrue(sell_tp)
+        self.assertEqual(reason_tp, 'TP')
+        # Use price strictly through SL to avoid float edge on 99.70
+        sell_sl, reason_sl = eng.should_sell_lot(_Lot(), 99.69)   # < -0.3%
+        self.assertTrue(sell_sl)
+        self.assertEqual(reason_sl, 'SL')
+        hold, reason_h = eng.should_sell_lot(_Lot(), 100.20)      # +0.2%
+        self.assertFalse(hold)
+        self.assertEqual(reason_h, '')
 
     def test_hifo_and_tax_gain_ordering(self):
         self.portfolio.add_lot('binance', 'BTC/USD', 0.1, 48000)
