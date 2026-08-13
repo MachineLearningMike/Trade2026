@@ -245,7 +245,7 @@ class PredictionHead(nn.Module):
     Prediction head (layout depends on config label / output_dim):
 
     trend:   3 → (horizon, slope, intercept);  2 → (slope, intercept)
-    yield:  2 → (chance, wait);  1 → (chance,) if chance_only
+    yield:  2 → (chance, wait);  1 → (chance,) or (wait,) per yield_target
     """
 
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int = 3, dropout: float = 0.1):
@@ -275,7 +275,7 @@ class MarketTransformerWithHeads(nn.Module):
 
     output_dim controls the head layout (see config ``label``):
       trend:  3 → (h, m, b);  2 → (m, b)
-      yield: 2 → (chance, wait);  1 → (chance,) if chance_only
+      yield: 2 → both;  1 → chance or wait (yield_target)
 
     Window statistics (mean / std / shape moments) condition the decoder via
     x_stat tokens. Recent past prices ``p`` are shared by both label modes.

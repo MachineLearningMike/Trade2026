@@ -53,22 +53,28 @@ VALID_HORIZON_SEARCH_MODES = (
 )
 
 
-def label_target_slice(label_mode: str, output_dim: int) -> slice:
+def label_target_slice(
+    label_mode: str,
+    output_dim: int,
+    yield_target: str = 'both',
+) -> slice:
     """
-    Map (label_mode, output_dim) → slice into stored label vectors.
+    Map (label_mode, output_dim[, yield_target]) → slice into stored labels.
 
     trend (stored as h, m, b):
       output_dim=3 → [horizon, slope, intercept]
       output_dim=2 → [slope, intercept]
     yield (stored as chance, wait):
-      always [chance, wait]  (output_dim must be 2)
+      yield_target both   → [0:2]
+      yield_target chance → [0:1]
+      yield_target wait   → [1:2]
     """
     if label_mode == LABEL_YIELD:
-        if output_dim != 2:
-            raise ValueError(
-                f"label={LABEL_YIELD!r} requires output_dim=2, got {output_dim}"
-            )
-        return slice(0, 2)
+        from labels import Label_Yield
+        return Label_Yield.target_slice(
+            output_dim,
+            yield_target=yield_target,
+        )
     if label_mode == LABEL_TREND:
         if output_dim == 3:
             return slice(0, 3)
@@ -80,9 +86,17 @@ def label_target_slice(label_mode: str, output_dim: int) -> slice:
     )
 
 
-def label_target_names(label_mode: str, output_dim: int) -> Tuple[str, ...]:
+def label_target_names(
+    label_mode: str,
+    output_dim: int,
+    yield_target: str = 'both',
+) -> Tuple[str, ...]:
     if label_mode == LABEL_YIELD:
-        return ('chance', 'wait')
+        from labels import Label_Yield
+        return Label_Yield.target_names(
+            output_dim,
+            yield_target=yield_target,
+        )
     if label_mode == LABEL_TREND:
         if output_dim == 3:
             return ('horizon', 'slope', 'intercept')
@@ -280,6 +294,9 @@ def generate_dataset_signature(config: dict) -> str:
         'label': _normalize_label_mode(config.get('label', LABEL_TREND)),
         'min_yield_percent': config.get('min_yield_percent', 0.0),
         'max_hope_future_horizon': config.get('max_hope_future_horizon', 60),
+        # Model target selection for yield (chance / wait / both) — must
+        # distinguish single-dim chance vs wait checkpoints/stats.
+        'yield_target': config.get('yield_target', 'both'),
         'min_trend_horizon': config.get('min_trend_horizon', 3),
         'max_trend_future_horizon': max_trend_future,
         'regime_use_past': config.get('regime_use_past', True),
@@ -600,18 +617,11 @@ def find_yield(
     history,
     min_yield_percent: float,
     max_hope_future_horizon: Optional[int] = None,
-    chance_only: bool = False,
+    yield_target: Optional[str] = None,
 ):
     """
-    Yield label: (chance, wait) or (chance,).
-
-    MUST be called on RAW prices (not window z-scores). Percent yield is
-        yv = 100 * (future[t] - history[-1]) / history[-1]
-    and for each bar with yv >= min_yield_percent:
-        chance += (yv - min_yield_percent)   # excess % above threshold
-        wait   += t / yv                     # (unless chance_only)
-
-    Delegates to labels.Label_Yield.find (single source of truth).
+    Yield label. Cache path should leave yield_target=None so the full
+    (chance, wait) pair is stored; model uses target_slice.
     """
     # Local import: labels is free of data.py, so no cycle.
     from labels import Label_Yield
@@ -620,7 +630,7 @@ def find_yield(
         history,
         min_yield_percent=min_yield_percent,
         max_hope_future_horizon=max_hope_future_horizon,
-        chance_only=chance_only,
+        yield_target=yield_target,
     )
 
 
@@ -931,19 +941,33 @@ class TradingDataset(Dataset):
             config.get('fitness_threshold', LABEL_FITNESS_THRESHOLD)
         )
         self.regime_use_past = bool(config.get('regime_use_past', True))
-        self.output_dim = int(config.get('output_dim', 3))
+        # Yield target: both | chance | wait
         if self.label_mode == LABEL_YIELD:
-            if self.output_dim != 2:
-                print(
-                    f"⚠ label={LABEL_YIELD}: forcing output_dim "
-                    f"{self.output_dim} → 2 (chance, wait)"
-                )
-                self.output_dim = 2
-        elif self.output_dim not in (2, 3):
-            raise ValueError(
-                f"output_dim must be 2 or 3 for trend, got {self.output_dim}"
+            from labels import resolve_yield_target, Label_Yield
+            self.yield_target = resolve_yield_target(config)
+            forced_dim = Label_Yield.resolve_output_dim(
+                yield_target=self.yield_target
             )
-        self._label_slice = label_target_slice(self.label_mode, self.output_dim)
+            cfg_dim = int(config.get('output_dim', forced_dim))
+            if cfg_dim != forced_dim:
+                print(
+                    f"⚠ label={LABEL_YIELD} yield_target={self.yield_target!r}: "
+                    f"forcing output_dim {cfg_dim} → {forced_dim}"
+                )
+            self.output_dim = forced_dim
+            self._label_slice = label_target_slice(
+                self.label_mode,
+                self.output_dim,
+                yield_target=self.yield_target,
+            )
+        else:
+            self.yield_target = 'both'
+            self.output_dim = int(config.get('output_dim', 3))
+            if self.output_dim not in (2, 3):
+                raise ValueError(
+                    f"output_dim must be 2 or 3 for trend, got {self.output_dim}"
+                )
+            self._label_slice = label_target_slice(self.label_mode, self.output_dim)
         self.horizon_mode = config.get('horizon_mode', 'floating')
         self.weight_type = config.get('weight_type', 'exponential')
         self.weight_decay = config.get('weight_decay', 0.9)
@@ -1030,10 +1054,13 @@ class TradingDataset(Dataset):
         else:
             print(f"  min_yield_percent: {self.min_yield_percent}")
             print(f"  max_hope_future_horizon: {self.max_hope_future_horizon}")
-        print(
-            f"  Model output_dim: {self.output_dim} "
-            f"{label_target_names(self.label_mode, self.output_dim)}"
+            print(f"  yield_target: {self.yield_target}")
+        _onames = label_target_names(
+            self.label_mode,
+            self.output_dim,
+            yield_target=getattr(self, 'yield_target', 'both'),
         )
+        print(f"  Model output_dim: {self.output_dim} {_onames}")
         print(f"  Horizon viz mode: {self.horizon_mode}")
         if self.horizon_mode == 'weighted':
             print(f"  Weight type: {self.weight_type}, Decay: {self.weight_decay}")
@@ -1056,7 +1083,7 @@ class TradingDataset(Dataset):
         print(f"    Std:   {self.stats['label']['std'].tolist()}")
         print(
             f"  Model target "
-            f"{label_target_names(self.label_mode, self.output_dim)}:"
+            f"{label_target_names(self.label_mode, self.output_dim, yield_target=getattr(self, 'yield_target', 'both'))}:"
         )
         print(f"    Mean:  {self._label_stat_mean.tolist()}")
         print(f"    Std:   {self._label_stat_std.tolist()}")
@@ -1187,7 +1214,7 @@ class TradingDataset(Dataset):
                     history_prices,
                     min_yield_percent=self.min_yield_percent,
                     max_hope_future_horizon=self.max_hope_future_horizon,
-                    chance_only=False,  # full cache always (chance, wait)
+                    # full cache always (chance, wait); model uses yield_target slice
                 )
                 if len(result) == 1:
                     chance, wait = float(result[0]), 0.0

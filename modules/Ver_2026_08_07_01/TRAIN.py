@@ -713,12 +713,15 @@ def main(config):
     print(f"  Input x: (F={F}, past_window={past_window})")
     print(f"  Label mode: {getattr(dataset, 'label_mode', config.get('label', 'trend'))}")
     _od = config['output_dim']
+    _yt = getattr(dataset, 'yield_target', config.get('yield_target', 'both'))
     _onames = label_target_names(
         getattr(dataset, 'label_mode', config.get('label', 'trend')),
         _od,
-        chance_only=getattr(dataset, 'chance_only', config.get('chance_only', False)),
+        yield_target=_yt,
     )
     print(f"  Output: {_onames} - {_od} values (output_dim)")
+    if getattr(dataset, 'label_mode', None) == 'yield' or config.get('label') == 'yield':
+        print(f"  yield_target: {_yt}")
     print(f"  Total samples: {len(dataset)}")
     print(f"  Train samples: {len(dataset.train_indices)}")
     print(f"  Val samples: {len(dataset.val_indices)}")
@@ -769,7 +772,7 @@ def main(config):
     loss_fn = bind_label_loss(
         dataset.label_mode,
         config,
-        chance_only=getattr(dataset, 'chance_only', config.get('chance_only', False)),
+        yield_target=getattr(dataset, 'yield_target', config.get('yield_target', 'both')),
     )
 
     check_all_weights_updated(
@@ -825,7 +828,7 @@ def main(config):
         print(
             f"min_yield_percent: {config.get('min_yield_percent')}, "
             f"max_hope_future_horizon: {config.get('max_hope_future_horizon')}, "
-            f"chance_only: {config.get('chance_only', False)}"
+            f"yield_target: {config.get('yield_target', getattr(dataset, 'yield_target', 'both'))}"
         )
     else:
         print(

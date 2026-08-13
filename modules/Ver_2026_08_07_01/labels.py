@@ -26,7 +26,18 @@ VALID_LABEL_MODES = (LABEL_TREND, LABEL_YIELD)
 
 LABEL_FULL_DIM_TREND = 3
 LABEL_FULL_DIM_YIELD = 2
-LABEL_FULL_DIM_YIELD_CHANCE = 1
+LABEL_FULL_DIM_YIELD_SINGLE = 1  # chance-only or wait-only head
+
+# Yield model target selection (config key ``yield_target``).
+# Cache always stores full (chance, wait); this selects the model slice.
+YIELD_TARGET_BOTH = 'both'
+YIELD_TARGET_CHANCE = 'chance'
+YIELD_TARGET_WAIT = 'wait'
+VALID_YIELD_TARGETS = (
+    YIELD_TARGET_BOTH,
+    YIELD_TARGET_CHANCE,
+    YIELD_TARGET_WAIT,
+)
 
 # Horizon search rules for linear trend (free OLS, no f[0] anchor).
 HORIZON_SEARCH_LONGEST_LINEAR = 'longest_linear'
@@ -308,26 +319,61 @@ class Label_Trend:
 
 
 # ═══════════════════════════════════════════════════════════
+# YIELD TARGET RESOLUTION
+# ═══════════════════════════════════════════════════════════
+
+def resolve_yield_target(config: Optional[dict] = None, **overrides) -> str:
+    """
+    Resolve yield model target: 'both' | 'chance' | 'wait'.
+
+    Reads overrides['yield_target'] or config['yield_target']; default 'both'.
+    """
+    cfg = dict(config or {})
+    cfg.update({k: v for k, v in overrides.items() if v is not None})
+
+    raw = cfg.get('yield_target', YIELD_TARGET_BOTH)
+    if raw is None or str(raw).strip() == '':
+        return YIELD_TARGET_BOTH
+    yt = str(raw).strip().lower()
+    if yt in ('both', 'chance_wait', 'all'):
+        yt = YIELD_TARGET_BOTH
+    elif yt in ('c',):
+        yt = YIELD_TARGET_CHANCE
+    elif yt in ('w',):
+        yt = YIELD_TARGET_WAIT
+    if yt not in VALID_YIELD_TARGETS:
+        raise ValueError(
+            f"yield_target must be one of {VALID_YIELD_TARGETS}, got {raw!r}"
+        )
+    return yt
+
+
+# ═══════════════════════════════════════════════════════════
 # LABEL FAMILY: YIELD
 # ═══════════════════════════════════════════════════════════
 
 class Label_Yield:
     """
-    Yield labels on raw prices: (chance, wait) or (chance,).
+    Yield labels on raw prices.
 
     Config id: 'yield'
     Price space: raw (true % yield); caller must not z-score inputs.
+
+    Full cache vector is always (chance, wait). Model target is selected by
+    ``yield_target``: 'both' | 'chance' | 'wait'.
     """
 
     name = LABEL_YIELD
 
     @classmethod
-    def full_dim(cls, chance_only: bool = False) -> int:
-        return (
-            LABEL_FULL_DIM_YIELD_CHANCE
-            if chance_only
-            else LABEL_FULL_DIM_YIELD
-        )
+    def full_cache_dim(cls) -> int:
+        """Stored label vector width (always chance + wait)."""
+        return LABEL_FULL_DIM_YIELD
+
+    @classmethod
+    def full_dim(cls, yield_target: str = YIELD_TARGET_BOTH, **_kwargs) -> int:
+        """Model head width for the given yield_target."""
+        return cls.resolve_output_dim(yield_target=yield_target)
 
     @classmethod
     def resolve_future_window(cls, config: dict) -> int:
@@ -338,26 +384,60 @@ class Label_Yield:
         return cls.resolve_future_window(config)
 
     @classmethod
-    def resolve_output_dim(cls, chance_only: bool = False) -> int:
-        return cls.full_dim(chance_only)
+    def resolve_output_dim(
+        cls,
+        yield_target: str = YIELD_TARGET_BOTH,
+        **_kwargs,
+    ) -> int:
+        yt = resolve_yield_target({'yield_target': yield_target})
+        if yt == YIELD_TARGET_BOTH:
+            return LABEL_FULL_DIM_YIELD
+        return LABEL_FULL_DIM_YIELD_SINGLE
 
     @classmethod
-    def target_slice(cls, output_dim: int, chance_only: bool = False, **_kwargs) -> slice:
-        expected = cls.resolve_output_dim(chance_only)
+    def target_slice(
+        cls,
+        output_dim: int,
+        yield_target: str = YIELD_TARGET_BOTH,
+        **_kwargs,
+    ) -> slice:
+        """
+        Slice into full cache vector [chance, wait].
+
+          both   → [0:2]
+          chance → [0:1]
+          wait   → [1:2]
+        """
+        yt = resolve_yield_target({'yield_target': yield_target})
+        expected = cls.resolve_output_dim(yield_target=yt)
         if output_dim != expected:
             raise ValueError(
-                f"{cls.name} with chance_only={chance_only} requires "
+                f"{cls.name} with yield_target={yt!r} requires "
                 f"output_dim={expected}, got {output_dim}"
             )
-        return slice(0, expected)
+        if yt == YIELD_TARGET_BOTH:
+            return slice(0, 2)
+        if yt == YIELD_TARGET_CHANCE:
+            return slice(0, 1)
+        if yt == YIELD_TARGET_WAIT:
+            return slice(1, 2)
+        raise ValueError(f"Unknown yield_target {yt!r}")
 
     @classmethod
     def target_names(
-        cls, output_dim: int, chance_only: bool = False, **_kwargs
+        cls,
+        output_dim: int,
+        yield_target: str = YIELD_TARGET_BOTH,
+        **_kwargs,
     ) -> Tuple[str, ...]:
-        if chance_only or output_dim == 1:
+        yt = resolve_yield_target({'yield_target': yield_target})
+        if yt == YIELD_TARGET_BOTH:
+            return ('chance', 'wait')
+        if yt == YIELD_TARGET_CHANCE:
             return ('chance',)
-        return ('chance', 'wait')
+        if yt == YIELD_TARGET_WAIT:
+            return ('wait',)
+        raise ValueError(f"Unknown yield_target {yt!r}")
 
     @classmethod
     def find(
@@ -366,23 +446,16 @@ class Label_Yield:
         history,
         min_yield_percent: float,
         max_hope_future_horizon: Optional[int] = None,
-        chance_only: bool = False,
+        yield_target: Optional[str] = None,
     ):
         """
         Thresholded yield events vs the last raw price history[-1].
 
-        Inputs MUST be raw prices (not window z-scores). Percent yield at bar t:
-            yv = 100 * (future[t] - current) / current
-        For every t in [0, n) with yv >= min_yield_percent:
-            chance += (yv - min_yield_percent)   # excess % above threshold
-            wait   += t / yv                     # unless chance_only
+        Always computes both chance and wait. Return shape:
+          - default / cache (yield_target None or 'both'): (chance, wait)
+          - yield_target='chance'|'wait': single-component tuple
 
-        So chance == 0 when there are no hits, and grows with how far each hit
-        exceeds the threshold (not with z-score artifacts).
-
-        Returns:
-            chance_only=False → (chance, wait)
-            chance_only=True  → (chance,)
+        Prefer always caching (chance, wait) and slicing via target_slice.
         """
         n = int(future.shape[0])
         if max_hope_future_horizon is not None:
@@ -390,42 +463,51 @@ class Label_Yield:
 
         chance = 0.0
         wait = 0.0
-        if n == 0 or history.numel() == 0:
-            return (float(chance),) if chance_only else (float(chance), float(wait))
+        empty = n == 0 or history.numel() == 0
+        if not empty:
+            current = history[-1]
+            eps = 1e-8
+            denom = current if abs(float(current)) > eps else (
+                current + eps if float(current) >= 0 else current - eps
+            )
+            for t in range(n):
+                yv = float(((future[t] - current) / denom) * 100)
+                if yv <= min_yield_percent:
+                    continue
+                chance += (yv - min_yield_percent)
+                wait += np.sin(t/n * np.pi) / (yv - min_yield_percent + eps)
 
-        current = history[-1]
-        eps = 1e-8
-        denom = current if abs(float(current)) > eps else (
-            current + eps if float(current) >= 0 else current - eps
-        )
+        full = (float(chance), float(wait))
+        if yield_target is None:
+            return full
 
-        for t in range(n):
-            yv = float(((future[t] - current) / denom) * 100)
-            if yv <= min_yield_percent:
-                continue
-            chance += (yv - min_yield_percent)
-            if not chance_only:
-                wait += t / yv
-
-        if chance_only:
-            return (float(chance),)
-        return (float(chance), float(wait))
+        yt = resolve_yield_target({'yield_target': yield_target})
+        if yt == YIELD_TARGET_BOTH:
+            return full
+        if yt == YIELD_TARGET_CHANCE:
+            return (full[0],)
+        if yt == YIELD_TARGET_WAIT:
+            return (full[1],)
+        return full
 
     @classmethod
     def make_auxiliary(cls, config: Optional[dict] = None, **overrides) -> dict:
         """
         Class-private loss knobs for yield.
 
-        Keys (only used inside Label_Yield.loss):
-          chance_weight, wait_weight, chance_only
+        Keys: chance_weight, wait_weight, yield_target
         """
         cfg = config or {}
+        yt = resolve_yield_target(cfg, **overrides)
         aux = {
             'chance_weight': float(cfg.get('chance_loss_weight', 1.0)),
             'wait_weight': float(cfg.get('wait_loss_weight', 1.0)),
-            'chance_only': bool(cfg.get('chance_only', False)),
+            'yield_target': yt,
         }
-        aux.update(overrides)
+        for k, v in overrides.items():
+            if k == 'yield_target':
+                continue
+            aux[k] = v
         return aux
 
     @classmethod
@@ -439,33 +521,39 @@ class Label_Yield:
         """
         Uniform signature: loss(x, y_pred, y_truth, auxiliary).
 
-        MSE on (chance[, wait]). ``x`` unused for yield (kept for API uniformity).
-        ``auxiliary`` may contain chance_weight / wait_weight / chance_only.
+        MSE on model targets for the active yield_target.
+        ``x`` unused for yield (kept for API uniformity).
         """
         aux = auxiliary or {}
         chance_weight = float(aux.get('chance_weight', 1.0))
         wait_weight = float(aux.get('wait_weight', 1.0))
-        chance_only = bool(aux.get('chance_only', False))
+        yt = resolve_yield_target(aux)
 
         out_dim = y_pred.shape[-1]
         if y_truth.shape[-1] != out_dim:
             raise ValueError(
                 f"{cls.name} loss: target dim {y_truth.shape[-1]} != pred dim {out_dim}"
             )
-        if chance_only or out_dim == 1:
-            if out_dim != 1:
+
+        if yt == YIELD_TARGET_BOTH:
+            if out_dim != 2:
                 raise ValueError(
-                    f"chance_only requires pred dim 1, got {out_dim}"
+                    f"yield_target='both' requires pred dim 2, got {out_dim}"
                 )
-            return chance_weight * nn.functional.mse_loss(
-                y_pred[:, 0], y_truth[:, 0]
-            )
-        if out_dim == 2:
             chance_loss = nn.functional.mse_loss(y_pred[:, 0], y_truth[:, 0])
             wait_loss = nn.functional.mse_loss(y_pred[:, 1], y_truth[:, 1])
             return chance_weight * chance_loss + wait_weight * wait_loss
+
+        if yt in (YIELD_TARGET_CHANCE, YIELD_TARGET_WAIT):
+            if out_dim != 1:
+                raise ValueError(
+                    f"yield_target={yt!r} requires pred dim 1, got {out_dim}"
+                )
+            w = chance_weight if yt == YIELD_TARGET_CHANCE else wait_weight
+            return w * nn.functional.mse_loss(y_pred[:, 0], y_truth[:, 0])
+
         raise ValueError(
-            f"{cls.name} loss: require dim 1 (chance_only) or 2, got {out_dim}"
+            f"{cls.name} loss: unknown yield_target {yt!r}"
         )
 
 
@@ -491,28 +579,32 @@ def get_label_class(label_mode: str) -> Type:
     return LABEL_CLASSES[label_mode]
 
 
-def resolve_hope_output_dim(chance_only: bool) -> int:
-    """Yield head / label width: 1 if chance_only else 2."""
-    return Label_Yield.resolve_output_dim(chance_only)
+def resolve_hope_output_dim(yield_target: Optional[str] = None) -> int:
+    """Yield head / label width from yield_target."""
+    return Label_Yield.resolve_output_dim(
+        yield_target=yield_target or YIELD_TARGET_BOTH,
+    )
 
 
 def label_target_slice(
     label_mode: str,
     output_dim: int,
-    chance_only: bool = False,
+    yield_target: Optional[str] = None,
 ) -> slice:
     return get_label_class(label_mode).target_slice(
-        output_dim, chance_only=chance_only
+        output_dim,
+        yield_target=yield_target or YIELD_TARGET_BOTH,
     )
 
 
 def label_target_names(
     label_mode: str,
     output_dim: int,
-    chance_only: bool = False,
+    yield_target: Optional[str] = None,
 ) -> Tuple[str, ...]:
     return get_label_class(label_mode).target_names(
-        output_dim, chance_only=chance_only
+        output_dim,
+        yield_target=yield_target or YIELD_TARGET_BOTH,
     )
 
 
@@ -944,7 +1036,7 @@ def visualize_yield(
     future_window: int,
     min_yield_percent: float = 0.0,
     max_hope_future_horizon: Optional[int] = None,
-    chance_only: bool = False,
+    yield_target: Optional[str] = None,
     num_samples: int = 6,
     figsize: Tuple[int, int] = (15, 10),
     interactive: bool = True,
@@ -962,14 +1054,12 @@ def visualize_yield(
       - recent past + future actual prices
       - horizontal line at reference price history[-1]
       - orange markers on future bars where yield % >= min_yield_percent
-        (decorative only — illustrates the threshold rule on the chart)
-      - title chance/wait from ``label_tensor`` (dataset cache; not recomputed;
-        values shown in natural/denorm units)
-      - small chance×wait inset in *normalized* (z-score) space using
-        ``label_mean`` / ``label_std`` (train label stats); truth + pred points
-        with center text for L2 / chance / wait distances (skipped when
-        ``chance_only`` / 1-D labels)
+      - title chance/wait from ``label_tensor`` (natural/denorm units)
+      - chance×wait inset in normalized space when yield_target='both'
     """
+    yt = resolve_yield_target({'yield_target': yield_target})
+    show_cw_inset = yt == YIELD_TARGET_BOTH
+
     if total_tensor.is_cuda:
         total_tensor = total_tensor.cpu()
     if label_tensor.is_cuda:
@@ -988,7 +1078,7 @@ def visualize_yield(
         )
 
     # Label z-score stats for the chance×wait inset (model target space)
-    def _as_stat_vec(v, dim: int) -> np.ndarray:
+    def _as_stat_vec(v, dim: int):
         if v is None:
             return None
         if hasattr(v, 'detach'):
@@ -1001,15 +1091,14 @@ def visualize_yield(
             )
         return arr[:dim].astype(np.float64)
 
-    out_dim_stats = 1 if chance_only else 2
+    out_dim_stats = 2 if show_cw_inset else 1
     _y_mean = _as_stat_vec(label_mean, out_dim_stats)
     _y_std = _as_stat_vec(label_std, out_dim_stats)
-    if _y_mean is None or _y_std is None:
-        # Fallback: stats from the provided (denorm) label batch
+    if show_cw_inset and (_y_mean is None or _y_std is None):
         lt = label_tensor.detach().cpu().float()
         if lt.ndim == 1:
             lt = lt.unsqueeze(-1)
-        d = min(out_dim_stats, lt.shape[-1])
+        d = min(out_dim_stats, int(lt.shape[-1]))
         _y_mean = lt[:, :d].mean(dim=0).numpy().astype(np.float64)
         _y_std = lt[:, :d].std(dim=0).numpy().astype(np.float64)
         _y_std = np.where(_y_std < 1e-8, 1.0, _y_std)
@@ -1017,13 +1106,11 @@ def visualize_yield(
             "  (yield inset: label_mean/std not provided — "
             "using batch label stats for normalization)"
         )
-    else:
+    elif _y_std is not None:
         _y_std = np.where(_y_std < 1e-8, 1.0, _y_std)
 
     def _normalize_cw(comps: Tuple[float, ...]) -> Tuple[float, ...]:
-        """Map denorm (chance[, wait]) → z-score using train label stats."""
-        if chance_only or len(comps) == 1 or out_dim_stats == 1:
-            return ((float(comps[0]) - _y_mean[0]) / (_y_std[0] + 1e-8),)
+        """Map denorm (chance, wait) → z-score using train label stats."""
         return (
             (float(comps[0]) - _y_mean[0]) / (_y_std[0] + 1e-8),
             (float(comps[1]) - _y_mean[1]) / (_y_std[1] + 1e-8),
@@ -1075,7 +1162,7 @@ def visualize_yield(
 
     def _as_components(vec) -> Tuple[float, ...]:
         v = vec.detach().cpu().flatten() if hasattr(vec, 'detach') else np.asarray(vec).ravel()
-        if chance_only or len(v) == 1:
+        if yt != YIELD_TARGET_BOTH or len(v) == 1:
             return (float(v[0]),)
         return (float(v[0]), float(v[1]))
 
@@ -1153,20 +1240,29 @@ def visualize_yield(
             if n_hope > 0:
                 ax.axvspan(0, max(n_hope - 1, 0), alpha=0.08, color='#FFE0B2')
 
-            # Labels: always from stored dataset cache (not recomputed here)
+            # Labels: from provided tensor (cache or model-sliced denorm)
             comps_lbl = _as_components(label_tensor[idx])
             comps_prd = (
                 _as_components(pred_tensor[idx]) if pred_tensor is not None else None
             )
-            if chance_only or len(comps_lbl) == 1:
+            if yt == YIELD_TARGET_CHANCE or (
+                yt == YIELD_TARGET_BOTH and len(comps_lbl) == 1
+            ):
                 title_l1 = f'chance={comps_lbl[0]:.2f}'
+            elif yt == YIELD_TARGET_WAIT:
+                title_l1 = f'wait={comps_lbl[0]:.2f}'
             else:
                 title_l1 = f'chance={comps_lbl[0]:.2f}, wait={comps_lbl[1]:.2f}'
             title_l2 = None
             if comps_prd is not None:
-                if chance_only or len(comps_prd) == 1:
+                if yt == YIELD_TARGET_CHANCE or (
+                    yt == YIELD_TARGET_BOTH and len(comps_prd) == 1
+                ):
                     title_l2 = f'pred chance={comps_prd[0]:.2f}'
                     pred_txt = f'pred c={comps_prd[0]:.1f}'
+                elif yt == YIELD_TARGET_WAIT:
+                    title_l2 = f'pred wait={comps_prd[0]:.2f}'
+                    pred_txt = f'pred w={comps_prd[0]:.1f}'
                 else:
                     title_l2 = (
                         f'pred chance={comps_prd[0]:.2f}, wait={comps_prd[1]:.2f}'
@@ -1181,7 +1277,7 @@ def visualize_yield(
                 )
 
             # Small chance × wait inset in *normalized* (z-score) space
-            if not (chance_only or len(comps_lbl) < 2 or out_dim_stats < 2):
+            if show_cw_inset and len(comps_lbl) >= 2 and _y_mean is not None:
                 ch_t_n, wt_t_n = _normalize_cw(comps_lbl)
                 ax_cw = ax.inset_axes([0.55, 0.08, 0.43, 0.42])
                 _inset_axes.append(ax_cw)
@@ -1266,7 +1362,7 @@ def visualize_yield(
         page_label = f'Page {page_num[0]}'
         if fixed_order and n_pages is not None:
             page_label = f'Page {page_num[0]}/{n_pages}'
-        mode_note = 'chance_only' if chance_only else 'chance+wait'
+        mode_note = f'yield_target={yt}'
         line1 = (
             f'Yield ({mode_note}) — min_yield={min_yield_percent:g}%  |  {page_label}'
         )
@@ -1275,7 +1371,7 @@ def visualize_yield(
             'orange=hits ≥ threshold',
             'chance from dataset cache',
         ]
-        if not chance_only:
+        if show_cw_inset:
             line2_parts.append('inset: truth/pred in norm chance×wait')
             if pred_tensor is not None:
                 line2_parts.append('center text: ||d||, dc, dw (norm)')

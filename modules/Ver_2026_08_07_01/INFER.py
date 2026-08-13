@@ -288,6 +288,10 @@ def run_test(
 
     print("\nLoading dataset (same path as TRAIN)...", flush=True)
     dataset, total_features = get_dataset(config)
+    # Align head width with resolved yield_target / trend slice
+    config['output_dim'] = dataset.output_dim
+    if getattr(dataset, 'label_mode', None) == 'yield':
+        config['yield_target'] = getattr(dataset, 'yield_target', 'both')
 
     checkpoint_key = generate_checkpoint_key(config, dataset.cache_key)
     print(f"🔑 Generated Checkpoint Key: {checkpoint_key}", flush=True)
@@ -331,16 +335,23 @@ def run_test(
 
     out_dim = preds.shape[-1]
     label_mode = config.get('label', getattr(dataset, 'label_mode', 'trend'))
-    chance_only = bool(
-        config.get('chance_only', getattr(dataset, 'chance_only', False))
+    from labels import resolve_yield_target
+    yield_target = resolve_yield_target(
+        config,
+        yield_target=getattr(dataset, 'yield_target', None),
     )
     print("\n📊 Test Set Results:")
     metrics = {}
-    if label_mode == 'yield' and (chance_only or out_dim == 1):
+    if label_mode == 'yield' and yield_target == 'chance':
         metrics['chance_mse'] = torch.nn.functional.mse_loss(
             preds[:, 0], test_labels[:, 0]
         ).item()
         print(f"  Chance MSE:      {metrics['chance_mse']:.4f}")
+    elif label_mode == 'yield' and yield_target == 'wait':
+        metrics['wait_mse'] = torch.nn.functional.mse_loss(
+            preds[:, 0], test_labels[:, 0]
+        ).item()
+        print(f"  Wait MSE:        {metrics['wait_mse']:.4f}")
     elif label_mode == 'yield' and out_dim == 2:
         metrics['chance_mse'] = torch.nn.functional.mse_loss(
             preds[:, 0], test_labels[:, 0]
@@ -376,8 +387,15 @@ def run_test(
         raise ValueError(f"Unexpected pred dim {out_dim}")
 
     print(f"\n📈 Sample Predictions (first 5):")
-    if label_mode == 'yield' and (chance_only or out_dim == 1):
+    if label_mode == 'yield' and yield_target == 'chance':
         print(f"  {'Index':<6} {'True Chance':<12} {'Pred Chance':<12}")
+        print(f"  {'-'*6} {'-'*12} {'-'*12}")
+        for i in range(min(5, len(preds))):
+            print(
+                f"  {i:<6} {test_labels[i, 0].item():<12.4f} {preds[i, 0].item():<12.4f}"
+            )
+    elif label_mode == 'yield' and yield_target == 'wait':
+        print(f"  {'Index':<6} {'True Wait':<12} {'Pred Wait':<12}")
         print(f"  {'-'*6} {'-'*12} {'-'*12}")
         for i in range(min(5, len(preds))):
             print(
@@ -428,13 +446,18 @@ def run_test(
 
         if label_mode == 'yield':
             print(
-                "\n📈 Visualizing yield labels (chance/wait) on test samples...",
+                f"\n📈 Visualizing yield labels "
+                f"(yield_target={yield_target}) on test samples...",
                 flush=True,
             )
+            # Model-aligned denorm labels (sliced) match pred_tensor layout
+            viz_labels = test_labels.detach().cpu()
+            # For chance×wait inset we need full (chance, wait) in natural units
+            # when yield_target=both; for single modes titles use sliced tensors.
             visualize_yield(
                 total_tensor=dataset.Total,
                 valid_starts=valid_starts,
-                label_tensor=full_labels,
+                label_tensor=viz_labels if yield_target != 'both' else full_labels,
                 price_feature_idx=dataset.price_feature_idx,
                 past_window=dataset.past_window,
                 future_window=dataset.future_window,
@@ -446,7 +469,7 @@ def run_test(
                     'max_hope_future_horizon',
                     getattr(dataset, 'max_hope_future_horizon', None),
                 ),
-                chance_only=chance_only,
+                yield_target=yield_target,
                 num_samples=min(6, n_viz),
                 pred_tensor=pred_cpu,
                 fixed_order=True,
