@@ -24,7 +24,9 @@ config = {
     # ============================================================
     'train_ratio': 0.70,
     'val_ratio': 0.20,
-    'shuffle_split': True,
+    # False: train / val / test are consecutive in time (earliest → latest).
+    # Training still shuffles the train split each epoch (DataLoader).
+    'shuffle_split': False,
     
     # ============================================================
     # VALIDATION CONFIGURATION
