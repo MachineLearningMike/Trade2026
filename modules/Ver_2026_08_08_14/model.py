@@ -246,7 +246,7 @@ class PredictionHead(nn.Module):
 
     trend:   3 → (horizon, slope, intercept);  2 → (slope, intercept)
     yield:   2 → (chance, wait);  1 → (chance,) or (wait,) per yield_target
-    latent:  2 → (mu, log_var) normal;  3 → (loc, log_scale, log_df) student
+    latent:  2 → (mu, var_raw) normal;  3 → (loc, scale_raw, df_raw) student
     """
 
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int = 3, dropout: float = 0.1):
@@ -277,10 +277,11 @@ class MarketTransformerWithHeads(nn.Module):
     output_dim controls the head layout (see config ``label``):
       trend:  3 → (h, m, b);  2 → (m, b)
       yield:  2 → both;  1 → chance or wait (yield_target)
-      latent: 2 → normal (mu, log_var);  3 → student (loc, log_scale, log_df)
+      latent: 2 → normal (mu, var_raw);  3 → student (loc, scale_raw, df_raw)
 
     Window statistics (mean / std / shape moments) condition the decoder via
-    x_stat tokens. Recent past prices ``p`` are shared by all label modes.
+    x_stat tokens. Recent past prices ``p`` are concatenated onto the
+    flattened decoder tokens when ``look_price`` is True (config).
     """
 
     def __init__(
@@ -301,6 +302,7 @@ class MarketTransformerWithHeads(nn.Module):
         output_dim: int = 3,
         use_reconstruction: bool = True,
         num_shapes: int = 4,
+        look_price: bool = True,
     ):
         super().__init__()
         if output_dim not in (1, 2, 3):
@@ -316,6 +318,7 @@ class MarketTransformerWithHeads(nn.Module):
         self.output_dim = output_dim
         self.num_shapes = num_shapes
         self.n_max_past_horizon = int(n_max_past_horizon)
+        self.look_price = bool(look_price)
         # x_stat tokens: mean (1) + std (1) + shape moments (num_shapes)
         self.n_stat_tokens = 1 + 1 + num_shapes
 
@@ -393,9 +396,11 @@ class MarketTransformerWithHeads(nn.Module):
         self.decoder_norm = nn.LayerNorm(embed_dim)
 
         # ---- Prediction Head ----
-        # Flatten decoder tokens (B, N_stat, D) → (B, N_stat * D), concat recent
-        # past prices p (B, n_max_past_horizon), then FFN → (B, output_dim)
-        input_dim = self.n_stat_tokens * embed_dim + self.n_max_past_horizon
+        # Flatten decoder tokens (B, N_stat, D) → (B, N_stat * D).
+        # When look_price: concat recent past prices p (B, n_max_past_horizon).
+        input_dim = self.n_stat_tokens * embed_dim
+        if self.look_price:
+            input_dim = input_dim + self.n_max_past_horizon
         self.prediction_head = PredictionHead(
             input_dim=input_dim,
             hidden_dim=head_hidden_dim_multiplier * input_dim,
@@ -535,7 +540,9 @@ class MarketTransformerWithHeads(nn.Module):
               - project x_stat → (B, N_stat, D)
               - TransformerDecoder(tgt=x_stat, memory=encoder(x))
               - LayerNorm → (B, N_stat, D)
-        4. Flatten (B, N_stat, D) → (B, N_stat * D), FFN → (B, 3)
+        4. Flatten (B, N_stat, D) → (B, N_stat * D)
+           [if look_price: concat p (B, n_max_past_horizon)]
+           FFN → (B, output_dim)
 
         Args:
             x:     (B, T, F) — window features. T must be divisible by patch_size.
@@ -568,23 +575,24 @@ class MarketTransformerWithHeads(nn.Module):
         )                                                          # (B, N_stat, D)
         dec_out = self.decoder_norm(dec_out)
 
-        # ---- 3. Flatten decoder tokens, concat recent past p, FFN → (B, out) ----
+        # ---- 3. Flatten decoder tokens [, concat p], FFN → (B, out) ----
         B = dec_out.shape[0]
         flat = dec_out.reshape(B, n_stat * self.embed_dim)         # (B, N_stat * D)
-        if p is None:
-            p = torch.zeros(
-                B, self.n_max_past_horizon, device=flat.device, dtype=flat.dtype
-            )
-        else:
-            p = p.to(device=flat.device, dtype=flat.dtype)
-            if p.dim() == 1:
-                p = p.unsqueeze(0)
-            if p.shape[-1] != self.n_max_past_horizon:
-                raise ValueError(
-                    f"p last dim {p.shape[-1]} != n_max_past_horizon "
-                    f"{self.n_max_past_horizon}"
+        if self.look_price:
+            if p is None:
+                p = torch.zeros(
+                    B, self.n_max_past_horizon, device=flat.device, dtype=flat.dtype
                 )
-        flat = torch.cat([flat, p], dim=1)
+            else:
+                p = p.to(device=flat.device, dtype=flat.dtype)
+                if p.dim() == 1:
+                    p = p.unsqueeze(0)
+                if p.shape[-1] != self.n_max_past_horizon:
+                    raise ValueError(
+                        f"p last dim {p.shape[-1]} != n_max_past_horizon "
+                        f"{self.n_max_past_horizon}"
+                    )
+            flat = torch.cat([flat, p], dim=1)
         predictions = self.prediction_head(flat)                   # (B, output_dim)
 
         # ---- 4. Reconstruction from encoder map (optional) ----
@@ -648,6 +656,7 @@ if __name__ == "__main__":
         output_dim=config['output_dim'],
         use_reconstruction=config['use_reconstruction'],
         num_shapes=num_shapes,
+        look_price=config.get('look_price', True),
     ).to(device)
 
     # ---- Size + weight-update diagnostics at start ----

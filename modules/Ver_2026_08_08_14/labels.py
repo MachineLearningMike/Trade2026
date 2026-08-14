@@ -40,8 +40,8 @@ LATENT_DIST_NORMAL = 'normal'
 LATENT_DIST_STUDENT = 'student'
 VALID_LATENT_DISTRIBUTIONS = (LATENT_DIST_NORMAL, LATENT_DIST_STUDENT)
 # Model head widths (y_pred last dim) for each density.
-LABEL_OUTPUT_DIM_NORMAL = 2   # (mu, log_var)
-LABEL_OUTPUT_DIM_STUDENT = 3  # (location, log_scale, log_df_raw)
+LABEL_OUTPUT_DIM_NORMAL = 2   # (mu, var_raw)
+LABEL_OUTPUT_DIM_STUDENT = 3  # (location, scale_raw, df_raw)
 
 # Yield model target selection (config key ``yield_target``).
 # Cache always stores full (chance, wait); this selects the model slice.
@@ -609,69 +609,143 @@ def resolve_latent_distribution(
     )
 
 
-# Clamp ranges keep exp(log_var) / exp(log_scale) finite under a random head.
-_LOG_VAR_MIN = -10.0   # var >= ~4.5e-5
-_LOG_VAR_MAX = 8.0     # var <= ~2980
-_LOG_SCALE_MIN = -10.0
-_LOG_SCALE_MAX = 5.0
-_DF_SOFTPLUS_MAX = 30.0  # df in (2, 2+softplus_max]
+# Head scale channels are unconstrained; mapped here.
+# Floor variance: label-normalized y has std ~ 1. If sigma -> 1e-4,
+# (y-mu)^2/sigma^2 explodes on typical shuffled residuals and NLL rises
+# for the rest of the epoch even though the data order is random.
+_VAR_EPS = 1e-4
+_VAR_MIN = 1e-3    # sigma >= ~0.032 in observation units
+_VAR_MAX = 1e2     # sigma <= 10
+_SCALE_EPS = 1e-4
+_SCALE_MIN = 1e-2
+_SCALE_MAX = 1e1
+_DF_SOFTPLUS_MAX = 20.0  # df in (2, 2+cap]
+
+
+def _gaussian_variance(var_raw: torch.Tensor) -> torch.Tensor:
+    """softplus(var_raw)+eps, clamped to a stable NLL range."""
+    var = F.softplus(var_raw) + _VAR_EPS
+    return var.clamp(_VAR_MIN, _VAR_MAX)
+
+
+def _student_scale(scale_raw: torch.Tensor) -> torch.Tensor:
+    scale = F.softplus(scale_raw) + _SCALE_EPS
+    return scale.clamp(_SCALE_MIN, _SCALE_MAX)
 
 
 def _gaussian_nll_loss(
     mu: torch.Tensor,
-    log_var: torch.Tensor,
+    var_raw: torch.Tensor,
     target: torch.Tensor,
 ) -> torch.Tensor:
     """
     NLL for diagonal Gaussian (Basic/Predict_normal_disttribution.py).
 
-    Clamps log_var before exp so an unconstrained head cannot overflow to NaN.
+    Head channel 1 is unconstrained ``var_raw``; variance is
+    ``softplus(var_raw)+eps`` clamped to [_VAR_MIN, _VAR_MAX].
     """
-    # Drop non-finite targets (bad cache / normalize edge cases) from the mean.
-    finite = torch.isfinite(target) & torch.isfinite(mu)
+    finite = torch.isfinite(target) & torch.isfinite(mu) & torch.isfinite(var_raw)
     if not finite.any():
-        return mu.sum() * 0.0  # connected to graph, value 0
+        return mu.sum() * 0.0
 
-    log_var = log_var.clamp(_LOG_VAR_MIN, _LOG_VAR_MAX)
-    var = torch.exp(log_var)
-    # 0.5 * (log σ² + (y-μ)² / σ²)  — no 2π term (constant w.r.t. params)
-    inv_var = torch.exp(-log_var)
+    var = _gaussian_variance(var_raw)
+    log_var = torch.log(var)
     residual2 = (target - mu).pow(2)
-    loss = 0.5 * (log_var + residual2 * inv_var)
+    # 0.5 * (log σ² + (y-μ)² / σ²)  — omit 2π constant
+    loss = 0.5 * (log_var + residual2 / var)
     loss = loss.masked_fill(~finite, 0.0)
     return loss.sum() / finite.sum().clamp(min=1).to(loss.dtype)
 
 
 def _student_t_nll_loss(
     location: torch.Tensor,
-    log_scale: torch.Tensor,
-    log_df_raw: torch.Tensor,
+    scale_raw: torch.Tensor,
+    df_raw: torch.Tensor,
     target: torch.Tensor,
 ) -> torch.Tensor:
     """
     NLL for Student-t (Basic/Predict_student_t_disttribution.py).
 
-    scale = exp(clamp(log_scale)) > 0
-    df    = 2 + softplus(log_df_raw) > 2  (capped for stability)
+    scale = clamp(softplus(scale_raw) + eps)
+    df    = 2 + softplus(df_raw)  (capped)
     """
     finite = (
         torch.isfinite(target)
         & torch.isfinite(location)
-        & torch.isfinite(log_scale)
-        & torch.isfinite(log_df_raw)
+        & torch.isfinite(scale_raw)
+        & torch.isfinite(df_raw)
     )
     if not finite.any():
         return location.sum() * 0.0
 
-    log_scale = log_scale.clamp(_LOG_SCALE_MIN, _LOG_SCALE_MAX)
-    scale = torch.exp(log_scale)
-    # Cap softplus so df does not explode (StudentT log_prob can NaN for huge df/scale).
-    df = 2.0 + F.softplus(log_df_raw).clamp(max=_DF_SOFTPLUS_MAX)
+    scale = _student_scale(scale_raw)
+    df = 2.0 + F.softplus(df_raw).clamp(max=_DF_SOFTPLUS_MAX)
     dist = StudentT(df=df, loc=location, scale=scale)
     nll = -dist.log_prob(target)
     nll = torch.nan_to_num(nll, nan=0.0, posinf=1e4, neginf=1e4)
     nll = nll.masked_fill(~finite, 0.0)
     return nll.sum() / finite.sum().clamp(min=1).to(nll.dtype)
+
+
+def decode_latent_params(
+    y_pred: torch.Tensor,
+    latent_distribution: Optional[str] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Decode unconstrained density-head channels to (location, scale, df).
+
+    y_pred last dim:
+      normal  → 2 = (mu, var_raw);     scale = sqrt(softplus(var_raw)+eps)
+      student → 3 = (loc, scale_raw, df_raw)
+
+    Returns location/scale with the same leading shape as y_pred (df is None
+    for the Gaussian). Does not denormalize into observation space.
+    """
+    dist = resolve_latent_distribution(
+        {'latent_distribution': latent_distribution}
+        if latent_distribution is not None
+        else None,
+        latent_distribution=latent_distribution,
+    )
+    if y_pred.dim() == 0:
+        raise ValueError("y_pred must have a last dimension of density params")
+    if dist == LATENT_DIST_NORMAL:
+        if y_pred.shape[-1] != LABEL_OUTPUT_DIM_NORMAL:
+            raise ValueError(
+                f"normal head expects last dim {LABEL_OUTPUT_DIM_NORMAL}, "
+                f"got {y_pred.shape[-1]}"
+            )
+        location = y_pred[..., 0]
+        scale = _gaussian_variance(y_pred[..., 1]).sqrt()
+        return location, scale, None
+    if y_pred.shape[-1] != LABEL_OUTPUT_DIM_STUDENT:
+        raise ValueError(
+            f"student head expects last dim {LABEL_OUTPUT_DIM_STUDENT}, "
+            f"got {y_pred.shape[-1]}"
+        )
+    location = y_pred[..., 0]
+    scale = _student_scale(y_pred[..., 1])
+    df = 2.0 + F.softplus(y_pred[..., 2]).clamp(max=_DF_SOFTPLUS_MAX)
+    return location, scale, df
+
+
+def latent_params_to_obs_space(
+    location: torch.Tensor,
+    scale: torch.Tensor,
+    label_mean: torch.Tensor,
+    label_std: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Map location/scale from label-normalized space to cache observation space."""
+    mean = torch.as_tensor(label_mean, device=location.device, dtype=location.dtype)
+    std = torch.as_tensor(label_std, device=location.device, dtype=location.dtype)
+    mean = mean.reshape(-1)[:1]
+    std = std.reshape(-1)[:1]
+    std = torch.where(std.abs() < 1e-8, torch.ones_like(std), std)
+    # Broadcast (1,) over leading dims of location/scale.
+    while mean.dim() < location.dim():
+        mean = mean.unsqueeze(0)
+        std = std.unsqueeze(0)
+    return location * std + mean, scale * std.abs()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -680,18 +754,23 @@ def _student_t_nll_loss(
 
 class Label_Latent:
     """
-    Latent labels: predict a parametric density for a scalar future observation.
+    Latent labels: infer a density for the *current* price (last historical bar).
+
+    The realized current price is treated as one sample from a latent price
+    law. The model does not forecast a future price — it outputs the
+    parameters of that law from market history.
 
     Config id: 'latent'
     Shares ``model.MarketTransformerWithHeads`` with trend/yield.
 
     Mode (config ``latent_distribution``):
-      'normal'  → y_pred (B, 2) = (mu, log_var);        NLL as Gaussian
-      'student' → y_pred (B, 3) = (loc, log_scale, log_df_raw); NLL as Student-t
+      'normal'  → y_pred (B, 2) = (mu, var_raw);   var = softplus(var_raw)+eps
+      'student' → y_pred (B, 3) = (loc, scale_raw, df_raw)
+                  scale = softplus(scale_raw)+eps; df = 2+softplus(df_raw)
 
-    Label cache stores a scalar observation (dim 1). Model ``output_dim`` is
-    forced from the density mode (2 or 3). ``y_pred`` and ``y_truth`` therefore
-    have different last dims by design — loss is NLL, not elementwise MSE.
+    Label cache stores the realized current price (dim 1). Model ``output_dim``
+    is forced from the density mode (2 or 3). ``y_pred`` and ``y_truth``
+    therefore have different last dims by design — loss is NLL, not MSE.
     """
 
     name = LABEL_LATENT
@@ -774,9 +853,9 @@ class Label_Latent:
             latent_distribution=latent_distribution,
         )
         if dist == LATENT_DIST_NORMAL and output_dim == LABEL_OUTPUT_DIM_NORMAL:
-            return ('mu', 'log_var')
+            return ('mu', 'var_raw')
         if dist == LATENT_DIST_STUDENT and output_dim == LABEL_OUTPUT_DIM_STUDENT:
-            return ('location', 'log_scale', 'log_df_raw')
+            return ('location', 'scale_raw', 'df_raw')
         # Fallback: generic param names
         return tuple(f'param_{i}' for i in range(output_dim))
 
@@ -788,20 +867,25 @@ class Label_Latent:
         **_kwargs,
     ):
         """
-        Scalar observation for the density model.
+        Realized current price: last bar of ``history``.
 
-        Uses the first future bar when available (next-step target), else
-        ``history[-1]``. Returned as a 1-tuple for cache stacking.
+        That price is the observation the density is fitted to — one draw
+        from the latent current-price law. ``future`` is ignored (kept so
+        data.py can call find the same way as trend/yield).
+
+        data.py may pass window-z-scored prices; this still returns
+        ``history[-1]`` in that space.
         """
-        if future is not None:
-            fut = future.reshape(-1) if hasattr(future, 'reshape') else torch.as_tensor(future).reshape(-1)
-            if fut.numel() > 0:
-                return (float(fut[0].item()),)
-        if history is None or (
-            hasattr(history, 'numel') and history.numel() == 0
-        ):
+        del future
+        if history is None:
             return (0.0,)
-        hist = history.reshape(-1) if hasattr(history, 'reshape') else torch.as_tensor(history).reshape(-1)
+        hist = (
+            history.reshape(-1)
+            if hasattr(history, 'reshape')
+            else torch.as_tensor(history).reshape(-1)
+        )
+        if hist.numel() == 0:
+            return (0.0,)
         return (float(hist[-1].item()),)
 
     @classmethod
@@ -839,10 +923,10 @@ class Label_Latent:
             loss(x: Tensor, y_pred: Tensor, y_truth: Tensor, auxiliary=None)
 
         y_pred:
-          normal  → (B, 2) = (mu, log_var)
-          student → (B, 3) = (location, log_scale, log_df_raw)
+          normal  → (B, 2) = (mu, var_raw)
+          student → (B, 3) = (location, scale_raw, df_raw)
         y_truth:
-          (B,) or (B, 1) scalar observation (cache dim 1)
+          (B,) or (B, 1) realized current price (cache dim 1)
         """
         aux = auxiliary or {}
         weight = float(aux.get('latent_weight', 1.0))
@@ -880,23 +964,21 @@ class Label_Latent:
                 f"got {y_pred.shape[-1]}"
             )
 
-        # Bound raw head outputs so an unconstrained Linear cannot blow NLL.
-        # log_var / log_scale are clamped again inside the NLL helpers.
+        # Finite-ize only; scale channels use softplus inside the NLL helpers.
         y_pred = torch.nan_to_num(y_pred, nan=0.0, posinf=50.0, neginf=-50.0)
-        y_pred = y_pred.clamp(-50.0, 50.0)
         y_truth = torch.nan_to_num(y_truth, nan=0.0, posinf=0.0, neginf=0.0)
 
         del x  # reserved for conditioning terms later
 
         if dist == LATENT_DIST_NORMAL:
             mu = y_pred[:, 0:1]
-            log_var = y_pred[:, 1:2]
-            nll = _gaussian_nll_loss(mu, log_var, y_truth)
+            var_raw = y_pred[:, 1:2]
+            nll = _gaussian_nll_loss(mu, var_raw, y_truth)
         else:
             location = y_pred[:, 0:1]
-            log_scale = y_pred[:, 1:2]
-            log_df_raw = y_pred[:, 2:3]
-            nll = _student_t_nll_loss(location, log_scale, log_df_raw, y_truth)
+            scale_raw = y_pred[:, 1:2]
+            df_raw = y_pred[:, 2:3]
+            nll = _student_t_nll_loss(location, scale_raw, df_raw, y_truth)
         if not torch.isfinite(nll):
             # Last-resort: keep the graph alive with a zero that still depends on y_pred.
             nll = y_pred.sum() * 0.0
@@ -1780,6 +1862,191 @@ def visualize_yield(
             )
         else:
             print("Yield browser: [Next] or N/Space = next page · [Quit] or Q = exit")
+
+    _draw_page()
+    plt.show(block=True)
+
+
+def visualize_latent(
+    series: List[dict],
+    latent_distribution: Optional[str] = None,
+    series_per_page: int = 1,
+    figsize: Tuple[int, int] = (15, 9),
+    interactive: bool = True,
+    **_ignored,
+):
+    """
+    Visualize the latent current-price density as μ(t), σ(t) over an interval.
+
+    Each series uses two stacked axes (same time):
+      top    — raw price P(t), μ_raw(t), μ±σ band
+      bottom — observation-space y(t), μ(t), σ(t)
+               (this is the space the density is actually fitted in)
+
+    t=0 is the seed sample's current bar (last historical price).
+    """
+    del _ignored
+    dist = resolve_latent_distribution(
+        {'latent_distribution': latent_distribution}
+        if latent_distribution is not None
+        else None,
+        latent_distribution=latent_distribution,
+    )
+
+    if not series:
+        print("⚠ No latent series available for visualization.")
+        return
+
+    n_series = len(series)
+    series_per_page = max(1, int(series_per_page))
+    n_pages = max(1, (n_series + series_per_page - 1) // series_per_page)
+    n_rows = series_per_page * 2
+
+    fig, axes = plt.subplots(n_rows, 1, figsize=figsize, squeeze=False)
+    axes = axes.ravel()
+    if interactive:
+        fig.subplots_adjust(
+            left=0.07, right=0.98, top=0.88, bottom=0.14, hspace=0.45
+        )
+    else:
+        fig.subplots_adjust(
+            left=0.07, right=0.98, top=0.88, bottom=0.08, hspace=0.45
+        )
+
+    page_num = [0]
+    _widgets: List[Any] = []
+
+    def _draw_page():
+        page_num[0] += 1
+        if page_num[0] > n_pages:
+            page_num[0] = 1
+        page = page_num[0]
+        start_i = (page - 1) * series_per_page
+        page_items = list(range(start_i, min(start_i + series_per_page, n_series)))
+
+        for ax in axes:
+            ax.clear()
+            ax.set_visible(False)
+
+        for slot, si in enumerate(page_items):
+            rec = series[si]
+            t_price = np.asarray(rec['t_price'], dtype=np.float64)
+            price = np.asarray(rec['price'], dtype=np.float64)
+            t_pred = np.asarray(rec['t_pred'], dtype=np.float64)
+            sample_id = rec.get('sample_id', si)
+            recon_mae = float(rec.get('recon_mae', float('nan')))
+            mu_mae = float(rec.get('mu_mae_raw', float('nan')))
+
+            ax_raw = axes[2 * slot]
+            ax_obs = axes[2 * slot + 1]
+            ax_raw.set_visible(True)
+            ax_obs.set_visible(True)
+
+            ax_raw.plot(
+                t_price, price, color='#1565C0', linewidth=1.6,
+                label='P(t) realized', zorder=3,
+            )
+            if t_pred.size > 0:
+                mu_raw = np.asarray(rec['mu_raw'], dtype=np.float64)
+                sig_raw = np.asarray(rec['sigma_raw'], dtype=np.float64)
+                y_raw = np.asarray(rec.get('y_raw', []), dtype=np.float64)
+                ax_raw.plot(
+                    t_pred, mu_raw, color='#2E7D32', linewidth=2.0,
+                    label='μ(t)', zorder=4,
+                )
+                ax_raw.fill_between(
+                    t_pred, mu_raw - sig_raw, mu_raw + sig_raw,
+                    color='#2E7D32', alpha=0.20, linewidth=0,
+                    label='μ ± σ', zorder=2,
+                )
+                if y_raw.size == t_pred.size:
+                    ax_raw.scatter(
+                        t_pred, y_raw, c='#6A1B9A', s=14, zorder=5,
+                        label='y → price (check)',
+                    )
+            ax_raw.axvline(x=0, color='gray', linestyle=':', linewidth=1.1, alpha=0.6)
+            ax_raw.set_title(
+                f'Sample {sample_id}: raw price   '
+                f'|μ−P|={mu_mae:.4g}   label→P MAE={recon_mae:.4g}',
+                fontsize=10,
+            )
+            ax_raw.set_ylabel('Price (raw)')
+            ax_raw.grid(True, alpha=0.3)
+            ax_raw.legend(fontsize=7, loc='best')
+
+            if t_pred.size > 0:
+                y_obs = np.asarray(rec['y_obs'], dtype=np.float64)
+                mu_obs = np.asarray(rec['mu_obs'], dtype=np.float64)
+                sig_obs = np.asarray(rec['sigma_obs'], dtype=np.float64)
+                ax_obs.plot(
+                    t_pred, y_obs, color='#1565C0', linewidth=1.6,
+                    label='y(t) realized', zorder=3,
+                )
+                ax_obs.plot(
+                    t_pred, mu_obs, color='#2E7D32', linewidth=2.0,
+                    label='μ(t)', zorder=4,
+                )
+                ax_obs.fill_between(
+                    t_pred, mu_obs - sig_obs, mu_obs + sig_obs,
+                    color='#2E7D32', alpha=0.20, linewidth=0,
+                    label='μ ± σ', zorder=2,
+                )
+                ax_obs.plot(
+                    t_pred, sig_obs, color='#EF6C00', linewidth=1.4,
+                    linestyle='--', label='σ(t)', zorder=4,
+                )
+            ax_obs.axhline(0.0, color='0.7', linewidth=0.7)
+            ax_obs.axvline(x=0, color='gray', linestyle=':', linewidth=1.1, alpha=0.6)
+            ax_obs.set_title(
+                f'Sample {sample_id}: observation space (density units)',
+                fontsize=10,
+            )
+            ax_obs.set_xlabel('Time (min; t=0 = seed current bar)')
+            ax_obs.set_ylabel('y, μ, σ')
+            ax_obs.grid(True, alpha=0.3)
+            ax_obs.legend(fontsize=7, loc='best')
+
+        page_label = f'Page {page}/{n_pages}'
+        fig.suptitle(
+            f'Latent current-price density ({dist})  |  {page_label}\n'
+            f'top: raw P(t) and inverted μ,σ   ·   '
+            f'bottom: real μ(t), σ(t) next to realized y(t)'
+            + ('   ·   [Next] / [Quit]' if interactive else ''),
+            fontsize=11, fontweight='bold',
+        )
+        fig.canvas.draw_idle()
+        shown = [series[i].get('sample_id', i) for i in page_items]
+        print(f"  {page_label}: seed samples {shown}")
+
+    if interactive:
+        ax_next = fig.add_axes([0.55, 0.02, 0.18, 0.055])
+        ax_quit = fig.add_axes([0.76, 0.02, 0.18, 0.055])
+        btn_next = Button(ax_next, 'Next')
+        btn_quit = Button(ax_quit, 'Quit')
+        _widgets.extend([btn_next, btn_quit, ax_next, ax_quit])
+
+        def _on_next(_event):
+            _draw_page()
+
+        def _on_quit(_event):
+            print("  Quit — closing latent browser.")
+            plt.close(fig)
+
+        btn_next.on_clicked(_on_next)
+        btn_quit.on_clicked(_on_quit)
+
+        def _on_key(event):
+            if event.key in ('n', 'right', ' '):
+                _draw_page()
+            elif event.key in ('q', 'escape'):
+                print("  Quit — closing latent browser.")
+                plt.close(fig)
+
+        fig.canvas.mpl_connect('key_press_event', _on_key)
+        print(
+            f"Latent browser ({n_series} interval(s)): "
+            f"[Next] or N/Space = next page · [Quit] or Q = exit"
+        )
 
     _draw_page()
     plt.show(block=True)

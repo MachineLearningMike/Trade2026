@@ -17,7 +17,9 @@ import torch.nn as nn
 from config import get_config
 from model import MarketTransformerWithHeads
 from labels import resolve_model_past_len
-from labels import visualize_trend, visualize_yield
+from labels import visualize_trend, visualize_yield, visualize_latent
+from labels import Label_Latent, resolve_latent_distribution
+from labels import decode_latent_params, latent_params_to_obs_space
 from trainer import generate_checkpoint_key
 from TRAIN import get_dataset
 
@@ -48,11 +50,20 @@ def find_checkpoint_by_key(
             print(f"⚠ Checkpoint key directory not found: {key_dir}")
             return None
 
+        best = key_dir / 'best_val.pt'
+        if best.exists():
+            print(f"✓ Using best-val checkpoint: {best} (Key: {key})")
+            return str(best), key
+
         state_file = key_dir / 'training_state.json'
         if state_file.exists():
             try:
                 with open(state_file, 'r') as f:
                     state = json.load(f)
+                best_path = state.get('best_checkpoint')
+                if best_path and Path(best_path).exists():
+                    print(f"✓ Using best-val checkpoint: {best_path} (Key: {key})")
+                    return best_path, key
                 latest = state.get('latest_checkpoint')
                 if latest and Path(latest).exists():
                     return latest, key
@@ -68,11 +79,20 @@ def find_checkpoint_by_key(
         print(f"✓ Found checkpoint: {latest} (Key: {key})")
         return str(latest), key
 
+    bests = []
     all_checkpoints = []
     for subdir in checkpoint_dir.iterdir():
         if subdir.is_dir():
+            best = subdir / 'best_val.pt'
+            if best.exists():
+                bests.append((best, subdir.name))
             for f in subdir.glob('*.pt'):
                 all_checkpoints.append((f, subdir.name))
+
+    if bests:
+        latest, key = max(bests, key=lambda p: p[0].stat().st_mtime)
+        print(f"✓ Using best-val checkpoint: {latest} (Key: {key})")
+        return str(latest), key
 
     if not all_checkpoints:
         print(f"⚠ No checkpoint files found in {checkpoint_dir}")
@@ -123,6 +143,7 @@ def load_model(
         output_dim=config['output_dim'],
         use_reconstruction=config['use_reconstruction'],
         num_shapes=config.get('num_shapes', 4),
+        look_price=config.get('look_price', True),
     )
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
@@ -155,7 +176,7 @@ def _collate_batch(dataset, indices: List[int]):
     return (
         torch.stack(xs),      # (B, T, F)
         torch.stack(ps),      # (B, max_past_horizon)
-        torch.stack(ys),      # (B, output_dim)
+        torch.stack(ys),      # (B, target_dim)  1 for latent; output_dim otherwise
         torch.stack(means),   # (B, F)
         torch.stack(stds),    # (B, F)
         torch.stack(shapes),  # (B, num_shapes, F)
@@ -182,8 +203,12 @@ def run_inference_on_test_set(
         shape: (B, num_shapes, F)
 
     Returns:
-        preds:  (N, output_dim) denormalized predictions on `device`
-        labels: (N, output_dim) denormalized model targets on `device`
+        preds:  (N, output_dim) on `device`
+                trend/yield → denormalized targets
+                latent      → raw density-head params (not denormalized)
+        labels: (N, target_dim) on `device`
+                trend/yield → denormalized targets (target_dim = output_dim)
+                latent      → label-normalized scalar observation (target_dim = 1)
         used_indices: list of dataset indices that were evaluated
     """
     model.eval()
@@ -230,19 +255,26 @@ def run_inference_on_test_set(
             std = std.to(device, non_blocking=True)
             shape = shape.to(device, non_blocking=True)
 
-            pred_norm, _, _ = model(x, p, mean, std, shape)  # (B, output_dim) normalized
+            pred_norm, _, _ = model(x, p, mean, std, shape)  # (B, output_dim)
 
-            # Denormalize on CPU (dataset stats live on CPU)
-            pred_denorm = torch.stack(
-                [dataset.denormalize_y(pred_norm[i].detach().cpu()) for i in range(pred_norm.shape[0])]
-            )
-            # y from __getitem__ is model-target-normalized → denormalize for metrics
-            y_denorm = torch.stack(
-                [dataset.denormalize_y(y[i]) for i in range(y.shape[0])]
-            )
-
-            pred_chunks.append(pred_denorm)
-            label_chunks.append(y_denorm)
+            if getattr(dataset, 'label_mode', None) == 'latent':
+                # Head is density params (mu, var_raw) / (loc, scale_raw, df_raw).
+                # Label stats are the scalar observation (dim 1). Do not
+                # denormalize preds. Keep y in __getitem__ (normalized) space
+                # so test NLL matches training.
+                pred_chunks.append(pred_norm.detach().cpu())
+                label_chunks.append(y)
+            else:
+                # Denormalize on CPU (dataset stats live on CPU)
+                pred_denorm = torch.stack(
+                    [dataset.denormalize_y(pred_norm[i].detach().cpu()) for i in range(pred_norm.shape[0])]
+                )
+                # y from __getitem__ is model-target-normalized → denormalize for metrics
+                y_denorm = torch.stack(
+                    [dataset.denormalize_y(y[i]) for i in range(y.shape[0])]
+                )
+                pred_chunks.append(pred_denorm)
+                label_chunks.append(y_denorm)
 
             if b == 0 or (b + 1) % max(1, n_batches // 20) == 0 or (b + 1) == n_batches:
                 print(f"  Inference batch {b + 1}/{n_batches}  ({end}/{n} samples)", flush=True)
@@ -253,6 +285,134 @@ def run_inference_on_test_set(
     preds = torch.cat(pred_chunks, dim=0).to(device)
     labels = torch.cat(label_chunks, dim=0).to(device)
     return preds, labels, test_indices
+
+
+def _sample_current_time(dataset, idx: int) -> int:
+    """Bar index of the realized current price (last historical bar)."""
+    return int(dataset.valid_starts[idx]) + int(dataset.past_window) - 1
+
+
+def collect_latent_price_series(
+    model,
+    dataset,
+    seed_indices: List[int],
+    device: str = 'cuda',
+    batch_size: int = 16,
+    interval_minutes: int = 120,
+    lookback_minutes: int = 60,
+    latent_distribution: str = 'normal',
+) -> List[dict]:
+    """
+    For each seed sample, run the model on every dataset window whose
+    current bar falls in [t0 - lookback, t0 + interval] and return
+    raw-price series for visualize_latent.
+    """
+    model.eval()
+    label_std = dataset._label_stat_std
+    normalize = bool(getattr(dataset, 'normalize', True))
+    price_idx = int(dataset.price_feature_idx)
+    pw = int(dataset.past_window)
+    T = int(dataset.T)
+    starts = dataset.valid_starts
+
+    series: List[dict] = []
+    label_std_s = float(torch.as_tensor(label_std).reshape(-1)[0].abs().clamp(min=1e-8))
+    with torch.no_grad():
+        for seed in seed_indices:
+            t0 = _sample_current_time(dataset, seed)
+            t_lo = t0 - int(lookback_minutes)
+            t_hi = t0 + int(interval_minutes)
+            idxs = []
+            for i, s in enumerate(starts):
+                t = int(s) + pw - 1
+                if t_lo <= t <= t_hi:
+                    idxs.append(i)
+            if not idxs:
+                continue
+            idxs.sort(key=lambda i: int(starts[i]))
+
+            mu_obs_parts = []
+            sig_obs_parts = []
+            y_obs_parts = []
+            t_pred = []
+            price_at = []
+            y_raw_parts = []
+            mu_raw_parts = []
+            sig_raw_parts = []
+            for b0 in range(0, len(idxs), batch_size):
+                batch_idx = idxs[b0:b0 + batch_size]
+                x, p, y, mean, std, shape = _collate_batch(dataset, batch_idx)
+                x = x.to(device, non_blocking=True)
+                p = p.to(device, non_blocking=True)
+                mean = mean.to(device, non_blocking=True)
+                std = std.to(device, non_blocking=True)
+                shape = shape.to(device, non_blocking=True)
+                pred, _, _ = model(x, p, mean, std, shape)
+                loc_n, scale_n, _df = decode_latent_params(
+                    pred.detach(), latent_distribution=latent_distribution
+                )
+                # Same inverse as training: head space → cache observation space.
+                loc_n_cpu = loc_n.reshape(-1, 1).detach().cpu()
+                scale_n_cpu = scale_n.reshape(-1).detach().cpu()
+                loc_obs = dataset.denormalize_y(loc_n_cpu).reshape(-1)
+                scale_obs = scale_n_cpu * label_std_s
+                y_obs = dataset.denormalize_y(y.reshape(-1, 1)).reshape(-1)
+
+                idx_t = torch.as_tensor(batch_idx, dtype=torch.long)
+                win_mean = dataset.mean_tensor[idx_t, price_idx].cpu().float()
+                win_std = dataset.std_tensor[idx_t, price_idx].cpu().float()
+                win_std = torch.where(win_std == 0, torch.ones_like(win_std), win_std)
+                if normalize:
+                    loc_raw = loc_obs * win_std + win_mean
+                    sig_raw = scale_obs * win_std.abs()
+                    y_raw = y_obs * win_std + win_mean
+                else:
+                    loc_raw = loc_obs
+                    sig_raw = scale_obs
+                    y_raw = y_obs
+
+                mu_obs_parts.append(loc_obs)
+                sig_obs_parts.append(scale_obs)
+                y_obs_parts.append(y_obs)
+                mu_raw_parts.append(loc_raw)
+                sig_raw_parts.append(sig_raw)
+                y_raw_parts.append(y_raw)
+                for i in batch_idx:
+                    tc = _sample_current_time(dataset, i)
+                    t_pred.append(tc - t0)
+                    price_at.append(float(dataset.Total[tc, price_idx].item()))
+                del x, p, y, mean, std, shape, pred
+
+            ctx_start = max(0, t_lo)
+            ctx_end = min(T, t_hi + 1)
+            t_price = np.arange(ctx_start, ctx_end, dtype=np.float64) - float(t0)
+            price_curve = dataset.Total[ctx_start:ctx_end, price_idx].detach().cpu().numpy()
+            y_raw_np = torch.cat(y_raw_parts).numpy()
+            price_at_np = np.asarray(price_at, dtype=np.float64)
+            recon_mae = float(np.mean(np.abs(y_raw_np - price_at_np)))
+            mu_raw_np = torch.cat(mu_raw_parts).numpy()
+            series.append({
+                'sample_id': seed,
+                't_price': t_price,
+                'price': np.asarray(price_curve, dtype=np.float64),
+                't_pred': np.asarray(t_pred, dtype=np.float64),
+                'price_at_pred': price_at_np,
+                'y_obs': torch.cat(y_obs_parts).numpy(),
+                'mu_obs': torch.cat(mu_obs_parts).numpy(),
+                'sigma_obs': torch.cat(sig_obs_parts).numpy(),
+                'y_raw': y_raw_np,
+                'mu_raw': mu_raw_np,
+                'sigma_raw': torch.cat(sig_raw_parts).numpy(),
+                'recon_mae': recon_mae,
+                'mu_mae_raw': float(np.mean(np.abs(mu_raw_np - price_at_np))),
+            })
+            print(
+                f"  latent series seed={seed}: n={len(idxs)}  "
+                f"label→price MAE={recon_mae:.4g}  "
+                f"|μ-P| MAE={series[-1]['mu_mae_raw']:.4g}",
+                flush=True,
+            )
+    return series
 
 
 # ═══════════════════════════════════════════════════════════
@@ -288,10 +448,14 @@ def run_test(
 
     print("\nLoading dataset (same path as TRAIN)...", flush=True)
     dataset, total_features = get_dataset(config)
-    # Align head width with resolved yield_target / trend slice
+    # Align head width with resolved yield_target / trend slice / latent density
     config['output_dim'] = dataset.output_dim
     if getattr(dataset, 'label_mode', None) == 'yield':
         config['yield_target'] = getattr(dataset, 'yield_target', 'both')
+    if getattr(dataset, 'label_mode', None) == 'latent':
+        config['latent_distribution'] = getattr(
+            dataset, 'latent_distribution', config.get('latent_distribution', 'normal')
+        )
 
     checkpoint_key = generate_checkpoint_key(config, dataset.cache_key)
     print(f"🔑 Generated Checkpoint Key: {checkpoint_key}", flush=True)
@@ -340,9 +504,37 @@ def run_test(
         config,
         yield_target=getattr(dataset, 'yield_target', None),
     )
+    latent_dist = resolve_latent_distribution(
+        config,
+        latent_distribution=getattr(dataset, 'latent_distribution', None),
+    )
     print("\n📊 Test Set Results:")
     metrics = {}
-    if label_mode == 'yield' and yield_target == 'chance':
+    if label_mode == 'latent':
+        aux = Label_Latent.make_auxiliary(config, latent_distribution=latent_dist)
+        metrics['nll'] = Label_Latent.loss(
+            preds, preds, test_labels, auxiliary=aux
+        ).item()
+        loc_n, scale_n, df_t = decode_latent_params(preds, latent_distribution=latent_dist)
+        loc_obs, scale_obs = latent_params_to_obs_space(
+            loc_n, scale_n,
+            dataset._label_stat_mean, dataset._label_stat_std,
+        )
+        y_obs = dataset.denormalize_y(test_labels.detach().cpu()).reshape(-1)
+        loc_obs = loc_obs.reshape(-1).to(y_obs.device)
+        scale_obs = scale_obs.reshape(-1).to(y_obs.device)
+        metrics['location_mae'] = (loc_obs - y_obs).abs().mean().item()
+        metrics['location_rmse'] = (loc_obs - y_obs).pow(2).mean().sqrt().item()
+        metrics['mean_pred_std'] = scale_obs.mean().item()
+        print(f"  Density:         {latent_dist}")
+        print(f"  NLL:             {metrics['nll']:.4f}")
+        print(f"  Location MAE:    {metrics['location_mae']:.4f}")
+        print(f"  Location RMSE:   {metrics['location_rmse']:.4f}")
+        print(f"  Mean pred std:   {metrics['mean_pred_std']:.4f}")
+        if df_t is not None:
+            metrics['mean_pred_df'] = df_t.reshape(-1).float().mean().item()
+            print(f"  Mean pred df:    {metrics['mean_pred_df']:.2f}")
+    elif label_mode == 'yield' and yield_target == 'chance':
         metrics['chance_mse'] = torch.nn.functional.mse_loss(
             preds[:, 0], test_labels[:, 0]
         ).item()
@@ -387,7 +579,39 @@ def run_test(
         raise ValueError(f"Unexpected pred dim {out_dim}")
 
     print(f"\n📈 Sample Predictions (first 5):")
-    if label_mode == 'yield' and yield_target == 'chance':
+    if label_mode == 'latent':
+        loc_n, scale_n, df_t = decode_latent_params(preds, latent_distribution=latent_dist)
+        loc_obs, scale_obs = latent_params_to_obs_space(
+            loc_n, scale_n,
+            dataset._label_stat_mean, dataset._label_stat_std,
+        )
+        y_obs = dataset.denormalize_y(test_labels.detach().cpu()).reshape(-1)
+        loc_obs = loc_obs.reshape(-1).to(y_obs.device)
+        scale_obs = scale_obs.reshape(-1).to(y_obs.device)
+        if df_t is None:
+            print(
+                f"  {'Index':<6} {'y (obs)':<12} {'μ (obs)':<12} {'σ (obs)':<12}"
+            )
+            print(f"  {'-'*6} {'-'*12} {'-'*12} {'-'*12}")
+            for i in range(min(5, len(preds))):
+                print(
+                    f"  {i:<6} {y_obs[i].item():<+12.4f} "
+                    f"{loc_obs[i].item():<+12.4f} {scale_obs[i].item():<12.4f}"
+                )
+        else:
+            df_flat = df_t.reshape(-1)
+            print(
+                f"  {'Index':<6} {'True price':<12} {'Pred loc':<12} "
+                f"{'Pred scale':<12} {'Pred df':<10}"
+            )
+            print(f"  {'-'*6} {'-'*12} {'-'*12} {'-'*12} {'-'*10}")
+            for i in range(min(5, len(preds))):
+                print(
+                    f"  {i:<6} {y_obs[i].item():<+12.4f} "
+                    f"{loc_obs[i].item():<+12.4f} {scale_obs[i].item():<12.4f} "
+                    f"{df_flat[i].item():<10.2f}"
+                )
+    elif label_mode == 'yield' and yield_target == 'chance':
         print(f"  {'Index':<6} {'True Chance':<12} {'Pred Chance':<12}")
         print(f"  {'-'*6} {'-'*12} {'-'*12}")
         for i in range(min(5, len(preds))):
@@ -438,13 +662,41 @@ def run_test(
 
     if visualize:
         n_viz = len(used_indices)
-        valid_starts = [dataset.valid_starts[i] for i in used_indices]
-        full_labels = torch.stack(
-            [dataset.label_tensor[i] for i in used_indices]
-        )
-        pred_cpu = preds.detach().cpu()
 
-        if label_mode == 'yield':
+        if label_mode == 'latent':
+            print(
+                f"\n📈 Visualizing latent current-price density "
+                f"({latent_dist}) as μ(t), σ(t) curves...",
+                flush=True,
+            )
+            interval = int(
+                config.get('max_latent_future_horizon')
+                or getattr(dataset, 'future_window', 50)
+            )
+            interval = max(interval, 120)
+            n_panels = min(4, max(1, n_viz))
+            seeds = list(used_indices[:n_panels])
+            latent_series = collect_latent_price_series(
+                model,
+                dataset,
+                seeds,
+                device=device,
+                batch_size=batch_size,
+                interval_minutes=interval,
+                lookback_minutes=60,
+                latent_distribution=latent_dist,
+            )
+            visualize_latent(
+                latent_series,
+                latent_distribution=latent_dist,
+                series_per_page=1,
+            )
+        elif label_mode == 'yield':
+            valid_starts = [dataset.valid_starts[i] for i in used_indices]
+            full_labels = torch.stack(
+                [dataset.label_tensor[i] for i in used_indices]
+            )
+            pred_cpu = preds.detach().cpu()
             print(
                 f"\n📈 Visualizing yield labels "
                 f"(yield_target={yield_target}) on test samples...",
@@ -479,6 +731,11 @@ def run_test(
                 label_std=getattr(dataset, '_label_stat_std', None),
             )
         else:
+            valid_starts = [dataset.valid_starts[i] for i in used_indices]
+            full_labels = torch.stack(
+                [dataset.label_tensor[i] for i in used_indices]
+            )
+            pred_cpu = preds.detach().cpu()
             print(
                 "\n📈 Visualizing label vs inferred trends on test samples...",
                 flush=True,

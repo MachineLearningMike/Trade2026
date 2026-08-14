@@ -47,7 +47,7 @@ optimizer = optim.Adam(model.parameters(), lr=1e-3)
 # ------------------------------------------------------------
 # 5. Generate training data directly on the device
 # ------------------------------------------------------------
-N = 200000
+N = 200_000
 X_train = torch.randn(N, 10, device=device)
 
 mean, std = 1.5, 0.5

@@ -10,11 +10,11 @@ config = {
     # ============================================================
     # DATA CONFIGURATION
     # ============================================================
-    'past_days': 3,     # 1, 2,
+    'past_days': 2,     # 1, 2,
     # future_window length is NOT set here — see label-mode horizons below:
     #   trend  → max_trend_future_horizon
     #   yield → max_hope_future_horizon
-    'step': 5,
+    'step': 3,
     'num_features': 5,
     'num_shapes': 4,
     'total_synthetic_days': 30,
@@ -64,9 +64,11 @@ config = {
     # ------------------------------------------------------------
     # LATENT (label=latent) — same model as trend/yield
     # ------------------------------------------------------------
-    # Parametric density for the scalar observation (see Basic/Predict_*):
-    #   'normal'  → output_dim=2  (mu, log_var)           Gaussian NLL
-    #   'student' → output_dim=3  (loc, log_scale, log_df) Student-t NLL
+    # Parametric density for the *current* price (last historical bar).
+    # The realized price is one sample from that latent law — not a forecast.
+    #   'normal'  → output_dim=2  (mu, var_raw)              Gaussian NLL
+    #   'student' → output_dim=3  (loc, scale_raw, df_raw)   Student-t NLL
+    # Scale channels use softplus internally (stable + learnable).
     # Aliases: normal_distribution, student_distribution, student_t, ...
     'latent_distribution': 'normal',
     # Optional future span; None → max_trend_future_horizon.
@@ -118,7 +120,7 @@ config = {
     'binance_interval': '1m',
     # Half-open-ish span in minutes: need end > start. Past window alone is
     # past_days * 1440 bars (e.g. 3 days → 4320) plus future_horizon.
-    'binance_start_date': '2026-01-01 00:00:00',
+    'binance_start_date': '2024-01-01 00:00:00',
     'binance_end_date': '2026-07-01 00:00:00',
     'binance_symbols': {
         "BTCUSDT": ["Close", "Volume"],
@@ -150,7 +152,7 @@ config = {
     # ============================================================
     'patch_size': 20,
     'embed_dim': None,  # AUTO-COMPUTED
-    'num_layers': 10,
+    'num_layers': 6,
     'num_heads': 10,
     'ff_dim_multiplier': 4,
     'dropout': 0.1,
@@ -161,6 +163,10 @@ config = {
     # HEAD CONFIGURATION
     # ============================================================
     'head_hidden_dim_multiplier': 4,
+    # If True, concat recent past prices p onto the flattened decoder
+    # tokens before the prediction head (adds n_max_past_horizon to
+    # head input_dim). If False, the head sees decoder tokens only.
+    'look_price': False,
     # Prediction head width. Must match label family:
     #   trend:   3 = (h,m,b),  2 = (m,b)
     #   yield:   2 = both;  1 = chance or wait  (forced from yield_target)
@@ -172,10 +178,12 @@ config = {
     # ============================================================
     'epochs': 200,
     'batch_size': 8,
-    'learning_rate': 0.0005,
+    'learning_rate': 0.00001,
     'save_every_n_minibatches': 5000,
     'checkpoint_dir': 'trading_checkpoints',
-    'max_checkpoints': 3,
+    # How many newest rolling weight files to keep (recency, not quality).
+    # Best-val snapshot is stored separately as best_val.pt and is not rotated.
+    'recent_checkpoints': 3,
     
     # ============================================================
     # DEVICE CONFIGURATION

@@ -275,8 +275,8 @@ def main(config):
             'normal_distribution', 'student_distribution', 'student_t',
         ],
         help=(
-            'Density for --label latent: normal → output_dim=2 (mu, log_var); '
-            'student → output_dim=3 (loc, log_scale, log_df)'
+            'Density for --label latent: normal → output_dim=2 (mu, var_raw); '
+            'student → output_dim=3 (loc, scale_raw, df_raw)'
         ),
     )
     parser.add_argument('--no-normalize', action='store_true', help='Disable per-window normalization')
@@ -302,6 +302,12 @@ def main(config):
                        help='Disable causal attention')
     parser.add_argument('--no-reconstruction', action='store_true', default=not config['use_reconstruction'],
                        help='Disable reconstruction auxiliary loss')
+    parser.add_argument(
+        '--no-look-price',
+        action='store_true',
+        default=not config.get('look_price', True),
+        help='Do not concat recent past prices p into the prediction head',
+    )
     parser.add_argument('--use-binance', action='store_true', default=config['use_binance_data'],
                        help='Use real Binance data instead of synthetic')
     parser.add_argument('--symbol', type=str, default=config.get('binance_primary_symbol', 'BTCUSDT'),
@@ -352,6 +358,7 @@ def main(config):
     config['head_hidden_dim_multiplier'] = args.head_hidden_dim_multiplier
     config['causal'] = not args.no_causal
     config['use_reconstruction'] = not args.no_reconstruction
+    config['look_price'] = not args.no_look_price
     config['use_binance_data'] = args.use_binance
     config['binance_primary_symbol'] = args.symbol
     config['train_ratio'] = args.train_ratio
@@ -761,6 +768,7 @@ def main(config):
     print(f"  FF dim multiplier: {config['ff_dim_multiplier']}")
     print(f"  Causal: {config['causal']}")
     print(f"  Use reconstruction: {config['use_reconstruction']}")
+    print(f"  look_price: {config.get('look_price', True)}")
     
     _model_past_len = int(
         getattr(dataset, 'model_past_len', resolve_model_past_len(config))
@@ -782,6 +790,7 @@ def main(config):
         output_dim=config['output_dim'],
         use_reconstruction=config['use_reconstruction'],
         num_shapes=config.get('num_shapes', 4),
+        look_price=config.get('look_price', True),
     )
 
     # Size report + one-step gradient coverage check at start
@@ -836,7 +845,10 @@ def main(config):
         enable_validation=config['validate'],
         validate_every_n_epochs=config['validate_every_n_epochs'],
         embed_dim=config['embed_dim'],
-        max_seq_len=config['max_seq_len']
+        max_seq_len=config['max_seq_len'],
+        recent_checkpoints=config.get(
+            'recent_checkpoints', config.get('max_checkpoints', 3)
+        ),
     )
     
     print("\n" + "=" * 60)

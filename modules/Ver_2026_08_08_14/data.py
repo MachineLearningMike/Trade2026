@@ -44,7 +44,7 @@ LABEL_FULL_DIM_LATENT = 1
 # Bump when label *implementation* changes but config params stay the same
 # (e.g. yield chance now on raw prices). Used only inside the pickle — never
 # hashed into generate_dataset_signature / checkpoint keys.
-LABEL_CACHE_ALGO_VERSION = 3  # v3: cache h_past_tensor for trend viz (no recompute)
+LABEL_CACHE_ALGO_VERSION = 5  # v5: latent target = current (last historical) price
 
 # Horizon search rules for find_trend (free OLS, no f[0] anchor).
 HORIZON_SEARCH_LONGEST_LINEAR = 'longest_linear'
@@ -1286,8 +1286,9 @@ class TradingDataset(Dataset):
                 label = torch.tensor([chance, wait], dtype=torch.float32)
                 h_past_list.append(0.0)
             elif self.label_mode == LABEL_LATENT:
-                # Scalar observation for density NLL (normal / student).
-                # Prefer z-scored prices like trend so the target is scale-free.
+                # Realized current price (history[-1]) as one draw from the
+                # latent price density. Window z-score keeps the observation
+                # scale-free across regimes; find() does not use the future.
                 from labels import Label_Latent
                 if self.normalize:
                     price_mean = mean[self.price_feature_idx]
@@ -1546,7 +1547,7 @@ class TradingDataset(Dataset):
         return (y - mean.to(y.device)) / (std.to(y.device) + 1e-8)
 
     def denormalize_y(self, y: torch.Tensor) -> torch.Tensor:
-        """Inverse of normalize_y for model-target vectors (dim = output_dim)."""
+        """Inverse of normalize_y for label-cache target vectors (not density params)."""
         device = y.device
         label_mean = self._label_stat_mean.to(device)
         label_std = self._label_stat_std.to(device)

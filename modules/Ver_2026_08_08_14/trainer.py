@@ -47,6 +47,7 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
         'output_dim': config.get('output_dim', 3),
         'causal': config.get('causal'),
         'use_reconstruction': config.get('use_reconstruction'),
+        'look_price': config.get('look_price', True),
     }
 
     param_string = json.dumps(key_params, sort_keys=True, default=str)
@@ -61,19 +62,61 @@ class TrainingState:
     """Manages saving and loading of complete training state with atomic writes."""
     
     def __init__(self, save_dir='trading_checkpoints', save_every_n_minibatches=100, 
-                 max_checkpoints=5, checkpoint_key=None):
+                 recent_checkpoints=5, checkpoint_key=None):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.save_every_n_minibatches = save_every_n_minibatches
-        self.max_checkpoints = max_checkpoints  # ← This was missing
-        
+        self.recent_checkpoints = int(recent_checkpoints)
+        self.best_val_loss = None
+        self.best_epoch = None
+
         if checkpoint_key:
             self.save_dir = self.save_dir / checkpoint_key
             self.save_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self.state_file = self.save_dir / 'training_state.json'
         self.checkpoint_key = checkpoint_key
         self.planned_total_epochs = None  # preserved across checkpoint saves
+        self._load_best_record()
+
+    def _load_best_record(self):
+        """Restore best-val bookkeeping from training_state.json if present."""
+        if not getattr(self, 'state_file', None) or not self.state_file.exists():
+            return
+        try:
+            with open(self.state_file, 'r') as f:
+                prev = json.load(f)
+            raw = prev.get('best_val_loss')
+            if raw is not None:
+                self.best_val_loss = float(raw)
+            raw_ep = prev.get('best_epoch')
+            if raw_ep is not None:
+                self.best_epoch = int(raw_ep)
+        except Exception:
+            pass
+
+    def _best_fields_from_state(self) -> dict:
+        """Best-val fields to preserve when rewriting training_state.json."""
+        out = {}
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, 'r') as f:
+                    prev = json.load(f)
+                for k in (
+                    'best_val_loss',
+                    'best_epoch',
+                    'best_checkpoint',
+                    'best_total_minibatches',
+                ):
+                    if k in prev:
+                        out[k] = prev[k]
+            except Exception:
+                pass
+        if self.best_val_loss is not None:
+            out['best_val_loss'] = self.best_val_loss
+        if self.best_epoch is not None:
+            out['best_epoch'] = self.best_epoch
+        return out
 
     def _list_checkpoint_files(self):
         """
@@ -99,8 +142,8 @@ class TrainingState:
             reverse=True
         )
         
-        # Keep only the most recent max_checkpoints files
-        for old_file in all_checkpoints[self.max_checkpoints:]:
+        # Keep only the newest recent_checkpoints files (not best-by-val).
+        for old_file in all_checkpoints[self.recent_checkpoints:]:
             try:
                 old_file.unlink()
                 print(f"🧹 Removed old checkpoint: {old_file.name}")
@@ -208,6 +251,7 @@ class TrainingState:
             'checkpoint_key': self.checkpoint_key,
             'total_epochs': preserved_total,
         }
+        state_info.update(self._best_fields_from_state())
         if training_finished:
             # epoch is 0-based index of last trained epoch
             state_info['completed_epochs'] = int(epoch) + 1
@@ -274,6 +318,108 @@ class TrainingState:
             if val_loss is not None:
                 print(f"  Val Loss: {val_loss:.4f}")
             print(f"{'='*60}")
+
+    def save_best_checkpoint(
+        self,
+        model,
+        optimizer,
+        dataloader_state,
+        epoch,
+        batch_idx,
+        total_minibatches_processed,
+        loss,
+        val_loss,
+        history=None,
+        embed_dim=None,
+        max_seq_len=None,
+    ) -> bool:
+        """
+        Replace best_val.pt when val_loss is strictly better (lower).
+
+        This file is not rotated by recent_checkpoints.
+        """
+        if val_loss is None:
+            return False
+        try:
+            val_f = float(val_loss)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(val_f):
+            return False
+        if self.best_val_loss is not None and val_f >= float(self.best_val_loss):
+            print(
+                f"  Val {val_f:.6f} did not beat best {float(self.best_val_loss):.6f} "
+                f"(epoch {self.best_epoch})"
+            )
+            return False
+
+        checkpoint = {
+            'version': 4,
+            'epoch': epoch,
+            'batch_idx': batch_idx,
+            'total_minibatches_processed': total_minibatches_processed,
+            'loss': loss,
+            'val_loss': val_f,
+            'history': history,
+            'training_finished': False,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'dataloader_state': dataloader_state,
+            'timestamp': time.time(),
+            'is_emergency': False,
+            'is_best': True,
+            'checkpoint_key': self.checkpoint_key,
+            'embed_dim': embed_dim,
+            'max_seq_len': max_seq_len,
+        }
+        dest = self.save_dir / BEST_CHECKPOINT_FILENAME
+        temp_file = dest.with_suffix('.tmp')
+        torch.save(checkpoint, temp_file)
+        try:
+            os.replace(temp_file, dest)
+        except (PermissionError, OSError):
+            import shutil
+            shutil.copy2(temp_file, dest)
+            try:
+                os.remove(temp_file)
+            except OSError:
+                pass
+
+        prev_best = self.best_val_loss
+        self.best_val_loss = val_f
+        self.best_epoch = int(epoch) + 1
+
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, 'r') as f:
+                    state_info = json.load(f)
+            except Exception:
+                state_info = {}
+        else:
+            state_info = {}
+        state_info['best_val_loss'] = val_f
+        state_info['best_epoch'] = self.best_epoch
+        state_info['best_checkpoint'] = str(dest)
+        state_info['best_total_minibatches'] = total_minibatches_processed
+        temp_state = self.state_file.with_suffix('.tmp')
+        with open(temp_state, 'w') as f:
+            json.dump(state_info, f, indent=2, default=str)
+        try:
+            os.replace(temp_state, self.state_file)
+        except (PermissionError, OSError):
+            pass
+
+        if prev_best is None:
+            print(
+                f"✓ Saved first best-val checkpoint → {dest.name}  "
+                f"(epoch {self.best_epoch}, val={val_f:.6f})"
+            )
+        else:
+            print(
+                f"✓ New best-val checkpoint → {dest.name}  "
+                f"(epoch {self.best_epoch}, val={val_f:.6f} < {float(prev_best):.6f})"
+            )
+        return True
     
     def mark_training_finished(self, model, optimizer, dataloader_state, epoch, batch_idx, 
                                total_minibatches_processed, loss, val_loss=None, history=None,
@@ -502,6 +648,7 @@ class TrainingState:
                 'total_minibatches': total_minibatches,
                 'loss': loss,
                 'val_loss': val_loss,
+                'best_val_loss': self.best_val_loss,
                 'history': history,
                 'latest_epoch_loss': latest_epoch_loss,
                 'dataloader_state': dataloader_state,
@@ -555,6 +702,11 @@ class TrainingState:
         print(f"  Loss: {loss:.4f}")
         if val_loss is not None:
             print(f"  Val Loss: {val_loss:.4f}")
+        if self.best_val_loss is not None:
+            print(
+                f"  Best val: {self.best_val_loss:.4f} "
+                f"(epoch {self.best_epoch})"
+            )
         
         return {
             'status': 'checkpoint',
@@ -563,6 +715,7 @@ class TrainingState:
             'total_minibatches': total_minibatches,
             'loss': loss,
             'val_loss': val_loss,
+            'best_val_loss': self.best_val_loss,
             'history': history,
             'latest_epoch_loss': latest_epoch_loss,
             'dataloader_state': dataloader_state,
@@ -670,6 +823,7 @@ class TrainingHistory:
 # ═══════════════════════════════════════════════════════════
 
 LATEST_EPOCH_LOSS_FILENAME = 'latest_epoch_loss.json'
+BEST_CHECKPOINT_FILENAME = 'best_val.pt'
 
 
 class LatestEpochLoss:
@@ -878,7 +1032,8 @@ class ResumableTrainer:
                 validate_every_n_epochs=1,
                 checkpoint_key=None,
                 embed_dim=None,
-                max_seq_len=None):
+                max_seq_len=None,
+                recent_checkpoints=None):
         self.dataset_signature = dataset_signature
         self.model = model.to(device)
         self.loss_fn = loss_fn
@@ -892,15 +1047,21 @@ class ResumableTrainer:
         self.enable_validation = enable_validation
         self.validate_every_n_epochs = validate_every_n_epochs
         
-        if checkpoint_key is None:
+        if checkpoint_key is None or recent_checkpoints is None:
             config = get_config()
-            checkpoint_key = generate_checkpoint_key(config, self.dataset_signature)
+            if checkpoint_key is None:
+                checkpoint_key = generate_checkpoint_key(config, self.dataset_signature)
+            if recent_checkpoints is None:
+                recent_checkpoints = config.get(
+                    'recent_checkpoints', config.get('max_checkpoints', 5)
+                )
         
         self.checkpoint_key = checkpoint_key
         
         self.state_manager = TrainingState(
             save_dir=save_dir,
             save_every_n_minibatches=save_every_n_minibatches,
+            recent_checkpoints=recent_checkpoints,
             checkpoint_key=checkpoint_key
         )
         
@@ -1029,6 +1190,7 @@ class ResumableTrainer:
                 
                 x, p, mean, std, shape, y = batch
                 x = x.to(self.device, non_blocking=True)
+                p = p.to(self.device, non_blocking=True)
                 y = y.to(self.device, non_blocking=True)
                 mean = mean.to(self.device, non_blocking=True)
                 std = std.to(self.device, non_blocking=True)
@@ -1405,6 +1567,22 @@ class ResumableTrainer:
                             f"Epoch {epoch + 1}/{num_epochs:g} - Loss: {train_loss:.4f}, "
                             f"Val Loss: {val_loss:.4f}"
                         )
+                        try:
+                            self.state_manager.save_best_checkpoint(
+                                model=self.model,
+                                optimizer=self.optimizer,
+                                dataloader_state=self.dataloader.get_state(),
+                                epoch=epoch,
+                                batch_idx=self.current_batch,
+                                total_minibatches_processed=self.total_minibatches_processed,
+                                loss=train_loss,
+                                val_loss=val_loss,
+                                history=self.history.to_dict(),
+                                embed_dim=getattr(self, 'embed_dim', None),
+                                max_seq_len=getattr(self, 'max_seq_len', None),
+                            )
+                        except Exception as e:
+                            print(f"⚠ Failed to save best-val checkpoint: {e}")
                     else:
                         partial_tag = "" if epoch_fully_done else " (partial)"
                         print(
@@ -1647,6 +1825,7 @@ class ResumableTrainer:
             # x: (B, F, T), p: (B, max_past_horizon), mean: (B, F, 1), std: (B, F, 1), shape: (B, F, 4), y: (B, output_dim)
             
             x = x.to(device, non_blocking=True)
+            p = p.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             mean = mean.to(device, non_blocking=True)
             std = std.to(device, non_blocking=True)
