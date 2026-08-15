@@ -1949,25 +1949,43 @@ def visualize_latent(
             if t_pred.size > 0:
                 mu_raw = np.asarray(rec['mu_raw'], dtype=np.float64)
                 sig_raw = np.asarray(rec['sigma_raw'], dtype=np.float64)
-                y_raw = np.asarray(rec.get('y_raw', []), dtype=np.float64)
+                p_at = np.asarray(rec.get('price_at_pred', []), dtype=np.float64)
+                lo_raw = mu_raw - sig_raw
+                hi_raw = mu_raw + sig_raw
                 ax_raw.plot(
-                    t_pred, mu_raw, color='#2E7D32', linewidth=2.0,
-                    label='μ(t)', zorder=4,
+                    t_pred, mu_raw, color='#2E7D32', linewidth=2.4,
+                    label='μ(t)', zorder=5,
+                )
+                # Band is μ±σ (not P±σ). Edges make the center obvious
+                # when μ sits close to the realized price.
+                ax_raw.plot(
+                    t_pred, hi_raw, color='#2E7D32', linewidth=1.0,
+                    linestyle='--', label='μ+σ', zorder=4,
+                )
+                ax_raw.plot(
+                    t_pred, lo_raw, color='#2E7D32', linewidth=1.0,
+                    linestyle='--', label='μ−σ', zorder=4,
                 )
                 ax_raw.fill_between(
-                    t_pred, mu_raw - sig_raw, mu_raw + sig_raw,
-                    color='#2E7D32', alpha=0.20, linewidth=0,
+                    t_pred, lo_raw, hi_raw,
+                    color='#2E7D32', alpha=0.16, linewidth=0,
                     label='μ ± σ', zorder=2,
                 )
-                if y_raw.size == t_pred.size:
+                if p_at.size == t_pred.size:
                     ax_raw.scatter(
-                        t_pred, y_raw, c='#6A1B9A', s=14, zorder=5,
-                        label='y → price (check)',
+                        t_pred, p_at, c='#1565C0', s=18, zorder=6,
+                        label='P at μ times',
                     )
+                ax_raw.scatter(
+                    t_pred, mu_raw, c='#2E7D32', s=18, marker='D', zorder=7,
+                    label='μ samples',
+                )
             ax_raw.axvline(x=0, color='gray', linestyle=':', linewidth=1.1, alpha=0.6)
+            align_mae = float(rec.get('align_mae', float('nan')))
             ax_raw.set_title(
                 f'Sample {sample_id}: raw price   '
-                f'|μ−P|={mu_mae:.4g}   label→P MAE={recon_mae:.4g}',
+                f'|μ−P|={mu_mae:.4g}   P-align={align_mae:.4g}   '
+                f'label→P MAE={recon_mae:.4g}',
                 fontsize=10,
             )
             ax_raw.set_ylabel('Price (raw)')
@@ -1982,13 +2000,23 @@ def visualize_latent(
                     t_pred, y_obs, color='#1565C0', linewidth=1.6,
                     label='y(t) realized', zorder=3,
                 )
+                lo_obs = mu_obs - sig_obs
+                hi_obs = mu_obs + sig_obs
                 ax_obs.plot(
-                    t_pred, mu_obs, color='#2E7D32', linewidth=2.0,
-                    label='μ(t)', zorder=4,
+                    t_pred, mu_obs, color='#2E7D32', linewidth=2.4,
+                    label='μ(t)', zorder=5,
+                )
+                ax_obs.plot(
+                    t_pred, hi_obs, color='#2E7D32', linewidth=1.0,
+                    linestyle='--', label='μ+σ', zorder=4,
+                )
+                ax_obs.plot(
+                    t_pred, lo_obs, color='#2E7D32', linewidth=1.0,
+                    linestyle='--', label='μ−σ', zorder=4,
                 )
                 ax_obs.fill_between(
-                    t_pred, mu_obs - sig_obs, mu_obs + sig_obs,
-                    color='#2E7D32', alpha=0.20, linewidth=0,
+                    t_pred, lo_obs, hi_obs,
+                    color='#2E7D32', alpha=0.16, linewidth=0,
                     label='μ ± σ', zorder=2,
                 )
                 ax_obs.plot(

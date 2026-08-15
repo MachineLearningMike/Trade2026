@@ -22,6 +22,7 @@ from labels import Label_Latent, resolve_latent_distribution
 from labels import decode_latent_params, latent_params_to_obs_space
 from trainer import generate_checkpoint_key
 from TRAIN import get_dataset
+from data import normalize_window
 
 
 # ═══════════════════════════════════════════════════════════
@@ -292,6 +293,42 @@ def _sample_current_time(dataset, idx: int) -> int:
     return int(dataset.valid_starts[idx]) + int(dataset.past_window) - 1
 
 
+def _item_at_current_bar(dataset, t_curr: int):
+    """
+    Build one model sample whose window *ends* on bar t_curr
+    (same last-historical-price convention as Label_Latent.find).
+    """
+    pw = int(dataset.past_window)
+    start = int(t_curr) - pw + 1
+    T = int(dataset.T)
+    if start < 0 or start + pw > T:
+        return None
+    x = dataset.Total[start:start + pw]
+    price_idx = int(dataset.price_feature_idx)
+    if dataset.normalize:
+        _, mean, std, shape = normalize_window(x, compute_moments=True)
+        std = std.clone()
+        std[std == 0] = 1
+        x_n = (x - mean) / std
+    else:
+        mean = torch.zeros(dataset.F)
+        std = torch.ones(dataset.F)
+        shape = torch.zeros(dataset.num_shapes, dataset.F)
+        x_n = x
+    n_p = int(
+        getattr(dataset, 'model_past_len', None)
+        or getattr(dataset, 'max_past_horizon', 0)
+        or 0
+    )
+    p = x_n[-n_p:, price_idx] if n_p else x_n.new_zeros(0)
+    y = dataset.normalize_y(x_n[-1, price_idx].reshape(1))
+    st = dataset.stats
+    mean_n = (mean - st['mean']['mean']) / (st['mean']['std'] + 1e-8)
+    std_n = (std - st['std']['mean']) / (st['std']['std'] + 1e-8)
+    shape_n = (shape - st['shape']['mean']) / (st['shape']['std'] + 1e-8)
+    return x_n, p, mean_n, std_n, shape_n, y, mean, std
+
+
 def collect_latent_price_series(
     model,
     dataset,
@@ -303,9 +340,9 @@ def collect_latent_price_series(
     latent_distribution: str = 'normal',
 ) -> List[dict]:
     """
-    For each seed sample, run the model on every dataset window whose
-    current bar falls in [t0 - lookback, t0 + interval] and return
-    raw-price series for visualize_latent.
+    For each seed sample, run the model at every bar in
+    [t0 - lookback, t0 + interval] (not only dataset.step) so μ(t)
+    shares P(t)'s 1-minute grid. Window ends on bar t (last historical).
     """
     model.eval()
     label_std = dataset._label_stat_std
@@ -313,7 +350,6 @@ def collect_latent_price_series(
     price_idx = int(dataset.price_feature_idx)
     pw = int(dataset.past_window)
     T = int(dataset.T)
-    starts = dataset.valid_starts
 
     series: List[dict] = []
     label_std_s = float(torch.as_tensor(label_std).reshape(-1)[0].abs().clamp(min=1e-8))
@@ -322,14 +358,11 @@ def collect_latent_price_series(
             t0 = _sample_current_time(dataset, seed)
             t_lo = t0 - int(lookback_minutes)
             t_hi = t0 + int(interval_minutes)
-            idxs = []
-            for i, s in enumerate(starts):
-                t = int(s) + pw - 1
-                if t_lo <= t <= t_hi:
-                    idxs.append(i)
-            if not idxs:
+            times = [
+                t for t in range(max(pw - 1, t_lo), min(T - 1, t_hi) + 1)
+            ]
+            if not times:
                 continue
-            idxs.sort(key=lambda i: int(starts[i]))
 
             mu_obs_parts = []
             sig_obs_parts = []
@@ -339,28 +372,45 @@ def collect_latent_price_series(
             y_raw_parts = []
             mu_raw_parts = []
             sig_raw_parts = []
-            for b0 in range(0, len(idxs), batch_size):
-                batch_idx = idxs[b0:b0 + batch_size]
-                x, p, y, mean, std, shape = _collate_batch(dataset, batch_idx)
-                x = x.to(device, non_blocking=True)
-                p = p.to(device, non_blocking=True)
-                mean = mean.to(device, non_blocking=True)
-                std = std.to(device, non_blocking=True)
-                shape = shape.to(device, non_blocking=True)
+            for b0 in range(0, len(times), batch_size):
+                bars = times[b0:b0 + batch_size]
+                xs, ps, ys, means, stds, shapes = [], [], [], [], [], []
+                raw_means, raw_stds = [], []
+                good_bars = []
+                for tc in bars:
+                    item = _item_at_current_bar(dataset, tc)
+                    if item is None:
+                        continue
+                    x, p, mean_n, std_n, shape_n, y, mean_r, std_r = item
+                    xs.append(x)
+                    ps.append(p)
+                    ys.append(y)
+                    means.append(mean_n)
+                    stds.append(std_n)
+                    shapes.append(shape_n)
+                    raw_means.append(mean_r)
+                    raw_stds.append(std_r)
+                    good_bars.append(tc)
+                if not xs:
+                    continue
+                x = torch.stack(xs).to(device, non_blocking=True)
+                p = torch.stack(ps).to(device, non_blocking=True)
+                y = torch.stack(ys)
+                mean = torch.stack(means).to(device, non_blocking=True)
+                std = torch.stack(stds).to(device, non_blocking=True)
+                shape = torch.stack(shapes).to(device, non_blocking=True)
                 pred, _, _ = model(x, p, mean, std, shape)
                 loc_n, scale_n, _df = decode_latent_params(
                     pred.detach(), latent_distribution=latent_distribution
                 )
-                # Same inverse as training: head space → cache observation space.
                 loc_n_cpu = loc_n.reshape(-1, 1).detach().cpu()
                 scale_n_cpu = scale_n.reshape(-1).detach().cpu()
                 loc_obs = dataset.denormalize_y(loc_n_cpu).reshape(-1)
                 scale_obs = scale_n_cpu * label_std_s
                 y_obs = dataset.denormalize_y(y.reshape(-1, 1)).reshape(-1)
 
-                idx_t = torch.as_tensor(batch_idx, dtype=torch.long)
-                win_mean = dataset.mean_tensor[idx_t, price_idx].cpu().float()
-                win_std = dataset.std_tensor[idx_t, price_idx].cpu().float()
+                win_mean = torch.stack(raw_means)[:, price_idx].cpu().float()
+                win_std = torch.stack(raw_stds)[:, price_idx].cpu().float()
                 win_std = torch.where(win_std == 0, torch.ones_like(win_std), win_std)
                 if normalize:
                     loc_raw = loc_obs * win_std + win_mean
@@ -377,8 +427,7 @@ def collect_latent_price_series(
                 mu_raw_parts.append(loc_raw)
                 sig_raw_parts.append(sig_raw)
                 y_raw_parts.append(y_raw)
-                for i in batch_idx:
-                    tc = _sample_current_time(dataset, i)
+                for tc in good_bars:
                     t_pred.append(tc - t0)
                     price_at.append(float(dataset.Total[tc, price_idx].item()))
                 del x, p, y, mean, std, shape, pred
@@ -389,13 +438,29 @@ def collect_latent_price_series(
             price_curve = dataset.Total[ctx_start:ctx_end, price_idx].detach().cpu().numpy()
             y_raw_np = torch.cat(y_raw_parts).numpy()
             price_at_np = np.asarray(price_at, dtype=np.float64)
+            t_pred_np = np.asarray(t_pred, dtype=np.float64)
+            # Dense P(t) at the same bars as μ(t): must match Total[current_bar].
+            align_err = []
+            for tp, p_at in zip(t_pred_np, price_at_np):
+                j = int(round(tp - t_price[0]))
+                if 0 <= j < len(price_curve):
+                    align_err.append(abs(float(price_curve[j]) - float(p_at)))
+            align_mae = float(np.mean(align_err)) if align_err else float('nan')
             recon_mae = float(np.mean(np.abs(y_raw_np - price_at_np)))
             mu_raw_np = torch.cat(mu_raw_parts).numpy()
+            lag_mae = {}
+            for lag in (-2, -1, 0, 1, 2):
+                errs = []
+                for tp, mu_v in zip(t_pred_np, mu_raw_np):
+                    bar = int(t0 + tp + lag)
+                    if 0 <= bar < T:
+                        errs.append(abs(float(mu_v) - float(dataset.Total[bar, price_idx])))
+                lag_mae[lag] = float(np.mean(errs)) if errs else float('nan')
             series.append({
                 'sample_id': seed,
                 't_price': t_price,
                 'price': np.asarray(price_curve, dtype=np.float64),
-                't_pred': np.asarray(t_pred, dtype=np.float64),
+                't_pred': t_pred_np,
                 'price_at_pred': price_at_np,
                 'y_obs': torch.cat(y_obs_parts).numpy(),
                 'mu_obs': torch.cat(mu_obs_parts).numpy(),
@@ -404,14 +469,25 @@ def collect_latent_price_series(
                 'mu_raw': mu_raw_np,
                 'sigma_raw': torch.cat(sig_raw_parts).numpy(),
                 'recon_mae': recon_mae,
+                'align_mae': align_mae,
                 'mu_mae_raw': float(np.mean(np.abs(mu_raw_np - price_at_np))),
+                'lag_mae': lag_mae,
             })
             print(
-                f"  latent series seed={seed}: n={len(idxs)}  "
+                f"  latent series seed={seed}: n={len(times)}  "
+                f"P-align MAE={align_mae:.4g}  "
                 f"label→price MAE={recon_mae:.4g}  "
-                f"|μ-P| MAE={series[-1]['mu_mae_raw']:.4g}",
+                f"|μ-P| MAE={series[-1]['mu_mae_raw']:.4g}  "
+                f"lag MAE "
+                + " ".join(f"Δ{k}={v:.4g}" for k, v in lag_mae.items()),
                 flush=True,
             )
+            if align_err and align_mae > 1e-4:
+                print(
+                    f"  ⚠ μ(t) and P(t) time grids disagree "
+                    f"(P-align MAE={align_mae:.4g})",
+                    flush=True,
+                )
     return series
 
 

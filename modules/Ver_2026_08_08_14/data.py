@@ -329,7 +329,7 @@ def generate_dataset_signature(config: dict) -> str:
         # --- train-split stats ---
         'train_ratio': train_ratio,
         'val_ratio': val_ratio,
-        'shuffle_split': config.get('shuffle_split', True),
+        'shuffle_split': config.get('shuffle_split', False),
     }
 
     param_string = json.dumps(key_params, sort_keys=True, default=str)
@@ -1020,7 +1020,7 @@ class TradingDataset(Dataset):
             test_ratio = 1.0 - train_ratio - val_ratio
             split_ratios = (train_ratio, val_ratio, test_ratio)
         self.split_ratios = split_ratios
-        self.shuffle_split = config.get('shuffle_split', True)
+        self.shuffle_split = config.get('shuffle_split', False)
         
         if data_dir is None:
             data_dir = config.get('data_dir', 'dataset_cache')
@@ -1187,6 +1187,8 @@ class TradingDataset(Dataset):
     
     def _create_splits(self):
         num_samples = len(self.valid_starts)
+        # valid_starts is already chronological. Shuffle only if requested;
+        # default is a time-ordered cut (train → val → test).
         indices = list(range(num_samples))
         
         if self.shuffle_split:
