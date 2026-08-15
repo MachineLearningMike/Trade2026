@@ -133,12 +133,66 @@ class TrainingState:
             list(self.save_dir.glob('checkpoint_*.pt'))
             + list(self.save_dir.glob('emergency_*.pt'))
         )
+
+    @staticmethod
+    def _step_from_ckpt_name(path: Path) -> int:
+        """Parse minibatch step from checkpoint_{step}_* or emergency_{step}_*."""
+        for part in Path(path).stem.split('_'):
+            if part.isdigit():
+                return int(part)
+        return -1
+
+    def _all_weight_files(self) -> List[Path]:
+        """Every resume candidate: rolling, emergency, and best_val.pt."""
+        files = self._list_checkpoint_files()
+        best = self.save_dir / BEST_CHECKPOINT_FILENAME
+        if best.exists():
+            files.append(best)
+        tagged = []
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, 'r') as f:
+                    state = json.load(f)
+                for key in ('latest_checkpoint', 'best_checkpoint'):
+                    p = state.get(key)
+                    if p and Path(p).exists():
+                        tagged.append(Path(p))
+            except Exception:
+                pass
+        seen = {f.resolve() for f in files}
+        for p in tagged:
+            if p.resolve() not in seen:
+                files.append(p)
+                seen.add(p.resolve())
+        return files
+
+    def _newest_weight_file(self) -> Optional[Path]:
+        """The .pt written last (mtime), among all save reasons."""
+        files = self._all_weight_files()
+        if not files:
+            return None
+        return max(files, key=lambda f: f.stat().st_mtime)
+
+    def _newest_rolling_checkpoint(self) -> Optional[Path]:
+        """Highest-step rolling/emergency file (cleanup / progress fallback)."""
+        files = self._list_checkpoint_files()
+        if not files:
+            return None
+        return max(
+            files,
+            key=lambda f: (self._step_from_ckpt_name(f), f.stat().st_mtime),
+        )
+
+    def _resolve_checkpoint_file(self, state_info: dict) -> Optional[Path]:
+        """Resume: load whichever weight file was saved most recently."""
+        del state_info
+        return self._newest_weight_file()
     
     def _cleanup_old_checkpoints(self):
         """Clean up old checkpoint files, keeping only the most recent ones."""
         all_checkpoints = sorted(
             self._list_checkpoint_files(),
-            key=lambda f: f.stat().st_mtime,
+            key=lambda f: (self._step_from_ckpt_name(f), f.stat().st_mtime),
             reverse=True
         )
         
@@ -576,7 +630,13 @@ class TrainingState:
             print(f"⚠ Failed to update total_epochs: {e}")
     
     def load_latest_checkpoint(self, model, optimizer, dataloader):
-        """Load the latest checkpoint from the most recent file."""
+        """
+        Load weights for resume / --extend.
+
+        Among rolling, emergency, finished, and best_val.pt, load the file
+        with the latest save time. Always applies model+optimizer weights,
+        including after a finished run.
+        """
         if not self.state_file.exists():
             return None
         
@@ -587,18 +647,20 @@ class TrainingState:
             print("⚠ State file corrupted. Starting fresh.")
             return None
         
-        # Find the most recent checkpoint file FIRST (we need it regardless).
-        # Matches both new names and legacy ``*_minibatch*`` files.
-        all_files = self._list_checkpoint_files()
-        
-        if not all_files:
+        latest_checkpoint = self._resolve_checkpoint_file(state_info)
+        if latest_checkpoint is None:
             print(f"⚠ No checkpoint files found in {self.save_dir}. Starting fresh.")
             return None
+
+        saved_at = time.strftime(
+            '%Y-%m-%d %H:%M:%S',
+            time.localtime(latest_checkpoint.stat().st_mtime),
+        )
+        print(
+            f"✓ Loading newest checkpoint: {latest_checkpoint.name} "
+            f"(saved {saved_at})"
+        )
         
-        latest_checkpoint = max(all_files, key=lambda f: f.stat().st_mtime)
-        print(f"Found checkpoint: {latest_checkpoint.name}")
-        
-        # Always load the checkpoint to get the full data
         try:
             checkpoint = torch.load(latest_checkpoint, map_location='cpu')
         except Exception as e:
@@ -628,34 +690,19 @@ class TrainingState:
                 pass
         is_emergency = checkpoint.get('is_emergency', False)
         dataloader_state = checkpoint.get('dataloader_state', None)
-        
-        # Check if training is finished
-        if state_info.get('training_finished', False):
-            print(f"✓ Training is already finished!")
-            print(f"  Key: {self.checkpoint_key}")
-            print(f"  Final checkpoint: {latest_checkpoint.name}")
-            print(f"  Total minibatches: {total_minibatches}")
-            print(f"  Loss: {loss:.4f}")
-            if val_loss is not None:
-                print(f"  Val Loss: {val_loss:.4f}")
-            
-            # Even though training is finished, we return the checkpoint data
-            # So the caller knows what was completed
-            return {
-                'status': 'finished',
-                'epoch': epoch,
-                'batch_idx': batch_idx,
-                'total_minibatches': total_minibatches,
-                'loss': loss,
-                'val_loss': val_loss,
-                'best_val_loss': self.best_val_loss,
-                'history': history,
-                'latest_epoch_loss': latest_epoch_loss,
-                'dataloader_state': dataloader_state,
-                'is_emergency': is_emergency,
-            }
-        
-        # Training is NOT finished - load model and optimizer
+        is_finished = bool(state_info.get('training_finished', False))
+
+        # Progress for the training *plan* comes from state when we load best_val
+        # (best may be an earlier epoch). Weights always come from the chosen file.
+        if latest_checkpoint.name == BEST_CHECKPOINT_FILENAME:
+            if state_info.get('completed_epochs') is not None:
+                epoch = max(int(epoch), int(state_info['completed_epochs']) - 1)
+            if state_info.get('total_minibatches_processed') is not None:
+                total_minibatches = max(
+                    int(total_minibatches),
+                    int(state_info['total_minibatches_processed']),
+                )
+
         try:
             model.load_state_dict(checkpoint['model_state_dict'], strict=True)
             print("✓ Loaded checkpoint with strict matching.")
@@ -686,17 +733,44 @@ class TrainingState:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             print("✓ Loaded optimizer state.")
         except Exception as e:
-            print(f"⚠ Failed to load optimizer state: {e}. Starting fresh.")
-            return None
+            print(f"⚠ Failed to load optimizer state: {e}. Starting with a fresh optimizer.")
         
-        if dataloader_state is not None:
+        if dataloader_state is not None and not is_finished:
             dataloader.restore_state(dataloader_state)
         
+        if is_finished:
+            print(f"✓ Training is already finished!")
+            print(f"  Key: {self.checkpoint_key}")
+            print(f"  Loaded file: {latest_checkpoint.name}")
+            print(f"  Total minibatches: {total_minibatches}")
+            print(f"  Loss: {loss:.4f}")
+            if val_loss is not None:
+                print(f"  Val Loss: {val_loss:.4f}")
+            if self.best_val_loss is not None:
+                print(
+                    f"  Best val: {self.best_val_loss:.4f} "
+                    f"(epoch {self.best_epoch})"
+                )
+            return {
+                'status': 'finished',
+                'epoch': epoch,
+                'batch_idx': batch_idx,
+                'total_minibatches': total_minibatches,
+                'loss': loss,
+                'val_loss': val_loss,
+                'best_val_loss': self.best_val_loss,
+                'history': history,
+                'latest_epoch_loss': latest_epoch_loss,
+                'dataloader_state': dataloader_state,
+                'is_emergency': is_emergency,
+            }
+
         if is_emergency:
             print(f"⚠ Resuming from EMERGENCY checkpoint")
         else:
             print(f"Resuming from checkpoint")
         print(f"  Key: {self.checkpoint_key}")
+        print(f"  File: {latest_checkpoint.name}")
         print(f"  Minibatch: {total_minibatches}")
         print(f"  Epoch {epoch+1}, batch {batch_idx}")
         print(f"  Loss: {loss:.4f}")
@@ -1266,9 +1340,8 @@ class ResumableTrainer:
         progress_cont = float(self.state_manager.get_progress_epochs(total_batches, continuous=True))
 
         if progress == 0 and progress_cont == 0:
-            checkpoint_files = self.state_manager._list_checkpoint_files()
-            if checkpoint_files:
-                latest = max(checkpoint_files, key=lambda f: f.stat().st_mtime)
+            latest = self.state_manager._newest_weight_file()
+            if latest:
                 try:
                     checkpoint = torch.load(latest, map_location="cpu", weights_only=False)
                     ep = int(checkpoint.get("epoch", 0))
@@ -1361,7 +1434,9 @@ class ResumableTrainer:
         
         if resume:
             result = self.state_manager.load_latest_checkpoint(
-                self.model, self.optimizer, self.dataloader
+                self.model,
+                self.optimizer,
+                self.dataloader,
             )
             
             if result:

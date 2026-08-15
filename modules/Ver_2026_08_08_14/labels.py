@@ -613,24 +613,19 @@ def resolve_latent_distribution(
 # Floor variance: label-normalized y has std ~ 1. If sigma -> 1e-4,
 # (y-mu)^2/sigma^2 explodes on typical shuffled residuals and NLL rises
 # for the rest of the epoch even though the data order is random.
-_VAR_EPS = 1e-4
 _VAR_MIN = 1e-3    # sigma >= ~0.032 in observation units
-_VAR_MAX = 1e2     # sigma <= 10
-_SCALE_EPS = 1e-4
 _SCALE_MIN = 1e-2
-_SCALE_MAX = 1e1
 _DF_SOFTPLUS_MAX = 20.0  # df in (2, 2+cap]
 
 
 def _gaussian_variance(var_raw: torch.Tensor) -> torch.Tensor:
-    """softplus(var_raw)+eps, clamped to a stable NLL range."""
-    var = F.softplus(var_raw) + _VAR_EPS
-    return var.clamp(_VAR_MIN, _VAR_MAX)
+    """True variance: softplus(var_raw) + _VAR_MIN (train and inference)."""
+    return F.softplus(var_raw) + _VAR_MIN
 
 
 def _student_scale(scale_raw: torch.Tensor) -> torch.Tensor:
-    scale = F.softplus(scale_raw) + _SCALE_EPS
-    return scale.clamp(_SCALE_MIN, _SCALE_MAX)
+    """True scale: softplus(scale_raw) + _SCALE_MIN (train and inference)."""
+    return F.softplus(scale_raw) + _SCALE_MIN
 
 
 def _gaussian_nll_loss(
@@ -641,8 +636,8 @@ def _gaussian_nll_loss(
     """
     NLL for diagonal Gaussian (Basic/Predict_normal_disttribution.py).
 
-    Head channel 1 is unconstrained ``var_raw``; variance is
-    ``softplus(var_raw)+eps`` clamped to [_VAR_MIN, _VAR_MAX].
+    Head channel 1 is unconstrained ``var_raw``.
+    True variance is ``softplus(var_raw) + _VAR_MIN`` (same at train and test).
     """
     finite = torch.isfinite(target) & torch.isfinite(mu) & torch.isfinite(var_raw)
     if not finite.any():
@@ -666,7 +661,7 @@ def _student_t_nll_loss(
     """
     NLL for Student-t (Basic/Predict_student_t_disttribution.py).
 
-    scale = clamp(softplus(scale_raw) + eps)
+    scale = softplus(scale_raw) + _SCALE_MIN
     df    = 2 + softplus(df_raw)  (capped)
     """
     finite = (

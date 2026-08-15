@@ -10,11 +10,11 @@ config = {
     # ============================================================
     # DATA CONFIGURATION
     # ============================================================
-    'past_days': 2,     # 1, 2,
+    'past_days': 3,     # 1, 2,
     # future_window length is NOT set here — see label-mode horizons below:
     #   trend  → max_trend_future_horizon
     #   yield → max_hope_future_horizon
-    'step': 3,
+    'step': 2,
     'num_features': 5,
     'num_shapes': 4,
     'total_synthetic_days': 30,
@@ -154,7 +154,7 @@ config = {
     # ============================================================
     'patch_size': 20,
     'embed_dim': None,  # AUTO-COMPUTED
-    'num_layers': 6,
+    'num_layers': 2,
     'num_heads': 10,
     'ff_dim_multiplier': 4,
     'dropout': 0.1,
@@ -178,9 +178,9 @@ config = {
     # ============================================================
     # TRAINING CONFIGURATION
     # ============================================================
-    'epochs': 200,
-    'batch_size': 8,
-    'learning_rate': 0.00001,
+    'epochs': 1,
+    'batch_size': 16,
+    'learning_rate': 0.0000001,
     'save_every_n_minibatches': 5000,
     'checkpoint_dir': 'trading_checkpoints',
     # How many newest rolling weight files to keep (recency, not quality).

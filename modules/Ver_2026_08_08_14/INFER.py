@@ -34,7 +34,11 @@ def find_checkpoint_by_key(
     key: Optional[str] = None,
 ) -> Optional[Tuple[str, str]]:
     """
-    Find checkpoint by key. If key is None, use the latest.
+    Checkpoint lookup for --test / INFER only (not training resume).
+
+    Prefer best_val.pt when it exists. Otherwise the newest remaining .pt
+    (rolling / emergency / finished). Resume uses a different rule: newest
+    save time among all files, including best_val.
 
     Returns:
         Tuple of (checkpoint_path, checkpoint_key) or None
