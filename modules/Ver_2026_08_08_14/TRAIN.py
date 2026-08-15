@@ -232,8 +232,10 @@ def main(config):
         '--test', nargs='?', const=-1, default=None, type=int, metavar='N',
         help=(
             'Run test-set evaluation without training (same as INFER.py). '
-            '--test uses all shuffled test samples; --test N uses N shuffled '
-            'test samples. Batch size is config test_batch_size.'
+            '--test uses all test samples; --test N uses N samples spaced '
+            'across the chronological test period (not a fixed-seed head). '
+            'Batch size is config test_batch_size; latent viz count is '
+            'config test_viz_samples.'
         ),
     )
     parser.add_argument('--past-days', type=int, default=config['past_days'], help='Past days for input')

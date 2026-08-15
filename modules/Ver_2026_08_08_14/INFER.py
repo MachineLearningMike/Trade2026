@@ -188,6 +188,83 @@ def _collate_batch(dataset, indices: List[int]):
     )
 
 
+def _evenly_spaced_indices(indices: List[int], n: int) -> List[int]:
+    """
+    Pick n indices covering the full span of `indices` (in the given order).
+
+    Used so --test N and latent viz seeds are spread across the test period
+    instead of clustering on the head of a fixed-seed shuffle.
+    """
+    if n <= 0 or not indices:
+        return []
+    if n >= len(indices):
+        return list(indices)
+    if n == 1:
+        return [indices[len(indices) // 2]]
+    # Inclusive endpoints: first and last of the ordered list.
+    out: List[int] = []
+    last = len(indices) - 1
+    for i in range(n):
+        pos = int(round(i * last / (n - 1)))
+        out.append(indices[pos])
+    # Deduplicate while preserving order (can happen when n is close to len).
+    seen = set()
+    unique: List[int] = []
+    for idx in out:
+        if idx not in seen:
+            seen.add(idx)
+            unique.append(idx)
+    # If rounding collapsed slots, fill from unused positions.
+    if len(unique) < n:
+        for idx in indices:
+            if idx not in seen:
+                seen.add(idx)
+                unique.append(idx)
+            if len(unique) >= n:
+                break
+    return unique
+
+
+def _select_test_indices(
+    dataset,
+    max_samples: Optional[int] = None,
+    shuffle: bool = True,
+    seed: int = 42,
+) -> List[int]:
+    """
+    Choose which dataset indices to evaluate on the test split.
+
+    When max_samples is set, take an evenly spaced subset of the *chronological*
+    test split so metrics/viz cover early, mid, and late test windows — not
+    just whatever lands first after seed=42 shuffle.
+    Presentation order may still be shuffled for batching.
+    """
+    # Chronological order of the test split (valid_starts order when
+    # shuffle_split=False; arbitrary but stable otherwise).
+    chronological = sorted(dataset.test_indices)
+    if not chronological:
+        return []
+
+    if max_samples is not None and max_samples < len(chronological):
+        selected = _evenly_spaced_indices(chronological, int(max_samples))
+        print(
+            f"  (using {len(selected)} test samples spaced across the "
+            f"{len(chronological)}-window test period)",
+            flush=True,
+        )
+    else:
+        selected = list(chronological)
+        print(
+            f"  (using all {len(selected)} test samples)",
+            flush=True,
+        )
+
+    if shuffle and len(selected) > 1:
+        rng = random.Random(seed)
+        rng.shuffle(selected)
+    return selected
+
+
 def run_inference_on_test_set(
     model,
     dataset,
@@ -218,16 +295,12 @@ def run_inference_on_test_set(
     """
     model.eval()
 
-    test_indices = list(dataset.test_indices)
-    if shuffle:
-        rng = random.Random(seed)
-        rng.shuffle(test_indices)
-
-    if max_samples is not None and max_samples < len(test_indices):
-        test_indices = test_indices[:max_samples]
-        print(f"  (using {max_samples} shuffled test samples)", flush=True)
-    else:
-        print(f"  (using all {len(test_indices)} shuffled test samples)", flush=True)
+    test_indices = _select_test_indices(
+        dataset,
+        max_samples=max_samples,
+        shuffle=shuffle,
+        seed=seed,
+    )
 
     n = len(test_indices)
     if n == 0:
@@ -510,9 +583,11 @@ def run_test(
 
     Args:
         config: Full training/inference config (same as TRAIN).
-        max_samples: If set, evaluate this many shuffled test samples;
-                     otherwise evaluate the full shuffled test split.
-        visualize: If True, plot a few labeled future trends after metrics.
+        max_samples: If set, evaluate this many test samples spaced across
+                     the chronological test period; otherwise evaluate all.
+        visualize: If True, plot labeled trends / latent series after metrics.
+                     Latent seeds use config['test_viz_samples'] windows spaced
+                     across the evaluated set (not only the first few).
 
     Batch size always comes from config['test_batch_size']
     (falls back to validate_batch_size, then batch_size).
@@ -754,8 +829,22 @@ def run_test(
                 or getattr(dataset, 'future_window', 50)
             )
             interval = max(interval, 120)
-            n_panels = min(4, max(1, n_viz))
-            seeds = list(used_indices[:n_panels])
+            # Space seeds across the evaluated test period (chronological
+            # valid_starts), not the first few after shuffle — otherwise
+            # Next only cycles a handful of near-duplicate windows.
+            n_want = int(config.get('test_viz_samples', 16))
+            n_seeds = min(max(1, n_want), max(1, n_viz))
+            chrono_used = sorted(
+                used_indices,
+                key=lambda i: int(dataset.valid_starts[i]),
+            )
+            seeds = _evenly_spaced_indices(chrono_used, n_seeds)
+            print(
+                f"  Latent viz seeds: {len(seeds)} windows spaced across "
+                f"{n_viz} evaluated test samples "
+                f"(config test_viz_samples={n_want})",
+                flush=True,
+            )
             latent_series = collect_latent_price_series(
                 model,
                 dataset,

@@ -39,6 +39,10 @@ config = {
     # TEST / INFERENCE CONFIGURATION
     # ============================================================
     'test_batch_size': 16,
+    # How many distinct test windows to precompute for latent μ(t)/σ(t)
+    # visualization after --test. Seeds are spaced across the test period
+    # (not the first few after a fixed shuffle).
+    'test_viz_samples': 16,
     
     # ============================================================
     # LABEL FAMILY
@@ -180,7 +184,7 @@ config = {
     # ============================================================
     'epochs': 1,
     'batch_size': 16,
-    'learning_rate': 0.0000001,
+    'learning_rate': 0.00001,
     'save_every_n_minibatches': 5000,
     'checkpoint_dir': 'trading_checkpoints',
     # How many newest rolling weight files to keep (recency, not quality).
