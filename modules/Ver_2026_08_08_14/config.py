@@ -10,7 +10,7 @@ config = {
     # ============================================================
     # DATA CONFIGURATION
     # ============================================================
-    'past_days': 3,     # 1, 2,
+    'past_days': 2,     # 1, 2,
     # future_window length is NOT set here — see label-mode horizons below:
     #   trend  → max_trend_future_horizon
     #   yield → max_hope_future_horizon
@@ -33,12 +33,12 @@ config = {
     # ============================================================
     'validate': True,
     'validate_every_n_epochs': 1,
-    'validate_batch_size': 16,
+    'validate_batch_size': 32,
 
     # ============================================================
     # TEST / INFERENCE CONFIGURATION
     # ============================================================
-    'test_batch_size': 16,
+    'test_batch_size': 32,
     # How many distinct test windows to precompute for latent μ(t)/σ(t)
     # visualization after --test. Seeds are spaced across the test period
     # (not the first few after a fixed shuffle).
@@ -70,14 +70,16 @@ config = {
     # ------------------------------------------------------------
     # LATENT (label=latent) — same model as trend/yield
     # ------------------------------------------------------------
-    # Parametric density for the *current* price (last historical bar).
-    # The realized price is one sample from that latent law — not a forecast.
+    # Parametric density for the *next* bar (future[0] after the history
+    # window). The realized next price is one sample from that latent law;
+    # the head outputs density params, not a point forecast (NLL loss).
     #   'normal'  → output_dim=2  (mu, var_raw)              Gaussian NLL
     #   'student' → output_dim=3  (loc, scale_raw, df_raw)   Student-t NLL
     # Scale channels use softplus internally (stable + learnable).
     # Aliases: normal_distribution, student_distribution, student_t, ...
     'latent_distribution': 'normal',
     # Optional future span; None → max_trend_future_horizon.
+    # Must be >= 1 so future[0] exists for the latent observation.
     'max_latent_future_horizon': None,
     'latent_loss_weight': 1.0,
 
@@ -158,7 +160,7 @@ config = {
     # ============================================================
     'patch_size': 20,
     'embed_dim': None,  # AUTO-COMPUTED
-    'num_layers': 2,
+    'num_layers': 8,
     'num_heads': 10,
     'ff_dim_multiplier': 4,
     'dropout': 0.1,
@@ -182,9 +184,9 @@ config = {
     # ============================================================
     # TRAINING CONFIGURATION
     # ============================================================
-    'epochs': 1,
+    'epochs': 12,
     'batch_size': 16,
-    'learning_rate': 0.00001,
+    'learning_rate': 0.00005, # 0.0000001 gives the similar speed as 0.0000001 x 100
     'save_every_n_minibatches': 5000,
     'checkpoint_dir': 'trading_checkpoints',
     # How many newest rolling weight files to keep (recency, not quality).
