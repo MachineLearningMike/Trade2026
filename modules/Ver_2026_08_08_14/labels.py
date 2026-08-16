@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch.distributions import StudentT
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
+from scipy import special
 
 # Default label fitness threshold (overridden by config['fitness_threshold']).
 LABEL_FITNESS_THRESHOLD = 0.75
@@ -454,6 +455,18 @@ class Label_Yield:
             return ('wait',)
         raise ValueError(f"Unknown yield_target {yt!r}")
 
+    @staticmethod
+    def _as_1d_float64(x) -> np.ndarray:
+        """Host 1-D float64 view; accepts torch / numpy / list / scalar."""
+        if x is None:
+            return np.zeros(0, dtype=np.float64)
+        if torch.is_tensor(x):
+            # Single-series label: no GPU benefit; one host transfer, then numpy.
+            # Keep full precision (do not cast through float32).
+            arr = x.detach().reshape(-1).to(dtype=torch.float64).cpu().numpy()
+            return np.asarray(arr, dtype=np.float64)
+        return np.asarray(x, dtype=np.float64).reshape(-1)
+
     @classmethod
     def find(
         cls,
@@ -466,31 +479,48 @@ class Label_Yield:
         """
         Thresholded yield events vs the last raw price history[-1].
 
+        Single-series only (not batched). Inputs may be torch / numpy / list;
+        they are converted once to host float64, then computed in numpy
+        (no per-bar tensor casts or GPU syncs).
+
         Always computes both chance and wait. Return shape:
           - default / cache (yield_target None or 'both'): (chance, wait)
           - yield_target='chance'|'wait': single-component tuple
 
         Prefer always caching (chance, wait) and slicing via target_slice.
         """
-        n = int(future.shape[0])
+        fut = cls._as_1d_float64(future)
+        hist = cls._as_1d_float64(history)
+
+        n = int(fut.shape[0])
         if max_hope_future_horizon is not None:
             n = min(n, max(0, int(max_hope_future_horizon)))
 
-        chance = 0.0
-        wait = 0.0
-        empty = n == 0 or history.numel() == 0
-        if not empty:
-            current = history[-1]
+        chance, wait = 0.0, 0.0
+
+        if n > 0 and hist.size > 0:
+            current = float(hist[-1])
             eps = 1e-8
-            denom = current if abs(float(current)) > eps else (
-                current + eps if float(current) >= 0 else current - eps
-            )
+            if abs(current) > eps:
+                denom = current
+            else:
+                denom = current + eps if current >= 0.0 else current - eps
+
+            # Note softplus is intuitively active over (-4, +infinity). It's almost linear over 4.0.
+            # softplus(-4, 0, 4) = (0.0181, 0.6931, 4.0181)
+            # I want to scale the surplus yield 
+            _yield = (fut[:n] - current) / denom * 100.0
+            # (-limit, 0) yield will map to (-4, 0), which belongs to the active interval of softplus.
+            gentle = 0.3    # How gently to ignore negative yield.
+            scaled_yield = _yield * 4.0 / gentle     # linearly scalled yield
+            cared_yield = special.softplus(scaled_yield)  # This gently ignores negative yield.
+            # scipy.special.expit([60, 30, 0, -1, -2, -3, -4]) =[1, 1, 0.5, 0.26, 0.11, 0.047, 0.018]
+            warmingup = 8.0
+            visibility = special.expit(np.array(reversed(range(n)) - warmingup / 2))
+
             for t in range(n):
-                yv = float(((future[t] - current) / denom) * 100)
-                if yv <= min_yield_percent:
-                    continue
-                chance += (yv - min_yield_percent)
-                wait += np.sin(t/n * np.pi) / (yv - min_yield_percent + eps)
+                chance += cared_yield[t] * visibility[t]
+
 
         full = (float(chance), float(wait))
         if yield_target is None:
@@ -749,11 +779,12 @@ def latent_params_to_obs_space(
 
 class Label_Latent:
     """
-    Latent labels: infer a density for the *current* price (last historical bar).
+    Latent labels: infer a density for the *next* bar (first future price).
 
-    The realized current price is treated as one sample from a latent price
-    law. The model does not forecast a future price — it outputs the
-    parameters of that law from market history.
+    The realized observation is ``future[0]`` — one sample from a latent
+    price law conditioned on the historical window. The model outputs the
+    parameters of that law from market history (it does not emit a point
+    forecast; the NLL trains the density against the realized next bar).
 
     Config id: 'latent'
     Shares ``model.MarketTransformerWithHeads`` with trend/yield.
@@ -763,7 +794,7 @@ class Label_Latent:
       'student' → y_pred (B, 3) = (loc, scale_raw, df_raw)
                   scale = softplus(scale_raw)+eps; df = 2+softplus(df_raw)
 
-    Label cache stores the realized current price (dim 1). Model ``output_dim``
+    Label cache stores the realized next-bar price (dim 1). Model ``output_dim``
     is forced from the density mode (2 or 3). ``y_pred`` and ``y_truth``
     therefore have different last dims by design — loss is NLL, not MSE.
     """
@@ -810,9 +841,10 @@ class Label_Latent:
 
     @classmethod
     def resolve_future_window(cls, config: dict) -> int:
+        # Need at least 1 future bar so find() can return future[0].
         if config.get('max_latent_future_horizon') is not None:
-            return int(config['max_latent_future_horizon'])
-        return int(config.get('max_trend_future_horizon', 50))
+            return max(1, int(config['max_latent_future_horizon']))
+        return max(1, int(config.get('max_trend_future_horizon', 50)))
 
     @classmethod
     def resolve_model_past_len(cls, config: dict) -> int:
@@ -862,26 +894,29 @@ class Label_Latent:
         **_kwargs,
     ):
         """
-        Realized current price: last bar of ``history``.
+        Realized next-bar price: first bar of ``future`` (``future[0]``).
 
         That price is the observation the density is fitted to — one draw
-        from the latent current-price law. ``future`` is ignored (kept so
-        data.py can call find the same way as trend/yield).
+        from the latent next-bar law, conditioned on ``history``. ``history``
+        is unused for the scalar itself (kept so data.py can call find the
+        same way as trend/yield).
 
         data.py may pass window-z-scored prices; this still returns
-        ``history[-1]`` in that space.
+        ``future[0]`` in that space.
         """
-        del future
-        if history is None:
+        del history
+        if future is None:
             return (0.0,)
-        hist = (
-            history.reshape(-1)
-            if hasattr(history, 'reshape')
-            else torch.as_tensor(history).reshape(-1)
-        )
-        if hist.numel() == 0:
+        # Accept torch / numpy / list; always index the first future bar.
+        if torch.is_tensor(future):
+            fut = future.reshape(-1)
+            if fut.numel() == 0:
+                return (0.0,)
+            return (float(fut[0].item()),)
+        fut = np.asarray(future).reshape(-1)
+        if fut.size == 0:
             return (0.0,)
-        return (float(hist[-1].item()),)
+        return (float(fut[0]),)
 
     @classmethod
     def make_auxiliary(cls, config: Optional[dict] = None, **overrides) -> dict:
@@ -921,7 +956,7 @@ class Label_Latent:
           normal  → (B, 2) = (mu, var_raw)
           student → (B, 3) = (location, scale_raw, df_raw)
         y_truth:
-          (B,) or (B, 1) realized current price (cache dim 1)
+          (B,) or (B, 1) realized next-bar price future[0] (cache dim 1)
         """
         aux = auxiliary or {}
         weight = float(aux.get('latent_weight', 1.0))
@@ -1871,14 +1906,15 @@ def visualize_latent(
     **_ignored,
 ):
     """
-    Visualize the latent current-price density as μ(t), σ(t) over an interval.
+    Visualize the latent next-bar density as μ(t), σ(t) over an interval.
 
     Each series uses two stacked axes (same time):
       top    — raw price P(t), μ_raw(t), μ±σ band
       bottom — observation-space y(t), μ(t), σ(t)
                (this is the space the density is actually fitted in)
 
-    t=0 is the seed sample's current bar (last historical price).
+    t=0 is the seed sample's observation bar (``future[0]`` / next bar after
+    the historical window). μ(t) is the density for P(t) = that next bar.
     """
     del _ignored
     dist = resolve_latent_distribution(
@@ -2024,16 +2060,16 @@ def visualize_latent(
                 f'Sample {sample_id}: observation space (density units)',
                 fontsize=10,
             )
-            ax_obs.set_xlabel('Time (min; t=0 = seed current bar)')
+            ax_obs.set_xlabel('Time (min; t=0 = seed observation bar, future[0])')
             ax_obs.set_ylabel('y, μ, σ')
             ax_obs.grid(True, alpha=0.3)
             ax_obs.legend(fontsize=7, loc='best')
 
         page_label = f'Page {page}/{n_pages}'
         fig.suptitle(
-            f'Latent current-price density ({dist})  |  {page_label}\n'
+            f'Latent next-bar density ({dist})  |  {page_label}\n'
             f'top: raw P(t) and inverted μ,σ   ·   '
-            f'bottom: real μ(t), σ(t) next to realized y(t)'
+            f'bottom: real μ(t), σ(t) next to realized y(t)=future[0]'
             + ('   ·   [Next] / [Quit]' if interactive else ''),
             fontsize=11, fontweight='bold',
         )

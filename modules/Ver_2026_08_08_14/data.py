@@ -44,7 +44,7 @@ LABEL_FULL_DIM_LATENT = 1
 # Bump when label *implementation* changes but config params stay the same
 # (e.g. yield chance now on raw prices). Used only inside the pickle — never
 # hashed into generate_dataset_signature / checkpoint keys.
-LABEL_CACHE_ALGO_VERSION = 5  # v5: latent target = current (last historical) price
+LABEL_CACHE_ALGO_VERSION = 6  # v6: latent target = future[0] (next bar after history)
 
 # Horizon search rules for find_trend (free OLS, no f[0] anchor).
 HORIZON_SEARCH_LONGEST_LINEAR = 'longest_linear'
@@ -1288,9 +1288,10 @@ class TradingDataset(Dataset):
                 label = torch.tensor([chance, wait], dtype=torch.float32)
                 h_past_list.append(0.0)
             elif self.label_mode == LABEL_LATENT:
-                # Realized current price (history[-1]) as one draw from the
-                # latent price density. Window z-score keeps the observation
-                # scale-free across regimes; find() does not use the future.
+                # Realized next bar (future[0]) as one draw from the latent
+                # price density. Window z-score (from history) keeps the
+                # observation scale-free across regimes; find() returns
+                # future[0] in that space.
                 from labels import Label_Latent
                 if self.normalize:
                     price_mean = mean[self.price_feature_idx]

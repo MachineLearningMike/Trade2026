@@ -365,20 +365,30 @@ def run_inference_on_test_set(
     return preds, labels, test_indices
 
 
-def _sample_current_time(dataset, idx: int) -> int:
-    """Bar index of the realized current price (last historical bar)."""
-    return int(dataset.valid_starts[idx]) + int(dataset.past_window) - 1
-
-
-def _item_at_current_bar(dataset, t_curr: int):
+def _sample_observation_time(dataset, idx: int) -> int:
     """
-    Build one model sample whose window *ends* on bar t_curr
-    (same last-historical-price convention as Label_Latent.find).
+    Bar index of the latent observation (``future[0]``).
+
+    History window is ``[start, start + past_window)``; observation is the
+    first future bar at ``start + past_window`` — matches Label_Latent.find.
+    """
+    return int(dataset.valid_starts[idx]) + int(dataset.past_window)
+
+
+def _item_at_observation_bar(dataset, t_obs: int):
+    """
+    Build one model sample whose latent observation is bar ``t_obs``.
+
+    History is ``Total[t_obs - past_window : t_obs]`` (ends one bar before
+    the observation). Label is window-z of ``Total[t_obs]`` = future[0],
+    then dataset label-normalized — same convention as Label_Latent.find
+    + data.py latent labeling.
     """
     pw = int(dataset.past_window)
-    start = int(t_curr) - pw + 1
+    start = int(t_obs) - pw
     T = int(dataset.T)
-    if start < 0 or start + pw > T:
+    # Need full history and the observation bar itself.
+    if start < 0 or t_obs < 0 or t_obs >= T or start + pw > T:
         return None
     x = dataset.Total[start:start + pw]
     price_idx = int(dataset.price_feature_idx)
@@ -387,18 +397,21 @@ def _item_at_current_bar(dataset, t_curr: int):
         std = std.clone()
         std[std == 0] = 1
         x_n = (x - mean) / std
+        # future[0] in the same window-z space as the label cache
+        obs_win = (dataset.Total[t_obs, price_idx] - mean[price_idx]) / std[price_idx]
     else:
         mean = torch.zeros(dataset.F)
         std = torch.ones(dataset.F)
         shape = torch.zeros(dataset.num_shapes, dataset.F)
         x_n = x
+        obs_win = dataset.Total[t_obs, price_idx]
     n_p = int(
         getattr(dataset, 'model_past_len', None)
         or getattr(dataset, 'max_past_horizon', 0)
         or 0
     )
     p = x_n[-n_p:, price_idx] if n_p else x_n.new_zeros(0)
-    y = dataset.normalize_y(x_n[-1, price_idx].reshape(1))
+    y = dataset.normalize_y(obs_win.reshape(1).float())
     st = dataset.stats
     mean_n = (mean - st['mean']['mean']) / (st['mean']['std'] + 1e-8)
     std_n = (std - st['std']['mean']) / (st['std']['std'] + 1e-8)
@@ -417,9 +430,12 @@ def collect_latent_price_series(
     latent_distribution: str = 'normal',
 ) -> List[dict]:
     """
-    For each seed sample, run the model at every bar in
+    For each seed sample, run the model at every observation bar in
     [t0 - lookback, t0 + interval] (not only dataset.step) so μ(t)
-    shares P(t)'s 1-minute grid. Window ends on bar t (last historical).
+    shares P(t)'s 1-minute grid.
+
+    At each t, history ends at t-1 and the density targets P(t)=future[0]
+    (Label_Latent.find). t0 is the seed sample's observation bar.
     """
     model.eval()
     label_std = dataset._label_stat_std
@@ -432,11 +448,12 @@ def collect_latent_price_series(
     label_std_s = float(torch.as_tensor(label_std).reshape(-1)[0].abs().clamp(min=1e-8))
     with torch.no_grad():
         for seed in seed_indices:
-            t0 = _sample_current_time(dataset, seed)
+            t0 = _sample_observation_time(dataset, seed)
             t_lo = t0 - int(lookback_minutes)
             t_hi = t0 + int(interval_minutes)
+            # Observation bar needs pw bars of history before it.
             times = [
-                t for t in range(max(pw - 1, t_lo), min(T - 1, t_hi) + 1)
+                t for t in range(max(pw, t_lo), min(T - 1, t_hi) + 1)
             ]
             if not times:
                 continue
@@ -454,8 +471,8 @@ def collect_latent_price_series(
                 xs, ps, ys, means, stds, shapes = [], [], [], [], [], []
                 raw_means, raw_stds = [], []
                 good_bars = []
-                for tc in bars:
-                    item = _item_at_current_bar(dataset, tc)
+                for to in bars:
+                    item = _item_at_observation_bar(dataset, to)
                     if item is None:
                         continue
                     x, p, mean_n, std_n, shape_n, y, mean_r, std_r = item
@@ -467,7 +484,7 @@ def collect_latent_price_series(
                     shapes.append(shape_n)
                     raw_means.append(mean_r)
                     raw_stds.append(std_r)
-                    good_bars.append(tc)
+                    good_bars.append(to)
                 if not xs:
                     continue
                 x = torch.stack(xs).to(device, non_blocking=True)
@@ -504,9 +521,10 @@ def collect_latent_price_series(
                 mu_raw_parts.append(loc_raw)
                 sig_raw_parts.append(sig_raw)
                 y_raw_parts.append(y_raw)
-                for tc in good_bars:
-                    t_pred.append(tc - t0)
-                    price_at.append(float(dataset.Total[tc, price_idx].item()))
+                for to in good_bars:
+                    t_pred.append(to - t0)
+                    # P at observation bar = future[0] target
+                    price_at.append(float(dataset.Total[to, price_idx].item()))
                 del x, p, y, mean, std, shape, pred
 
             ctx_start = max(0, t_lo)
@@ -516,7 +534,7 @@ def collect_latent_price_series(
             y_raw_np = torch.cat(y_raw_parts).numpy()
             price_at_np = np.asarray(price_at, dtype=np.float64)
             t_pred_np = np.asarray(t_pred, dtype=np.float64)
-            # Dense P(t) at the same bars as μ(t): must match Total[current_bar].
+            # Dense P(t) at the same bars as μ(t): must match Total[observation].
             align_err = []
             for tp, p_at in zip(t_pred_np, price_at_np):
                 j = int(round(tp - t_price[0]))
@@ -745,7 +763,7 @@ def run_test(
         scale_obs = scale_obs.reshape(-1).to(y_obs.device)
         if df_t is None:
             print(
-                f"  {'Index':<6} {'y (obs)':<12} {'μ (obs)':<12} {'σ (obs)':<12}"
+                f"  {'Index':<6} {'y future[0]':<12} {'μ (obs)':<12} {'σ (obs)':<12}"
             )
             print(f"  {'-'*6} {'-'*12} {'-'*12} {'-'*12}")
             for i in range(min(5, len(preds))):
@@ -756,7 +774,7 @@ def run_test(
         else:
             df_flat = df_t.reshape(-1)
             print(
-                f"  {'Index':<6} {'True price':<12} {'Pred loc':<12} "
+                f"  {'Index':<6} {'y future[0]':<12} {'Pred loc':<12} "
                 f"{'Pred scale':<12} {'Pred df':<10}"
             )
             print(f"  {'-'*6} {'-'*12} {'-'*12} {'-'*12} {'-'*10}")
@@ -820,8 +838,9 @@ def run_test(
 
         if label_mode == 'latent':
             print(
-                f"\n📈 Visualizing latent current-price density "
-                f"({latent_dist}) as μ(t), σ(t) curves...",
+                f"\n📈 Visualizing latent next-bar density "
+                f"({latent_dist}) as μ(t), σ(t) curves "
+                f"(observation = future[0])...",
                 flush=True,
             )
             interval = int(
