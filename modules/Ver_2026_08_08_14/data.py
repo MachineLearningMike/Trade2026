@@ -32,7 +32,7 @@ LABEL_FITNESS_THRESHOLD = 0.75
 
 # Label families (config key ``label``).
 LABEL_TREND = 'trend'       # (horizon, slope, intercept) → model slice
-LABEL_YIELD = 'yield'     # (chance, wait)
+LABEL_YIELD = 'yield'     # (chance, near)
 LABEL_LATENT = 'latent'   # placeholder latent vector (shares model.py)
 VALID_LABEL_MODES = (LABEL_TREND, LABEL_YIELD, LABEL_LATENT)
 
@@ -66,10 +66,10 @@ def label_target_slice(
     trend (stored as h, m, b):
       output_dim=3 → [horizon, slope, intercept]
       output_dim=2 → [slope, intercept]
-    yield (stored as chance, wait):
+    yield (stored as chance, near):
       yield_target both   → [0:2]
       yield_target chance → [0:1]
-      yield_target wait   → [1:2]
+      yield_target near   → [1:2]
     """
     if label_mode == LABEL_YIELD:
         from labels import Label_Yield
@@ -311,8 +311,8 @@ def generate_dataset_signature(config: dict) -> str:
         'label': _normalize_label_mode(config.get('label', LABEL_TREND)),
         'min_yield_percent': config.get('min_yield_percent', 0.0),
         'max_hope_future_horizon': config.get('max_hope_future_horizon', 60),
-        # Model target selection for yield (chance / wait / both) — must
-        # distinguish single-dim chance vs wait checkpoints/stats.
+        # Model target selection for yield (chance / near / both) — must
+        # distinguish single-dim chance vs near checkpoints/stats.
         'yield_target': config.get('yield_target', 'both'),
         'min_trend_horizon': config.get('min_trend_horizon', 3),
         'max_trend_future_horizon': max_trend_future,
@@ -642,7 +642,7 @@ def find_yield(
 ):
     """
     Yield label. Cache path should leave yield_target=None so the full
-    (chance, wait) pair is stored; model uses target_slice.
+    (chance, near) pair is stored; model uses target_slice.
     """
     # Local import: labels is free of data.py, so no cycle.
     from labels import Label_Yield
@@ -962,7 +962,7 @@ class TradingDataset(Dataset):
             config.get('fitness_threshold', LABEL_FITNESS_THRESHOLD)
         )
         self.regime_use_past = bool(config.get('regime_use_past', True))
-        # Yield target: both | chance | wait
+        # Yield target: both | chance | near
         if self.label_mode == LABEL_YIELD:
             from labels import resolve_yield_target, Label_Yield
             self.yield_target = resolve_yield_target(config)
@@ -1133,7 +1133,7 @@ class TradingDataset(Dataset):
         elif self.label_mode == LABEL_LATENT:
             full_names = ('y',)  # scalar observation in cache
         else:
-            full_names = ('chance', 'wait')
+            full_names = ('chance', 'near')
 
         print(f"  Full label {full_names}:")
         print(f"    Mean:  {self.stats['label']['mean'].tolist()}")
@@ -1279,13 +1279,13 @@ class TradingDataset(Dataset):
                     history_prices,
                     min_yield_percent=self.min_yield_percent,
                     max_hope_future_horizon=self.max_hope_future_horizon,
-                    # full cache always (chance, wait); model uses yield_target slice
+                    # full cache always (chance, near); model uses yield_target slice
                 )
                 if len(result) == 1:
-                    chance, wait = float(result[0]), 0.0
+                    chance, near = float(result[0]), 0.0
                 else:
-                    chance, wait = float(result[0]), float(result[1])
-                label = torch.tensor([chance, wait], dtype=torch.float32)
+                    chance, near = float(result[0]), float(result[1])
+                label = torch.tensor([chance, near], dtype=torch.float32)
                 h_past_list.append(0.0)
             elif self.label_mode == LABEL_LATENT:
                 # Realized next bar (future[0]) as one draw from the latent
@@ -1539,7 +1539,7 @@ class TradingDataset(Dataset):
 
         y must already be sliced to model target size:
           trend  → (h,m,b) or (m,b)
-          yield → (chance, wait)
+          yield → (chance, near)
         """
         mean = self._label_stat_mean
         std = self._label_stat_std

@@ -22,11 +22,11 @@ config = {
     # ============================================================
     # DATA SPLIT CONFIGURATION
     # ============================================================
-    'train_ratio': 0.70,
-    'val_ratio': 0.20,
+    'train_ratio': 0.80,
+    'val_ratio': 0.10,
     # False: train / val / test are consecutive in time (earliest → latest).
     # Training still shuffles the train split each epoch (DataLoader).
-    'shuffle_split': False,
+    'shuffle_split': True,
     
     # ============================================================
     # VALIDATION CONFIGURATION
@@ -50,22 +50,22 @@ config = {
     # Choose how supervised targets are built from the future price window:
     #   'trend'   → (horizon, slope, intercept) via find_trend
     #                        model may use output_dim 2 (m,b) or 3 (h,m,b)
-    #   'yield'   → (chance, wait) via find_yield; model target selected by
+    #   'yield'   → (chance, near) via find_yield; model target selected by
     #                        yield_target (cache always stores both)
     #   'latent'  → density over a scalar observation (shares model head)
-    'label': 'latent',
+    'label': 'yield',
 
     # ------------------------------------------------------------
-    # YIELD (distribution of chance and wait)
+    # YIELD (distribution of chance and near)
     # ------------------------------------------------------------
     'min_yield_percent': 0.26,   #
     # Also sets the sample future_window when label=yield
     'max_hope_future_horizon': 60,
-    # Model target from full cache (chance, wait):
-    #   'both'   → output_dim=2  (chance, wait)
+    # Model target from full cache (chance, near):
+    #   'both'   → output_dim=2  (chance, near)
     #   'chance' → output_dim=1  (chance,)
-    #   'wait'   → output_dim=1  (wait,)
-    'yield_target': 'wait',
+    #   'near'   → output_dim=1  (near,)
+    'yield_target': 'chance',
 
     # ------------------------------------------------------------
     # LATENT (label=latent) — same model as trend/yield
@@ -177,7 +177,7 @@ config = {
     'look_price': False,
     # Prediction head width. Must match label family:
     #   trend:   3 = (h,m,b),  2 = (m,b)
-    #   yield:   2 = both;  1 = chance or wait  (forced from yield_target)
+    #   yield:   2 = both;  1 = chance or near  (forced from yield_target)
     #   latent:  forced from latent_distribution (2=normal, 3=student)
     'output_dim': 2,
     
@@ -186,7 +186,7 @@ config = {
     # ============================================================
     'epochs': 12,
     'batch_size': 16,
-    'learning_rate': 0.00005, # 0.0000001 gives the similar speed as 0.0000001 x 100
+    'learning_rate': 0.000_01, # 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
     'save_every_n_minibatches': 5000,
     'checkpoint_dir': 'trading_checkpoints',
     # How many newest rolling weight files to keep (recency, not quality).
@@ -212,7 +212,7 @@ config = {
     'intercept_loss_weight': 10.0,
     # yield:
     'chance_loss_weight': 1.0,
-    'wait_loss_weight': 1.0,
+    'near_loss_weight': 1.0,
     'reconstruction_loss_weight': 0.01,
     'use_reconstruction': False,
 }

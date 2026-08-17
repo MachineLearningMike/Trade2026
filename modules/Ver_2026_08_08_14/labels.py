@@ -31,7 +31,7 @@ VALID_LABEL_MODES = (LABEL_TREND, LABEL_YIELD, LABEL_LATENT)
 
 LABEL_FULL_DIM_TREND = 3
 LABEL_FULL_DIM_YIELD = 2
-LABEL_FULL_DIM_YIELD_SINGLE = 1  # chance-only or wait-only head
+LABEL_FULL_DIM_YIELD_SINGLE = 1  # chance-only or near-only head
 # Latent: scalar observation in the label cache; model head width from density mode.
 LABEL_FULL_DIM_LATENT = 1
 
@@ -45,14 +45,14 @@ LABEL_OUTPUT_DIM_NORMAL = 2   # (mu, var_raw)
 LABEL_OUTPUT_DIM_STUDENT = 3  # (location, scale_raw, df_raw)
 
 # Yield model target selection (config key ``yield_target``).
-# Cache always stores full (chance, wait); this selects the model slice.
+# Cache always stores full (chance, near); this selects the model slice.
 YIELD_TARGET_BOTH = 'both'
 YIELD_TARGET_CHANCE = 'chance'
-YIELD_TARGET_WAIT = 'wait'
+YIELD_TARGET_NEAR = 'near'
 VALID_YIELD_TARGETS = (
     YIELD_TARGET_BOTH,
     YIELD_TARGET_CHANCE,
-    YIELD_TARGET_WAIT,
+    YIELD_TARGET_NEAR,
 )
 
 # Horizon search rules for linear trend (free OLS, no f[0] anchor).
@@ -340,9 +340,10 @@ class Label_Trend:
 
 def resolve_yield_target(config: Optional[dict] = None, **overrides) -> str:
     """
-    Resolve yield model target: 'both' | 'chance' | 'wait'.
+    Resolve yield model target: 'both' | 'chance' | 'near'.
 
     Reads overrides['yield_target'] or config['yield_target']; default 'both'.
+    Legacy aliases: wait → near, chance_wait → both.
     """
     cfg = dict(config or {})
     cfg.update({k: v for k, v in overrides.items() if v is not None})
@@ -351,12 +352,12 @@ def resolve_yield_target(config: Optional[dict] = None, **overrides) -> str:
     if raw is None or str(raw).strip() == '':
         return YIELD_TARGET_BOTH
     yt = str(raw).strip().lower()
-    if yt in ('both', 'chance_wait', 'all'):
+    if yt in ('both', 'chance_near', 'chance_wait', 'all'):
         yt = YIELD_TARGET_BOTH
     elif yt in ('c',):
         yt = YIELD_TARGET_CHANCE
-    elif yt in ('w',):
-        yt = YIELD_TARGET_WAIT
+    elif yt in ('n', 'w', 'wait'):  # 'wait' legacy → near
+        yt = YIELD_TARGET_NEAR
     if yt not in VALID_YIELD_TARGETS:
         raise ValueError(
             f"yield_target must be one of {VALID_YIELD_TARGETS}, got {raw!r}"
@@ -375,15 +376,15 @@ class Label_Yield:
     Config id: 'yield'
     Price space: raw (true % yield); caller must not z-score inputs.
 
-    Full cache vector is always (chance, wait). Model target is selected by
-    ``yield_target``: 'both' | 'chance' | 'wait'.
+    Full cache vector is always (chance, near). Model target is selected by
+    ``yield_target``: 'both' | 'chance' | 'near'.
     """
 
     name = LABEL_YIELD
 
     @classmethod
     def full_cache_dim(cls) -> int:
-        """Stored label vector width (always chance + wait)."""
+        """Stored label vector width (always chance + near)."""
         return LABEL_FULL_DIM_YIELD
 
     @classmethod
@@ -418,11 +419,11 @@ class Label_Yield:
         **_kwargs,
     ) -> slice:
         """
-        Slice into full cache vector [chance, wait].
+        Slice into full cache vector [chance, near].
 
           both   → [0:2]
           chance → [0:1]
-          wait   → [1:2]
+          near   → [1:2]
         """
         yt = resolve_yield_target({'yield_target': yield_target})
         expected = cls.resolve_output_dim(yield_target=yt)
@@ -435,7 +436,7 @@ class Label_Yield:
             return slice(0, 2)
         if yt == YIELD_TARGET_CHANCE:
             return slice(0, 1)
-        if yt == YIELD_TARGET_WAIT:
+        if yt == YIELD_TARGET_NEAR:
             return slice(1, 2)
         raise ValueError(f"Unknown yield_target {yt!r}")
 
@@ -448,11 +449,11 @@ class Label_Yield:
     ) -> Tuple[str, ...]:
         yt = resolve_yield_target({'yield_target': yield_target})
         if yt == YIELD_TARGET_BOTH:
-            return ('chance', 'wait')
+            return ('chance', 'near')
         if yt == YIELD_TARGET_CHANCE:
             return ('chance',)
-        if yt == YIELD_TARGET_WAIT:
-            return ('wait',)
+        if yt == YIELD_TARGET_NEAR:
+            return ('near',)
         raise ValueError(f"Unknown yield_target {yt!r}")
 
     @staticmethod
@@ -483,11 +484,11 @@ class Label_Yield:
         they are converted once to host float64, then computed in numpy
         (no per-bar tensor casts or GPU syncs).
 
-        Always computes both chance and wait. Return shape:
-          - default / cache (yield_target None or 'both'): (chance, wait)
-          - yield_target='chance'|'wait': single-component tuple
+        Always computes both chance and near. Return shape:
+          - default / cache (yield_target None or 'both'): (chance, near)
+          - yield_target='chance'|'near': single-component tuple
 
-        Prefer always caching (chance, wait) and slicing via target_slice.
+        Prefer always caching (chance, near) and slicing via target_slice.
         """
         fut = cls._as_1d_float64(future)
         hist = cls._as_1d_float64(history)
@@ -496,7 +497,7 @@ class Label_Yield:
         if max_hope_future_horizon is not None:
             n = min(n, max(0, int(max_hope_future_horizon)))
 
-        chance, wait = 0.0, 0.0
+        chance, near = 0.0, 0.0
 
         if n > 0 and hist.size > 0:
             current = float(hist[-1])
@@ -508,21 +509,28 @@ class Label_Yield:
 
             # Note softplus is intuitively active over (-4, +infinity). It's almost linear over 4.0.
             # softplus(-4, 0, 4) = (0.0181, 0.6931, 4.0181)
-            # I want to scale the surplus yield 
+            # Scale surplus yield so mild negatives land in the softplus ramp.
             _yield = (fut[:n] - current) / denom * 100.0
-            # (-limit, 0) yield will map to (-4, 0), which belongs to the active interval of softplus.
+            # (-gentle, 0) yield maps to (-4, 0), inside the active softplus region.
             gentle = 0.3    # How gently to ignore negative yield.
-            scaled_yield = _yield * 4.0 / gentle     # linearly scalled yield
-            cared_yield = special.softplus(scaled_yield)  # This gently ignores negative yield.
-            # scipy.special.expit([60, 30, 0, -1, -2, -3, -4]) =[1, 1, 0.5, 0.26, 0.11, 0.047, 0.018]
-            warmingup = 8.0
-            visibility = special.expit(np.array(reversed(range(n)) - warmingup / 2))
+            scaled_yield = _yield * 4.0 / gentle
+            cared_yield = special.softplus(scaled_yield)
+            # Far-future bars are down-weighted: index from the end via
+            # arange(n-1 … 0), then logistic centered at warmingup/2.
+            # expit([60, 30, 0, -1, -2, -3, -4]) ≈ [1, 1, 0.5, 0.27, 0.12, 0.05, 0.02]
+            warmingup = 8.0 # A far future price should get fully visible slowly for 'warmingup' time steps.
+            # Must be an ndarray: reversed(range(n)) is an iterator and cannot
+            # do arithmetic with a float.
+            rev_t = np.arange(n - 1, -1, -1, dtype=np.float64)
+            viz_t = special.expit(rev_t - warmingup / 2.0)     # sigmoid
+            viz_cared_yield = cared_yield * viz_t
+            chance = float(viz_cared_yield.sum())
+            if chance > eps:
+                near = float(n - (viz_cared_yield * rev_t).sum() / chance)
+            else:
+                near = 0.0
 
-            for t in range(n):
-                chance += cared_yield[t] * visibility[t]
-
-
-        full = (float(chance), float(wait))
+        full = (float(chance), float(near))
         if yield_target is None:
             return full
 
@@ -531,7 +539,7 @@ class Label_Yield:
             return full
         if yt == YIELD_TARGET_CHANCE:
             return (full[0],)
-        if yt == YIELD_TARGET_WAIT:
+        if yt == YIELD_TARGET_NEAR:
             return (full[1],)
         return full
 
@@ -540,17 +548,25 @@ class Label_Yield:
         """
         Class-private loss knobs for yield.
 
-        Keys: chance_weight, wait_weight, yield_target
+        Keys: chance_weight, near_weight, yield_target
         """
         cfg = config or {}
         yt = resolve_yield_target(cfg, **overrides)
+        # near_loss_weight preferred; wait_loss_weight kept as legacy alias.
+        near_w = cfg.get('near_loss_weight', cfg.get('wait_loss_weight', 1.0))
         aux = {
             'chance_weight': float(cfg.get('chance_loss_weight', 1.0)),
-            'wait_weight': float(cfg.get('wait_loss_weight', 1.0)),
+            'near_weight': float(near_w),
             'yield_target': yt,
         }
         for k, v in overrides.items():
             if k == 'yield_target':
+                continue
+            if k == 'wait_weight' and 'near_weight' not in overrides:
+                aux['near_weight'] = v
+                continue
+            if k == 'wait_loss_weight' and 'near_loss_weight' not in overrides:
+                aux['near_weight'] = float(v)
                 continue
             aux[k] = v
         return aux
@@ -571,7 +587,9 @@ class Label_Yield:
         """
         aux = auxiliary or {}
         chance_weight = float(aux.get('chance_weight', 1.0))
-        wait_weight = float(aux.get('wait_weight', 1.0))
+        near_weight = float(
+            aux.get('near_weight', aux.get('wait_weight', 1.0))
+        )
         yt = resolve_yield_target(aux)
 
         out_dim = y_pred.shape[-1]
@@ -586,15 +604,15 @@ class Label_Yield:
                     f"yield_target='both' requires pred dim 2, got {out_dim}"
                 )
             chance_loss = nn.functional.mse_loss(y_pred[:, 0], y_truth[:, 0])
-            wait_loss = nn.functional.mse_loss(y_pred[:, 1], y_truth[:, 1])
-            return chance_weight * chance_loss + wait_weight * wait_loss
+            near_loss = nn.functional.mse_loss(y_pred[:, 1], y_truth[:, 1])
+            return chance_weight * chance_loss + near_weight * near_loss
 
-        if yt in (YIELD_TARGET_CHANCE, YIELD_TARGET_WAIT):
+        if yt in (YIELD_TARGET_CHANCE, YIELD_TARGET_NEAR):
             if out_dim != 1:
                 raise ValueError(
                     f"yield_target={yt!r} requires pred dim 1, got {out_dim}"
                 )
-            w = chance_weight if yt == YIELD_TARGET_CHANCE else wait_weight
+            w = chance_weight if yt == YIELD_TARGET_CHANCE else near_weight
             return w * nn.functional.mse_loss(y_pred[:, 0], y_truth[:, 0])
 
         raise ValueError(
@@ -1525,8 +1543,8 @@ def visualize_yield(
       - recent past + future actual prices
       - horizontal line at reference price history[-1]
       - orange markers on future bars where yield % >= min_yield_percent
-      - title chance/wait from ``label_tensor`` (natural/denorm units)
-      - chance×wait inset in normalized space when yield_target='both'
+      - title chance/near from ``label_tensor`` (natural/denorm units)
+      - chance×near inset in normalized space when yield_target='both'
     """
     yt = resolve_yield_target({'yield_target': yield_target})
     show_cw_inset = yt == YIELD_TARGET_BOTH
@@ -1548,7 +1566,7 @@ def visualize_yield(
             f"label_tensor length ({num_available})"
         )
 
-    # Label z-score stats for the chance×wait inset (model target space)
+    # Label z-score stats for the chance×near inset (model target space)
     def _as_stat_vec(v, dim: int):
         if v is None:
             return None
@@ -1581,7 +1599,7 @@ def visualize_yield(
         _y_std = np.where(_y_std < 1e-8, 1.0, _y_std)
 
     def _normalize_cw(comps: Tuple[float, ...]) -> Tuple[float, ...]:
-        """Map denorm (chance, wait) → z-score using train label stats."""
+        """Map denorm (chance, near) → z-score using train label stats."""
         return (
             (float(comps[0]) - _y_mean[0]) / (_y_std[0] + 1e-8),
             (float(comps[1]) - _y_mean[1]) / (_y_std[1] + 1e-8),
@@ -1613,7 +1631,7 @@ def visualize_yield(
 
     page_num = [0]
     _widgets: List[Any] = []
-    _inset_axes: List[Any] = []  # chance×wait insets; removed on each redraw
+    _inset_axes: List[Any] = []  # chance×near insets; removed on each redraw
     max_h = (
         int(max_hope_future_horizon)
         if max_hope_future_horizon is not None
@@ -1720,10 +1738,10 @@ def visualize_yield(
                 yt == YIELD_TARGET_BOTH and len(comps_lbl) == 1
             ):
                 title_l1 = f'chance={comps_lbl[0]:.2f}'
-            elif yt == YIELD_TARGET_WAIT:
-                title_l1 = f'wait={comps_lbl[0]:.2f}'
+            elif yt == YIELD_TARGET_NEAR:
+                title_l1 = f'near={comps_lbl[0]:.2f}'
             else:
-                title_l1 = f'chance={comps_lbl[0]:.2f}, wait={comps_lbl[1]:.2f}'
+                title_l1 = f'chance={comps_lbl[0]:.2f}, near={comps_lbl[1]:.2f}'
             title_l2 = None
             if comps_prd is not None:
                 if yt == YIELD_TARGET_CHANCE or (
@@ -1731,14 +1749,14 @@ def visualize_yield(
                 ):
                     title_l2 = f'pred chance={comps_prd[0]:.2f}'
                     pred_txt = f'pred c={comps_prd[0]:.1f}'
-                elif yt == YIELD_TARGET_WAIT:
-                    title_l2 = f'pred wait={comps_prd[0]:.2f}'
-                    pred_txt = f'pred w={comps_prd[0]:.1f}'
+                elif yt == YIELD_TARGET_NEAR:
+                    title_l2 = f'pred near={comps_prd[0]:.2f}'
+                    pred_txt = f'pred n={comps_prd[0]:.1f}'
                 else:
                     title_l2 = (
-                        f'pred chance={comps_prd[0]:.2f}, wait={comps_prd[1]:.2f}'
+                        f'pred chance={comps_prd[0]:.2f}, near={comps_prd[1]:.2f}'
                     )
-                    pred_txt = f'pred c={comps_prd[0]:.1f} w={comps_prd[1]:.1f}'
+                    pred_txt = f'pred c={comps_prd[0]:.1f} n={comps_prd[1]:.1f}'
                 ax.text(
                     0.02, 0.98,
                     pred_txt,
@@ -1747,43 +1765,43 @@ def visualize_yield(
                     bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7),
                 )
 
-            # Small chance × wait inset in *normalized* (z-score) space
+            # Small chance × near inset in *normalized* (z-score) space
             if show_cw_inset and len(comps_lbl) >= 2 and _y_mean is not None:
-                ch_t_n, wt_t_n = _normalize_cw(comps_lbl)
+                ch_t_n, nr_t_n = _normalize_cw(comps_lbl)
                 ax_cw = ax.inset_axes([0.55, 0.08, 0.43, 0.42])
                 _inset_axes.append(ax_cw)
                 ax_cw.scatter(
-                    [ch_t_n], [wt_t_n],
+                    [ch_t_n], [nr_t_n],
                     c='#1f77b4', s=42, zorder=4, marker='o',
                     edgecolors='white', linewidths=0.6, label='truth',
                 )
                 xs_cw = [ch_t_n]
-                ys_cw = [wt_t_n]
+                ys_cw = [nr_t_n]
                 if comps_prd is not None and len(comps_prd) >= 2:
-                    ch_p_n, wt_p_n = _normalize_cw(comps_prd)
+                    ch_p_n, nr_p_n = _normalize_cw(comps_prd)
                     ax_cw.scatter(
-                        [ch_p_n], [wt_p_n],
+                        [ch_p_n], [nr_p_n],
                         c='#2ca02c', s=48, zorder=5, marker='x',
                         linewidths=1.6, label='pred',
                     )
                     ax_cw.plot(
-                        [ch_t_n, ch_p_n], [wt_t_n, wt_p_n],
+                        [ch_t_n, ch_p_n], [nr_t_n, nr_p_n],
                         color='gray', alpha=0.45, linewidth=0.9, zorder=3,
                     )
                     xs_cw.append(ch_p_n)
-                    ys_cw.append(wt_p_n)
+                    ys_cw.append(nr_p_n)
 
                     # Distances in normalized space (pred − truth)
                     d_chance = float(ch_p_n - ch_t_n)
-                    d_wait = float(wt_p_n - wt_t_n)
-                    d_l2 = float(np.hypot(d_chance, d_wait))
+                    d_near = float(nr_p_n - nr_t_n)
+                    d_l2 = float(np.hypot(d_chance, d_near))
                     # Text in the middle of the coordinate plane
                     ax_cw.text(
                         0.5, 0.5,
                         (
                             f'‖Δ‖={d_l2:.3f}\n'
                             f'Δc={d_chance:+.3f}\n'
-                            f'Δw={d_wait:+.3f}'
+                            f'Δn={d_near:+.3f}'
                         ),
                         transform=ax_cw.transAxes,
                         ha='center', va='center', fontsize=6,
@@ -1806,10 +1824,10 @@ def visualize_yield(
                 ax_cw.axhline(0.0, color='0.7', linewidth=0.6, zorder=1)
                 ax_cw.axvline(0.0, color='0.7', linewidth=0.6, zorder=1)
                 ax_cw.set_xlabel('chance (norm)', fontsize=6, labelpad=1)
-                ax_cw.set_ylabel('wait (norm)', fontsize=6, labelpad=1)
+                ax_cw.set_ylabel('near (norm)', fontsize=6, labelpad=1)
                 ax_cw.tick_params(axis='both', labelsize=5, length=2, pad=1)
                 ax_cw.grid(True, alpha=0.35, linewidth=0.5)
-                ax_cw.set_title('chance × wait (z)', fontsize=6, pad=2)
+                ax_cw.set_title('chance × near (z)', fontsize=6, pad=2)
                 ax_cw.legend(fontsize=5, loc='upper right', framealpha=0.75, borderpad=0.2)
                 ax_cw.set_facecolor('#FAFAFA')
                 for spine in ax_cw.spines.values():
@@ -1843,9 +1861,9 @@ def visualize_yield(
             'chance from dataset cache',
         ]
         if show_cw_inset:
-            line2_parts.append('inset: truth/pred in norm chance×wait')
+            line2_parts.append('inset: truth/pred in norm chance×near')
             if pred_tensor is not None:
-                line2_parts.append('center text: ||d||, dc, dw (norm)')
+                line2_parts.append('center text: ||d||, dc, dn (norm)')
         if pred_tensor is not None:
             line2_parts.append('green text=pred (denorm)')
         if fixed_order:

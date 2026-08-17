@@ -245,7 +245,7 @@ class PredictionHead(nn.Module):
     Prediction head (layout depends on config label / output_dim):
 
     trend:   3 → (horizon, slope, intercept);  2 → (slope, intercept)
-    yield:   2 → (chance, wait);  1 → (chance,) or (wait,) per yield_target
+    yield:   2 → (chance, near);  1 → (chance,) or (near,) per yield_target
     latent:  2 → (mu, var_raw) normal;  3 → (loc, scale_raw, df_raw) student
     """
 
@@ -276,7 +276,7 @@ class MarketTransformerWithHeads(nn.Module):
 
     output_dim controls the head layout (see config ``label``):
       trend:  3 → (h, m, b);  2 → (m, b)
-      yield:  2 → both;  1 → chance or wait (yield_target)
+      yield:  2 → both;  1 → chance or near (yield_target)
       latent: 2 → normal (mu, var_raw);  3 → student (loc, scale_raw, df_raw)
 
     Window statistics (mean / std / shape moments) condition the decoder via

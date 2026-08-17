@@ -712,20 +712,20 @@ def run_test(
             preds[:, 0], test_labels[:, 0]
         ).item()
         print(f"  Chance MSE:      {metrics['chance_mse']:.4f}")
-    elif label_mode == 'yield' and yield_target == 'wait':
-        metrics['wait_mse'] = torch.nn.functional.mse_loss(
+    elif label_mode == 'yield' and yield_target == 'near':
+        metrics['near_mse'] = torch.nn.functional.mse_loss(
             preds[:, 0], test_labels[:, 0]
         ).item()
-        print(f"  Wait MSE:        {metrics['wait_mse']:.4f}")
+        print(f"  Near MSE:        {metrics['near_mse']:.4f}")
     elif label_mode == 'yield' and out_dim == 2:
         metrics['chance_mse'] = torch.nn.functional.mse_loss(
             preds[:, 0], test_labels[:, 0]
         ).item()
-        metrics['wait_mse'] = torch.nn.functional.mse_loss(
+        metrics['near_mse'] = torch.nn.functional.mse_loss(
             preds[:, 1], test_labels[:, 1]
         ).item()
         print(f"  Chance MSE:      {metrics['chance_mse']:.4f}")
-        print(f"  Wait MSE:        {metrics['wait_mse']:.4f}")
+        print(f"  Near MSE:        {metrics['near_mse']:.4f}")
     elif out_dim == 3:
         metrics['horizon_mse'] = torch.nn.functional.mse_loss(
             preds[:, 0], test_labels[:, 0]
@@ -791,8 +791,8 @@ def run_test(
             print(
                 f"  {i:<6} {test_labels[i, 0].item():<12.4f} {preds[i, 0].item():<12.4f}"
             )
-    elif label_mode == 'yield' and yield_target == 'wait':
-        print(f"  {'Index':<6} {'True Wait':<12} {'Pred Wait':<12}")
+    elif label_mode == 'yield' and yield_target == 'near':
+        print(f"  {'Index':<6} {'True Near':<12} {'Pred Near':<12}")
         print(f"  {'-'*6} {'-'*12} {'-'*12}")
         for i in range(min(5, len(preds))):
             print(
@@ -801,7 +801,7 @@ def run_test(
     elif label_mode == 'yield' and out_dim == 2:
         print(
             f"  {'Index':<6} {'True Chance':<12} {'Pred Chance':<12} "
-            f"{'True Wait':<12} {'Pred Wait':<12}"
+            f"{'True Near':<12} {'Pred Near':<12}"
         )
         print(f"  {'-'*6} {'-'*12} {'-'*12} {'-'*12} {'-'*12}")
         for i in range(min(5, len(preds))):
@@ -892,7 +892,7 @@ def run_test(
             )
             # Model-aligned denorm labels (sliced) match pred_tensor layout
             viz_labels = test_labels.detach().cpu()
-            # For chance×wait inset we need full (chance, wait) in natural units
+            # For chance×near inset we need full (chance, near) in natural units
             # when yield_target=both; for single modes titles use sliced tensors.
             visualize_yield(
                 total_tensor=dataset.Total,
