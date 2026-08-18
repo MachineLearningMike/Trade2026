@@ -26,7 +26,7 @@ config = {
     'val_ratio': 0.10,
     # False: train / val / test are consecutive in time (earliest → latest).
     # Training still shuffles the train split each epoch (DataLoader).
-    'shuffle_split': True,
+    'shuffle_split': False,
     
     # ============================================================
     # VALIDATION CONFIGURATION
@@ -186,7 +186,7 @@ config = {
     # ============================================================
     'epochs': 12,
     'batch_size': 16,
-    'learning_rate': 0.000_01, # 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
+    'learning_rate': 0.000_001, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
     'save_every_n_minibatches': 5000,
     'checkpoint_dir': 'trading_checkpoints',
     # How many newest rolling weight files to keep (recency, not quality).

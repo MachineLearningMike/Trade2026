@@ -198,7 +198,11 @@ def main(config):
     parser.add_argument('--epochs', type=int, default=config['epochs'], help='Number of epochs')
     parser.add_argument('--save-every', type=int, default=config['save_every_n_minibatches'],
                        help='Save every N minibatches')
-    parser.add_argument('--clean', action='store_true', help='Delete old checkpoints')
+    parser.add_argument(
+        '--clean', action='store_true',
+        help='Delete checkpoints for the current checkpoint key only '
+             '(other key folders under checkpoint_dir are preserved)',
+    )
     parser.add_argument(
         '--extend', type=float, default=None,
         help=(
@@ -224,6 +228,15 @@ def main(config):
             '(no market data load). '
             'Use --loss (current config key), --loss all, or '
             '--loss <checkpoint_key>.'
+        ),
+    )
+    parser.add_argument(
+        '--validation', type=int, nargs='?', const=-1, default=None, metavar='E',
+        help=(
+            'Plot per-batch validation loss over batch index for epoch E '
+            '(no market data load), including a moving average. '
+            'Curves are written during training as validation_loss_epoch_<E>.json. '
+            'Use --validation <epoch>, or --validation for the latest saved epoch.'
         ),
     )
     parser.add_argument('--features', action='store_true', default=False,
@@ -656,14 +669,164 @@ def main(config):
         if _plot_latest_loss(subdir, label=" (fallback: latest with loss data)"):
             print("✅ Latest-epoch loss visualization completed!")
         return
+
+    # ============================================================
+    # STEP 2c: Handle --validation flag (per-batch val curve for epoch E)
+    # ============================================================
+    if args.validation is not None:
+        print("\n" + "=" * 60)
+        print("📉 VALIDATION LOSS VISUALIZATION MODE")
+        print("=" * 60)
+
+        checkpoint_dir = Path(config['checkpoint_dir'])
+        if not checkpoint_dir.exists():
+            print(f"⚠ Checkpoint directory not found: {checkpoint_dir}")
+            print("No validation loss history available.")
+            return
+
+        from trainer import (
+            ValidationEpochLoss,
+            list_validation_loss_epochs,
+            validation_loss_path,
+        )
+
+        requested_epoch = None if args.validation < 0 else int(args.validation)
+        if requested_epoch is not None and requested_epoch < 1:
+            print("⚠ Epoch must be >= 1 (1-based), or omit E for the latest saved run.")
+            return
+
+        def _list_val_runs():
+            runs = []
+            for subdir in checkpoint_dir.iterdir():
+                if not subdir.is_dir():
+                    continue
+                epochs = list_validation_loss_epochs(subdir)
+                if not epochs:
+                    continue
+                newest = validation_loss_path(subdir, epochs[-1])
+                runs.append((subdir, epochs, newest.stat().st_mtime))
+            runs.sort(key=lambda item: item[2], reverse=True)
+            return runs
+
+        def _plot_validation(subdir: Path, epoch: int, label: str = "") -> bool:
+            ve = ValidationEpochLoss.load(subdir, epoch)
+            if ve is None or not ve.batch_losses:
+                print(f"⚠ No validation loss data for epoch {epoch} in {subdir.name}")
+                return False
+            try:
+                print(f"📁 Checkpoint: {subdir.name}{label}")
+                ve.print_summary()
+                plot_path = subdir / f'validation_loss_epoch_{epoch}_view.png'
+                ve.plot(save_path=str(plot_path))
+                print(f"   Validation loss plot saved to: {plot_path}\n")
+                return True
+            except Exception as e:
+                print(f"⚠ Failed to plot validation loss from {subdir.name}: {e}")
+                return False
+
+        def _resolve_epoch(subdir: Path, epochs: list):
+            if not epochs:
+                return None
+            if requested_epoch is None:
+                return epochs[-1]
+            if requested_epoch in epochs:
+                return requested_epoch
+            return None
+
+        # Prefer current config key (same signature/key scheme as --loss / --history).
+        dataset_signature = generate_dataset_signature(config)
+        # Align output_dim with training so the key matches ResumableTrainer.
+        label_mode = str(config.get('label', 'trend')).lower()
+        if label_mode in ('yield', 'scattered_hope'):
+            from labels import Label_Yield, resolve_yield_target
+            config['output_dim'] = Label_Yield.resolve_output_dim(
+                yield_target=resolve_yield_target(config)
+            )
+        elif label_mode == 'latent':
+            from labels import Label_Latent
+            config['output_dim'] = Label_Latent.resolve_output_dim(config)
+        current_key = generate_checkpoint_key(config, dataset_signature)
+        current_dir = checkpoint_dir / current_key
+        print(f"🔑 Dataset signature: {dataset_signature}")
+        print(f"🔑 Checkpoint key:    {current_key}")
+        if requested_epoch is None:
+            print("🎯 Epoch:             latest saved")
+        else:
+            print(f"🎯 Epoch:             {requested_epoch}")
+
+        if current_dir.exists():
+            epochs = list_validation_loss_epochs(current_dir)
+            epoch = _resolve_epoch(current_dir, epochs)
+            if epoch is not None and _plot_validation(
+                current_dir, epoch, label=" (exact config match)"
+            ):
+                print("✅ Validation loss visualization completed!")
+                return
+            if requested_epoch is not None and epochs:
+                print(
+                    f"⚠ Epoch {requested_epoch} not found under current key. "
+                    f"Available epochs: {', '.join(str(e) for e in epochs)}"
+                )
+            elif not epochs:
+                print(f"⚠ No validation_loss_epoch_*.json under current key: {current_key}")
+
+        runs = _list_val_runs()
+        available = [p.name for p in checkpoint_dir.iterdir() if p.is_dir()]
+        if available:
+            print(f"   Available checkpoint keys: {', '.join(available)}")
+        if not runs:
+            print("   No runs with validation loss history found.")
+            print("   Train with validation enabled to generate validation_loss_epoch_<E>.json")
+            return
+
+        # Fall back: first run (newest) that has the requested epoch, else newest latest.
+        for subdir, epochs, _ in runs:
+            epoch = _resolve_epoch(subdir, epochs)
+            if epoch is None:
+                continue
+            if subdir.name == current_key:
+                continue
+            print(f"   Falling back to: {subdir.name} (epoch {epoch})")
+            print(f"   Tip: train under the current key, or inspect available epochs there.")
+            if _plot_validation(subdir, epoch, label=" (fallback)"):
+                print("✅ Validation loss visualization completed!")
+            return
+
+        if requested_epoch is not None:
+            print(f"⚠ No checkpoint key has validation loss for epoch {requested_epoch}.")
+        else:
+            print("⚠ No validation loss history could be plotted.")
+        return
     
     # ============================================================
     # STEP 3: Handle --clean flag
     # ============================================================
+    # Only remove this config's key folder. Sibling checkpoint keys stay intact.
     checkpoint_dir = Path(config['checkpoint_dir'])
-    if config['clean'] and checkpoint_dir.exists():
-        shutil.rmtree(checkpoint_dir)
-        print(f"✓ Cleaned previous checkpoints from: {config['checkpoint_dir']}\n")
+    if config['clean']:
+        # Match TradingDataset.cache_key: signature uses config before output_dim
+        # forcing. Then mirror get_dataset() → config['output_dim'] sync so the
+        # architecture hash matches ResumableTrainer's generate_checkpoint_key.
+        dataset_signature = generate_dataset_signature(config)
+        label_mode = str(config.get('label', 'trend')).lower()
+        if label_mode in ('yield', 'scattered_hope'):
+            from labels import Label_Yield, resolve_yield_target
+            config['output_dim'] = Label_Yield.resolve_output_dim(
+                yield_target=resolve_yield_target(config)
+            )
+        elif label_mode == 'latent':
+            from labels import Label_Latent
+            config['output_dim'] = Label_Latent.resolve_output_dim(config)
+        current_key = generate_checkpoint_key(config, dataset_signature)
+        key_dir = checkpoint_dir / current_key
+        if key_dir.exists():
+            shutil.rmtree(key_dir)
+            print(f"✓ Cleaned checkpoints for key: {current_key}")
+            print(f"  Removed: {key_dir}")
+            print(f"  Other keys under {checkpoint_dir}/ were left untouched.\n")
+        else:
+            print(f"✓ No checkpoints to clean for key: {current_key}")
+            print(f"  Looked in: {key_dir}\n")
 
     # ============================================================
     # STEP : Handle --features flag (visualize total_features only, no training)
@@ -827,6 +990,7 @@ def main(config):
     )
 
     # Create dataloaders
+    # Please please please keep shuffle = True, False, and False for train, val, and test, respectively.
     train_loader = ThreadedDataLoader(dataset.train_dataset, batch_size=config['batch_size'], shuffle=True)
     val_loader = ThreadedDataLoader(dataset.val_dataset, batch_size=config['validate_batch_size'], shuffle=False)
     test_loader = ThreadedDataLoader(dataset.test_dataset, batch_size=config['validate_batch_size'], shuffle=False)
