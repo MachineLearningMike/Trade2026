@@ -13,6 +13,7 @@ from typing import Optional, Tuple, List
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 from config import get_config
 from model import MarketTransformerWithHeads

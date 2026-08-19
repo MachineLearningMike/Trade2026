@@ -65,7 +65,7 @@ config = {
     #   'both'   → output_dim=2  (chance, near)
     #   'chance' → output_dim=1  (chance,)
     #   'near'   → output_dim=1  (near,)
-    'yield_target': 'chance',
+    'yield_target': 'near',
 
     # ------------------------------------------------------------
     # LATENT (label=latent) — same model as trend/yield

@@ -234,9 +234,31 @@ def main(config):
         '--validation', type=int, nargs='?', const=-1, default=None, metavar='E',
         help=(
             'Plot per-batch validation loss over batch index for epoch E '
-            '(no market data load), including a moving average. '
+            '(no market data load), including moving average and running loss. '
             'Curves are written during training as validation_loss_epoch_<E>.json. '
             'Use --validation <epoch>, or --validation for the latest saved epoch.'
+        ),
+    )
+    parser.add_argument(
+        '--validate', type=float, nargs='*', default=None, metavar='V',
+        help=(
+            'Run validation with the best checkpoint on a percent slice of '
+            'sorted validation samples, then plot batch/MA/running-loss '
+            '(same series as --validation; no files saved). '
+            '--validate → [0%%, 100%%]; '
+            '--validate V → [0%%, V%%]; '
+            '--validate V1 V2 → [V1%%, V2%%]. '
+            'Examples: --validate   |   --validate 30   |   --validate 20 40'
+        ),
+    )
+    parser.add_argument(
+        '--last-validate', type=float, nargs='*', default=None, metavar='V',
+        help=(
+            'Same as --validate, but loads the latest available checkpoint '
+            '(training_state latest_checkpoint / newest .pt) instead of best_val. '
+            '--last-validate → [0%%, 100%%]; '
+            '--last-validate V → [0%%, V%%]; '
+            '--last-validate V1 V2 → [V1%%, V2%%].'
         ),
     )
     parser.add_argument('--features', action='store_true', default=False,
@@ -849,6 +871,74 @@ def main(config):
                 print(dataset.feature_names[fid])
 
         print("\n✅ Features visualization completed!")
+        return
+
+    # ============================================================
+    # STEP 3a: Handle --validate / --last-validate [V [V2]]
+    # ============================================================
+    if args.validate is not None and getattr(args, 'last_validate', None) is not None:
+        print("⚠ Use only one of --validate or --last-validate, not both.")
+        return
+
+    _validate_args = None
+    _validate_mode = None
+    if args.validate is not None:
+        _validate_args = args.validate
+        _validate_mode = 'best'
+    elif getattr(args, 'last_validate', None) is not None:
+        _validate_args = args.last_validate
+        _validate_mode = 'latest'
+
+    if _validate_args is not None:
+        vals = [float(x) for x in _validate_args]
+        flag = '--validate' if _validate_mode == 'best' else '--last-validate'
+        # bare flag → [0, 100]; V → [0, V]; V1 V2 → [V1, V2]
+        if len(vals) == 0:
+            percent_lo, percent_hi = 0.0, 100.0
+        elif len(vals) == 1:
+            percent_lo, percent_hi = 0.0, vals[0]
+        elif len(vals) == 2:
+            percent_lo, percent_hi = vals[0], vals[1]
+        else:
+            print(f"⚠ {flag} accepts zero, one, or two values:  |  V  |  V1 V2")
+            return
+        if not (0.0 <= percent_lo < percent_hi <= 100.0):
+            print(
+                f"⚠ {flag} requires 0 <= V1 < V2 <= 100 "
+                f"(got V1={percent_lo:g}, V2={percent_hi:g})"
+            )
+            return
+
+        val_bs = config.get(
+            'validate_batch_size',
+            config.get('test_batch_size', config.get('batch_size', 8)),
+        )
+
+        print("\n" + "=" * 60)
+        if _validate_mode == 'best':
+            print("✅ BEST-CHECKPOINT VALIDATION MODE")
+            print("=" * 60)
+            print("Loads dataset + best_val checkpoint, evaluates sorted val samples.")
+        else:
+            print("✅ LATEST-CHECKPOINT VALIDATION MODE")
+            print("=" * 60)
+            print("Loads dataset + latest checkpoint, evaluates sorted val samples.")
+        print(
+            f"  Coverage: [{percent_lo:g}%, {percent_hi:g}%] of sorted validation samples"
+        )
+        print(f"  Batch size (config validate_batch_size): {val_bs}")
+        print("  Plot: batch loss / moving avg / running loss (no save)")
+        print("=" * 60 + "\n")
+
+        # Lazy import: INFER imports get_dataset from this module.
+        from INFER import run_validate
+
+        run_validate(
+            config,
+            percent_lo=percent_lo,
+            percent_hi=percent_hi,
+            checkpoint_mode=_validate_mode,
+        )
         return
 
     # ============================================================

@@ -1113,16 +1113,20 @@ class ValidationEpochLoss:
     it can be inspected later with --validation e without reloading weights.
     ``epoch`` and ``batch_indices`` are 1-based (epoch id / batch index within
     that validation run). Validation uses shuffle=False, so batch order is
-    stable. Plots use batch index on the x-axis plus a sliding moving average.
+    stable. Plots use batch index on the x-axis with:
+      - batch loss
+      - sliding moving average
+      - running loss (cumulative mean of losses so far)
     """
 
-    DEFAULT_MA_WINDOW = 5
+    DEFAULT_MA_WINDOW = 15
 
     def __init__(self, ma_window: int = DEFAULT_MA_WINDOW):
         self.epoch: Optional[int] = None          # 1-based epoch id
         self.batch_indices: List[int] = []        # 1-based batch id in val run
         self.batch_losses: List[float] = []
         self.moving_avgs: List[float] = []        # sliding MA over batch_losses
+        self.running_avgs: List[float] = []       # cumulative mean ("running loss")
         self.ma_window: int = max(1, int(ma_window))
         self.avg_loss: Optional[float] = None     # mean over batches
         self.timestamp: Optional[float] = None
@@ -1145,11 +1149,24 @@ class ValidationEpochLoss:
                 out.append(total / float(i + 1))
         return out
 
+    @staticmethod
+    def _running_average(values: List[float]) -> List[float]:
+        """Cumulative mean: running_avgs[i] = mean(values[:i+1])."""
+        if not values:
+            return []
+        out: List[float] = []
+        total = 0.0
+        for i, v in enumerate(values):
+            total += float(v)
+            out.append(total / float(i + 1))
+        return out
+
     def reset(self, epoch: int, ma_window: Optional[int] = None):
         self.epoch = int(epoch)  # 1-based
         self.batch_indices = []
         self.batch_losses = []
         self.moving_avgs = []
+        self.running_avgs = []
         if ma_window is not None:
             self.ma_window = max(1, int(ma_window))
         self.avg_loss = None
@@ -1159,13 +1176,13 @@ class ValidationEpochLoss:
     def add_batch(self, batch_idx_1based: int, loss: float):
         self.batch_indices.append(int(batch_idx_1based))
         self.batch_losses.append(float(loss))
-        # Incremental MA over the trailing window (including current point).
         w = self.ma_window
         start = max(0, len(self.batch_losses) - w)
         window_vals = self.batch_losses[start:]
-        ma = float(sum(window_vals) / len(window_vals))
-        self.moving_avgs.append(ma)
-        self.avg_loss = float(sum(self.batch_losses) / len(self.batch_losses))
+        self.moving_avgs.append(float(sum(window_vals) / len(window_vals)))
+        n = len(self.batch_losses)
+        self.avg_loss = float(sum(self.batch_losses) / n)
+        self.running_avgs.append(self.avg_loss)
         self.timestamp = time.time()
 
     def mark_complete(self):
@@ -1174,6 +1191,8 @@ class ValidationEpochLoss:
             self.avg_loss = float(sum(self.batch_losses) / len(self.batch_losses))
             if len(self.moving_avgs) != len(self.batch_losses):
                 self.moving_avgs = self._moving_average(self.batch_losses, self.ma_window)
+            if len(self.running_avgs) != len(self.batch_losses):
+                self.running_avgs = self._running_average(self.batch_losses)
         self.timestamp = time.time()
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1182,6 +1201,7 @@ class ValidationEpochLoss:
             'batch_indices': self.batch_indices,
             'batch_losses': self.batch_losses,
             'moving_avgs': self.moving_avgs,
+            'running_avgs': self.running_avgs,
             'ma_window': self.ma_window,
             'avg_loss': self.avg_loss,
             'num_batches': len(self.batch_losses),
@@ -1195,25 +1215,24 @@ class ValidationEpochLoss:
         self.epoch = data.get('epoch')
         self.batch_indices = list(data.get('batch_indices') or [])
         self.batch_losses = [float(x) for x in (data.get('batch_losses') or [])]
-        # Backward compat: older files stored per-sample curves.
+        # Older files may have stored per-sample curves.
         if not self.batch_losses and data.get('sample_losses'):
             self.batch_losses = [float(x) for x in (data.get('sample_losses') or [])]
             self.batch_indices = list(data.get('sample_indices') or [])
-        self.ma_window = max(
-            1, int(data.get('ma_window') or self.DEFAULT_MA_WINDOW)
-        )
-        self.moving_avgs = [float(x) for x in (data.get('moving_avgs') or [])]
+        # MA window is a display setting: always use the current default so
+        # --validation / --validate reflect DEFAULT_MA_WINDOW even for older files.
+        self.ma_window = max(1, int(self.DEFAULT_MA_WINDOW))
         self.avg_loss = data.get('avg_loss')
         self.timestamp = data.get('timestamp')
         self.complete = bool(data.get('complete', False))
         if self.batch_losses and not self.batch_indices:
             self.batch_indices = list(range(1, len(self.batch_losses) + 1))
-        if self.batch_losses and (
-            not self.moving_avgs or len(self.moving_avgs) != len(self.batch_losses)
-        ):
-            # Prefer explicit moving_avgs; else rebuild. Older files may have
-            # cumulative running_avgs — do not treat those as a sliding MA.
+        if self.batch_losses:
             self.moving_avgs = self._moving_average(self.batch_losses, self.ma_window)
+            self.running_avgs = self._running_average(self.batch_losses)
+        else:
+            self.moving_avgs = []
+            self.running_avgs = []
         if self.avg_loss is None and self.batch_losses:
             self.avg_loss = float(sum(self.batch_losses) / len(self.batch_losses))
 
@@ -1250,7 +1269,12 @@ class ValidationEpochLoss:
             return None
         return cls.load(save_dir, epochs[-1])
 
-    def plot(self, save_path: Optional[str] = None, figsize: Tuple[int, int] = (12, 6)):
+    def plot(
+        self,
+        save_path: Optional[str] = None,
+        figsize: Tuple[int, int] = (12, 6),
+        title: Optional[str] = None,
+    ):
         if not self.batch_losses:
             print("No validation batch losses to plot.")
             return None
@@ -1258,8 +1282,10 @@ class ValidationEpochLoss:
         xs = self.batch_indices if self.batch_indices else list(
             range(1, len(self.batch_losses) + 1)
         )
-        if not self.moving_avgs or len(self.moving_avgs) != len(self.batch_losses):
-            self.moving_avgs = self._moving_average(self.batch_losses, self.ma_window)
+        # Always recompute with the current default so legend/curve match config.
+        self.ma_window = max(1, int(self.DEFAULT_MA_WINDOW))
+        self.moving_avgs = self._moving_average(self.batch_losses, self.ma_window)
+        self.running_avgs = self._running_average(self.batch_losses)
 
         fig, ax = plt.subplots(figsize=figsize)
         ax.plot(xs, self.batch_losses, 'b-', linewidth=1.0, alpha=0.75,
@@ -1268,16 +1294,21 @@ class ValidationEpochLoss:
             xs, self.moving_avgs, 'r-', linewidth=2.0,
             label=f'Moving avg (window={self.ma_window})',
         )
+        ax.plot(
+            xs, self.running_avgs, color='orange', linewidth=2.0,
+            label='Running loss',
+        )
 
         epoch_label = self.epoch if self.epoch is not None else '?'
         status = 'complete' if self.complete else 'partial'
         ax.set_xlabel('Validation batch index', fontsize=12)
         ax.set_ylabel('Loss', fontsize=12)
-        ax.set_title(
-            f'Validation Loss — epoch {epoch_label} '
-            f'({status}, n={len(self.batch_losses)} batches)',
-            fontsize=14, fontweight='bold',
-        )
+        if title is None:
+            title = (
+                f'Validation Loss — epoch {epoch_label} '
+                f'({status}, n={len(self.batch_losses)} batches)'
+            )
+        ax.set_title(title, fontsize=14, fontweight='bold')
         ax.legend(fontsize=10)
         ax.grid(True, alpha=0.3)
 
@@ -1320,6 +1351,8 @@ class ValidationEpochLoss:
         print(f"Min / max:      {min(self.batch_losses):.6f} / {max(self.batch_losses):.6f}")
         if self.avg_loss is not None:
             print(f"Batch avg:      {self.avg_loss:.6f}")
+        if self.running_avgs:
+            print(f"Final running:  {self.running_avgs[-1]:.6f}")
         if self.moving_avgs:
             print(f"Final MA:       {self.moving_avgs[-1]:.6f}")
         print("=" * 60)
