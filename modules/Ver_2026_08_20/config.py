@@ -22,8 +22,8 @@ config = {
     # ============================================================
     # DATA SPLIT CONFIGURATION
     # ============================================================
-    'train_ratio': 0.96,
-    'val_ratio': 0.04,
+    'train_ratio': 0.95,
+    'val_ratio': 0.05,
     # False: train / val / test are consecutive in time (earliest → latest).
     # Training still shuffles the train split each epoch (DataLoader).
     'shuffle_split': False,
@@ -60,12 +60,12 @@ config = {
     # ------------------------------------------------------------
     'min_yield_percent': 0.26,   #
     # Also sets the sample future_window when label=yield
-    'max_hope_future_horizon': 30,
+    'max_hope_future_horizon': 50,
     # Model target from full cache (chance, near):
     #   'both'   → output_dim=2  (chance, near)
     #   'chance' → output_dim=1  (chance,)
     #   'near'   → output_dim=1  (near,)
-    'yield_target': 'near',
+    'yield_target': 'chance',
 
     # ------------------------------------------------------------
     # LATENT (label=latent) — same model as trend/yield
@@ -128,7 +128,7 @@ config = {
     'binance_interval': '1m',
     # Half-open-ish span in minutes: need end > start. Past window alone is
     # past_days * 1440 bars (e.g. 3 days → 4320) plus future_horizon.
-    'binance_start_date': '2024-01-01 00:00:00',
+    'binance_start_date': '2025-07-01 00:00:00',
     'binance_end_date': '2026-07-01 00:00:00',
     'binance_symbols': {
         "BTCUSDT": ["Close", "Volume"],
@@ -160,8 +160,8 @@ config = {
     # ============================================================
     'patch_size': 20,
     'embed_dim': None,  # AUTO-COMPUTED
-    'num_layers': 8,
-    'num_heads': 10,
+    'num_layers': 6,
+    'num_heads': 8,
     'ff_dim_multiplier': 4,
     'dropout': 0.1,
     'causal': False,
@@ -187,7 +187,7 @@ config = {
     'epochs': 12,
     'batch_size': 16,
     'learning_rate': 0.000_01, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
-    'save_every_n_minibatches': 5000,
+    'save_every_n_minibatches': 500,
     'checkpoint_dir': 'trading_checkpoints',
     # How many newest rolling weight files to keep (recency, not quality).
     # Best-val snapshot is stored separately as best_val.pt and is not rotated.
