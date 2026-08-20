@@ -22,8 +22,8 @@ config = {
     # ============================================================
     # DATA SPLIT CONFIGURATION
     # ============================================================
-    'train_ratio': 0.80,
-    'val_ratio': 0.10,
+    'train_ratio': 0.96,
+    'val_ratio': 0.04,
     # False: train / val / test are consecutive in time (earliest → latest).
     # Training still shuffles the train split each epoch (DataLoader).
     'shuffle_split': False,
@@ -60,7 +60,7 @@ config = {
     # ------------------------------------------------------------
     'min_yield_percent': 0.26,   #
     # Also sets the sample future_window when label=yield
-    'max_hope_future_horizon': 60,
+    'max_hope_future_horizon': 30,
     # Model target from full cache (chance, near):
     #   'both'   → output_dim=2  (chance, near)
     #   'chance' → output_dim=1  (chance,)
@@ -186,7 +186,7 @@ config = {
     # ============================================================
     'epochs': 12,
     'batch_size': 16,
-    'learning_rate': 0.000_001, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
+    'learning_rate': 0.000_01, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
     'save_every_n_minibatches': 5000,
     'checkpoint_dir': 'trading_checkpoints',
     # How many newest rolling weight files to keep (recency, not quality).
