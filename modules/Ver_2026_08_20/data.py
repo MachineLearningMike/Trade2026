@@ -337,16 +337,178 @@ def generate_dataset_signature(config: dict) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-# BINANCE DATA LOADER
+# BINANCE DATA LOADER + KEYED CACHE
 # ═══════════════════════════════════════════════════════════
+
+BINANCE_CACHE_SUBDIR = 'binance'
+BINANCE_FEATURES_FILENAME = 'features.npy'
+BINANCE_META_FILENAME = 'meta.json'
+
+
+def generate_binance_data_key(config: dict) -> str:
+    """
+    Hash config parameters that determine the Binance market-series payload.
+
+    Order of ``binance_symbols`` entries is preserved (feature layout depends
+    on it). Label / split / model hyperparams are intentionally omitted.
+    """
+    symbol_dict = config.get('binance_symbols') or {}
+    # List-of-pairs keeps symbol insertion order under sort_keys=True dumps.
+    symbols_ordered = [
+        {'symbol': str(sym), 'columns': list(cols)}
+        for sym, cols in symbol_dict.items()
+    ]
+    pred = config.get('prediction_target', ('UNKNOWN', 'UNKNOWN'))
+    key_params = {
+        'binance_datatype': config.get('binance_datatype', 'klines'),
+        'binance_interval': config.get('binance_interval', '1m'),
+        'binance_start_date': config.get('binance_start_date'),
+        'binance_end_date': config.get('binance_end_date'),
+        'binance_symbols': symbols_ordered,
+        'prediction_target': list(pred) if pred is not None else None,
+    }
+    param_string = json.dumps(key_params, sort_keys=True, default=str)
+    return hashlib.md5(param_string.encode()).hexdigest()[:16]
+
+
+def binance_cache_dir(config: dict, key: Optional[str] = None) -> Path:
+    """Return ``<data_dir>/binance/<key>/`` for the active config."""
+    data_dir = Path(config.get('data_dir', 'dataset_cache'))
+    if key is None:
+        key = generate_binance_data_key(config)
+    return data_dir / BINANCE_CACHE_SUBDIR / key
+
+
+def _save_binance_cache(
+    cache_dir: Path,
+    key: str,
+    features: List[np.ndarray],
+    T: int,
+    nForget: int,
+    target_feature_id: int,
+    feature_names: List[str],
+) -> Path:
+    """Persist stacked market features + load metadata under ``cache_dir``.
+
+    ``meta.json`` stores only fields needed to restore the arrays — not the
+    config inputs already hashed into ``binance_key`` / the folder name.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    features_arr = np.stack(
+        [np.asarray(f, dtype=np.float32) for f in features], axis=0
+    )
+    if features_arr.ndim != 2 or features_arr.shape[1] != int(T):
+        raise ValueError(
+            f"Binance cache features shape {features_arr.shape} incompatible "
+            f"with T={T}"
+        )
+    features_path = cache_dir / BINANCE_FEATURES_FILENAME
+    meta_path = cache_dir / BINANCE_META_FILENAME
+    tmp_features = features_path.with_suffix('.tmp.npy')
+    tmp_meta = meta_path.with_suffix('.tmp.json')
+
+    np.save(tmp_features, features_arr)
+    os.replace(tmp_features, features_path)
+
+    meta = {
+        'binance_key': key,
+        'T': int(T),
+        'F': int(features_arr.shape[0]),
+        'nForget': int(nForget) if nForget is not None else 0,
+        'target_feature_id': int(target_feature_id),
+        'feature_names': list(feature_names),
+        'saved_at': time.time(),
+    }
+    with open(tmp_meta, 'w', encoding='utf-8') as f:
+        json.dump(meta, f, indent=2, default=str)
+    os.replace(tmp_meta, meta_path)
+    return cache_dir
+
+
+def _load_binance_cache(cache_dir: Path, key: str):
+    """
+    Load cached Binance market data.
+
+    Returns:
+        (features_list, T, nForget, target_feature_id, feature_names) or None
+    """
+    features_path = cache_dir / BINANCE_FEATURES_FILENAME
+    meta_path = cache_dir / BINANCE_META_FILENAME
+    if not features_path.exists() or not meta_path.exists():
+        return None
+    try:
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+        if meta.get('binance_key') not in (None, key):
+            print(
+                f"⚠ Binance cache key mismatch "
+                f"(meta={meta.get('binance_key')}, expected={key}); ignoring cache."
+            )
+            return None
+        features_arr = np.load(features_path)
+        if features_arr.ndim != 2:
+            print(
+                f"⚠ Binance cache features.npy has shape {features_arr.shape}; "
+                f"expected 2-D (F, T)."
+            )
+            return None
+        T_meta = int(meta.get('T', features_arr.shape[1]))
+        F_meta = int(meta.get('F', features_arr.shape[0]))
+        if features_arr.shape != (F_meta, T_meta):
+            print(
+                f"⚠ Binance cache shape {features_arr.shape} != meta "
+                f"(F={F_meta}, T={T_meta}); ignoring cache."
+            )
+            return None
+        feature_names = list(meta.get('feature_names') or [])
+        if feature_names and len(feature_names) != features_arr.shape[0]:
+            print(
+                f"⚠ Binance cache feature_names length "
+                f"{len(feature_names)} != F={features_arr.shape[0]}; ignoring."
+            )
+            return None
+        if not feature_names:
+            feature_names = [f'feature_{i}' for i in range(features_arr.shape[0])]
+        nForget = int(meta.get('nForget', 0))
+        target_feature_id = int(meta.get('target_feature_id', 0))
+        features = [features_arr[i].astype(np.float32, copy=False) for i in range(features_arr.shape[0])]
+        return features, T_meta, nForget, target_feature_id, feature_names
+    except Exception as e:
+        print(f"⚠ Failed to load Binance cache from {cache_dir}: {e}")
+        return None
+
 
 def get_binance_data(config):
     """Get data from Binance using the configured parameters.
+
+    Looks up ``<data_dir>/binance/<binance_key>/`` first. On a miss (or when
+    ``force_recompute`` is set), fetches from Binance and saves under that key.
 
     Returns:
         features, T, nForget, target_feature_id, feature_names
         On failure all five values are None.
     """
+    key = generate_binance_data_key(config)
+    cache_dir = binance_cache_dir(config, key)
+    force = bool(config.get('force_recompute', False))
+
+    print(f"🔑 Binance data key: {key}")
+    print(f"📁 Binance cache dir: {cache_dir}")
+
+    if not force:
+        cached = _load_binance_cache(cache_dir, key)
+        if cached is not None:
+            features, T, nForget, target_feature_id, feature_names = cached
+            print(f"✓ Binance cache hit ({cache_dir.name})")
+            print(f"  Number of features: {len(features)}")
+            print(f"  Time points: {T}")
+            print(f"  Forgotten points: {nForget}")
+            print(f"  Target feature Id: {target_feature_id}")
+            return features, T, nForget, target_feature_id, feature_names
+        print("⚠ Binance cache miss — fetching from source.")
+    else:
+        print("⚠ force_recompute=True — refetching Binance data.")
+
     if Binance is None:
         print("⚠ Binance not available.")
         return None, None, None, None, None
@@ -384,6 +546,20 @@ def get_binance_data(config):
         print(f"  Time points: {T}")
         print(f"  Forgotten points: {nForget}")
         print(f"  Target feature Id: {target_feature_id}")
+
+        try:
+            saved = _save_binance_cache(
+                cache_dir,
+                key,
+                features,
+                T,
+                nForget,
+                target_feature_id,
+                feature_names,
+            )
+            print(f"✓ Saved Binance data → {saved}")
+        except Exception as e:
+            print(f"⚠ Failed to save Binance cache: {e}")
 
         return features, T, nForget, target_feature_id, feature_names
         
