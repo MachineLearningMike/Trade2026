@@ -1110,10 +1110,11 @@ class ValidationEpochLoss:
     Per-batch loss history for one validation pass.
 
     Saved as validation_loss_epoch_{e}.json under the checkpoint directory so
-    it can be inspected later with --validation e without reloading weights.
-    ``epoch`` and ``batch_indices`` are 1-based (epoch id / batch index within
-    that validation run). Validation uses shuffle=False, so batch order is
-    stable. Plots use batch index on the x-axis with:
+    it can be inspected later with ``--validation E [V1] [V2]`` without
+    reloading weights. ``epoch`` and ``batch_indices`` are 1-based (epoch id /
+    batch index within that validation run). Validation uses shuffle=False, so
+    batch order is stable. Optional percent args slice the saved batch series
+    before plotting. Plots use batch index on the x-axis with:
       - batch loss
       - sliding moving average
       - running loss (cumulative mean of losses so far)
@@ -1269,33 +1270,87 @@ class ValidationEpochLoss:
             return None
         return cls.load(save_dir, epochs[-1])
 
+    @staticmethod
+    def _percent_slice_bounds(
+        n: int, percent_lo: float = 0.0, percent_hi: float = 100.0
+    ) -> Tuple[int, int]:
+        """Map [percent_lo, percent_hi] onto ``[start, end)`` over ``n`` batches."""
+        lo = float(percent_lo)
+        hi = float(percent_hi)
+        if not (0.0 <= lo < hi <= 100.0):
+            raise ValueError(
+                f"percent slice requires 0 <= V1 < V2 <= 100 (got V1={lo}, V2={hi})"
+            )
+        if n <= 0:
+            return 0, 0
+        start = int(n * lo / 100.0)
+        end = n if hi >= 100.0 else int(n * hi / 100.0)
+        if end <= start:
+            end = min(n, start + 1)
+        return start, end
+
+    def _sliced_series(
+        self, percent_lo: float = 0.0, percent_hi: float = 100.0
+    ) -> Tuple[List[int], List[float], List[float], List[float], float]:
+        """
+        Return ``(xs, losses, moving_avgs, running_avgs, batch_avg)`` for the
+        percent slice. MA / running loss are recomputed on the sliced losses.
+        """
+        n = len(self.batch_losses)
+        start, end = self._percent_slice_bounds(n, percent_lo, percent_hi)
+        losses = self.batch_losses[start:end]
+        if not losses:
+            return [], [], [], [], float('nan')
+        xs_all = self.batch_indices if self.batch_indices else list(
+            range(1, n + 1)
+        )
+        xs = xs_all[start:end]
+        ma_window = max(1, int(self.DEFAULT_MA_WINDOW))
+        moving = self._moving_average(losses, ma_window)
+        running = self._running_average(losses)
+        batch_avg = float(sum(losses) / len(losses))
+        return xs, losses, moving, running, batch_avg
+
     def plot(
         self,
         save_path: Optional[str] = None,
         figsize: Tuple[int, int] = (12, 6),
         title: Optional[str] = None,
+        percent_lo: float = 0.0,
+        percent_hi: float = 100.0,
     ):
         if not self.batch_losses:
             print("No validation batch losses to plot.")
             return None
 
-        xs = self.batch_indices if self.batch_indices else list(
-            range(1, len(self.batch_losses) + 1)
-        )
-        # Always recompute with the current default so legend/curve match config.
+        try:
+            xs, losses, moving_avgs, running_avgs, batch_avg = self._sliced_series(
+                percent_lo, percent_hi
+            )
+        except ValueError as e:
+            print(f"⚠ {e}")
+            return None
+        if not losses:
+            print(
+                f"⚠ Percent slice [{percent_lo:g}%, {percent_hi:g}%] "
+                f"selected 0 of {len(self.batch_losses)} batches."
+            )
+            return None
+
+        # Keep instance MA fields in sync with the full series default window.
         self.ma_window = max(1, int(self.DEFAULT_MA_WINDOW))
         self.moving_avgs = self._moving_average(self.batch_losses, self.ma_window)
         self.running_avgs = self._running_average(self.batch_losses)
 
         fig, ax = plt.subplots(figsize=figsize)
-        ax.plot(xs, self.batch_losses, 'b-', linewidth=1.0, alpha=0.75,
+        ax.plot(xs, losses, 'b-', linewidth=1.0, alpha=0.75,
                 label='Batch loss')
         ax.plot(
-            xs, self.moving_avgs, 'r-', linewidth=2.0,
+            xs, moving_avgs, 'r-', linewidth=2.0,
             label=f'Moving avg (window={self.ma_window})',
         )
         ax.plot(
-            xs, self.running_avgs, color='orange', linewidth=2.0,
+            xs, running_avgs, color='orange', linewidth=2.0,
             label='Running loss',
         )
 
@@ -1303,24 +1358,27 @@ class ValidationEpochLoss:
         status = 'complete' if self.complete else 'partial'
         ax.set_xlabel('Validation batch index', fontsize=12)
         ax.set_ylabel('Loss', fontsize=12)
+        slice_note = ''
+        if float(percent_lo) > 0.0 or float(percent_hi) < 100.0:
+            slice_note = f', [{percent_lo:g}%, {percent_hi:g}%]'
         if title is None:
             title = (
                 f'Validation Loss — epoch {epoch_label} '
-                f'({status}, n={len(self.batch_losses)} batches)'
+                f'({status}, n={len(losses)}/{len(self.batch_losses)} batches'
+                f'{slice_note})'
             )
         ax.set_title(title, fontsize=14, fontweight='bold')
         ax.legend(fontsize=10)
         ax.grid(True, alpha=0.3)
 
-        if self.avg_loss is not None:
-            ax.axhline(
-                self.avg_loss, color='green', linestyle='--', linewidth=1,
-                label=f'Batch avg={self.avg_loss:.4f}',
-            )
-            ax.legend(fontsize=10)
+        ax.axhline(
+            batch_avg, color='green', linestyle='--', linewidth=1,
+            label=f'Batch avg={batch_avg:.4f}',
+        )
+        ax.legend(fontsize=10)
 
-        min_loss = min(self.batch_losses)
-        min_i = self.batch_losses.index(min_loss)
+        min_loss = min(losses)
+        min_i = losses.index(min_loss)
         ax.annotate(
             f'Min: {min_loss:.4f}',
             xy=(xs[min_i], min_loss),
@@ -1335,26 +1393,46 @@ class ValidationEpochLoss:
         plt.show()
         return fig
 
-    def print_summary(self):
+    def print_summary(
+        self, percent_lo: float = 0.0, percent_hi: float = 100.0
+    ):
         if not self.batch_losses:
             print("No validation batch loss history available.")
             return
+        try:
+            xs, losses, moving_avgs, running_avgs, batch_avg = self._sliced_series(
+                percent_lo, percent_hi
+            )
+        except ValueError as e:
+            print(f"⚠ {e}")
+            return
+        if not losses:
+            print(
+                f"⚠ Percent slice [{percent_lo:g}%, {percent_hi:g}%] "
+                f"selected 0 of {len(self.batch_losses)} batches."
+            )
+            return
         epoch_label = self.epoch if self.epoch is not None else '?'
         status = 'complete' if self.complete else 'partial'
+        self.ma_window = max(1, int(self.DEFAULT_MA_WINDOW))
         print("\n" + "=" * 60)
         print("VALIDATION EPOCH LOSS SUMMARY")
         print("=" * 60)
         print(f"Epoch:          {epoch_label} ({status})")
-        print(f"Batches:        {len(self.batch_losses)}")
+        if float(percent_lo) > 0.0 or float(percent_hi) < 100.0:
+            print(
+                f"Coverage:       [{percent_lo:g}%, {percent_hi:g}%] "
+                f"(batches {xs[0]}–{xs[-1]})"
+            )
+        print(f"Batches:        {len(losses)} / {len(self.batch_losses)}")
         print(f"MA window:      {self.ma_window}")
-        print(f"First / last:   {self.batch_losses[0]:.6f} / {self.batch_losses[-1]:.6f}")
-        print(f"Min / max:      {min(self.batch_losses):.6f} / {max(self.batch_losses):.6f}")
-        if self.avg_loss is not None:
-            print(f"Batch avg:      {self.avg_loss:.6f}")
-        if self.running_avgs:
-            print(f"Final running:  {self.running_avgs[-1]:.6f}")
-        if self.moving_avgs:
-            print(f"Final MA:       {self.moving_avgs[-1]:.6f}")
+        print(f"First / last:   {losses[0]:.6f} / {losses[-1]:.6f}")
+        print(f"Min / max:      {min(losses):.6f} / {max(losses):.6f}")
+        print(f"Batch avg:      {batch_avg:.6f}")
+        if running_avgs:
+            print(f"Final running:  {running_avgs[-1]:.6f}")
+        if moving_avgs:
+            print(f"Final MA:       {moving_avgs[-1]:.6f}")
         print("=" * 60)
 
 

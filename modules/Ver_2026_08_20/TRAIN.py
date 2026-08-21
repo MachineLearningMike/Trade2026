@@ -231,12 +231,16 @@ def main(config):
         ),
     )
     parser.add_argument(
-        '--validation', type=int, nargs='?', const=-1, default=None, metavar='E',
+        '--validation', nargs='*', default=None, metavar='E',
         help=(
-            'Plot per-batch validation loss over batch index for epoch E '
-            '(no market data load), including moving average and running loss. '
-            'Curves are written during training as validation_loss_epoch_<E>.json. '
-            'Use --validation <epoch>, or --validation for the latest saved epoch.'
+            'Plot per-batch validation loss for epoch E (no market data load), '
+            'including moving average and running loss. Curves come from '
+            'validation_loss_epoch_<E>.json written during training. '
+            'Optional percent slice of the saved batch series: '
+            '--validation → latest epoch, [0%%, 100%%]; '
+            '--validation E → epoch E, [0%%, 100%%]; '
+            '--validation E V2 → epoch E, [0%%, V2%%]; '
+            '--validation E V1 V2 → epoch E, [V1%%, V2%%].'
         ),
     )
     parser.add_argument(
@@ -705,7 +709,7 @@ def main(config):
         return
 
     # ============================================================
-    # STEP 2c: Handle --validation flag (per-batch val curve for epoch E)
+    # STEP 2c: Handle --validation [E [V1] [V2]] (per-batch val curve)
     # ============================================================
     if args.validation is not None:
         print("\n" + "=" * 60)
@@ -724,9 +728,48 @@ def main(config):
             validation_loss_path,
         )
 
-        requested_epoch = None if args.validation < 0 else int(args.validation)
-        if requested_epoch is not None and requested_epoch < 1:
-            print("⚠ Epoch must be >= 1 (1-based), or omit E for the latest saved run.")
+        # --validation → latest, [0,100]
+        # --validation E → epoch E, [0,100]
+        # --validation E V2 → epoch E, [0, V2]
+        # --validation E V1 V2 → epoch E, [V1, V2]
+        val_args = list(args.validation)
+        if len(val_args) > 3:
+            print(
+                "⚠ --validation accepts at most three values: "
+                "E  |  E V2  |  E V1 V2  (or bare --validation for latest)."
+            )
+            return
+        requested_epoch = None
+        percent_lo, percent_hi = 0.0, 100.0
+        if len(val_args) >= 1:
+            try:
+                requested_epoch = int(float(val_args[0]))
+            except (TypeError, ValueError):
+                print(f"⚠ --validation epoch must be an integer (got {val_args[0]!r}).")
+                return
+            if requested_epoch < 1:
+                print("⚠ Epoch must be >= 1 (1-based), or omit E for the latest saved run.")
+                return
+        if len(val_args) == 2:
+            try:
+                percent_lo, percent_hi = 0.0, float(val_args[1])
+            except (TypeError, ValueError):
+                print(f"⚠ --validation V2 must be a number (got {val_args[1]!r}).")
+                return
+        elif len(val_args) == 3:
+            try:
+                percent_lo, percent_hi = float(val_args[1]), float(val_args[2])
+            except (TypeError, ValueError):
+                print(
+                    f"⚠ --validation V1 V2 must be numbers "
+                    f"(got {val_args[1]!r}, {val_args[2]!r})."
+                )
+                return
+        if not (0.0 <= percent_lo < percent_hi <= 100.0):
+            print(
+                f"⚠ --validation requires 0 <= V1 < V2 <= 100 "
+                f"(got V1={percent_lo:g}, V2={percent_hi:g})"
+            )
             return
 
         def _list_val_runs():
@@ -749,9 +792,13 @@ def main(config):
                 return False
             try:
                 print(f"📁 Checkpoint: {subdir.name}{label}")
-                ve.print_summary()
+                ve.print_summary(percent_lo=percent_lo, percent_hi=percent_hi)
                 plot_path = subdir / f'validation_loss_epoch_{epoch}_view.png'
-                ve.plot(save_path=str(plot_path))
+                ve.plot(
+                    save_path=str(plot_path),
+                    percent_lo=percent_lo,
+                    percent_hi=percent_hi,
+                )
                 print(f"   Validation loss plot saved to: {plot_path}\n")
                 return True
             except Exception as e:
@@ -787,6 +834,7 @@ def main(config):
             print("🎯 Epoch:             latest saved")
         else:
             print(f"🎯 Epoch:             {requested_epoch}")
+        print(f"🎯 Coverage:          [{percent_lo:g}%, {percent_hi:g}%] of val batches")
 
         if current_dir.exists():
             epochs = list_validation_loss_epochs(current_dir)
