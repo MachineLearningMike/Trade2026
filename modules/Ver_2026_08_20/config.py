@@ -10,11 +10,11 @@ config = {
     # ============================================================
     # DATA CONFIGURATION
     # ============================================================
-    'past_days': 2,     # 1, 2,
+    'past_hours': 36,     # 1, 2, 36 (= 1.5 days)
     # future_window length is NOT set here — see label-mode horizons below:
     #   trend  → max_trend_future_horizon
     #   yield → max_hope_future_horizon
-    'step': 2,
+    'step': 3,
     'num_features': 5,
     'num_shapes': 4,
     'total_synthetic_days': 30,
@@ -127,12 +127,12 @@ config = {
     'binance_datatype': 'klines',
     'binance_interval': '1m',
     # Half-open-ish span in minutes: need end > start. Past window alone is
-    # past_days * 1440 bars (e.g. 3 days → 4320) plus future_horizon.
+    # past_hours * 60 bars (e.g. 36 hours → 2160) plus future_horizon.
     'binance_start_date': '2024-01-01 00:00:00',
     'binance_end_date': '2026-07-01 00:00:00',
     'binance_symbols': {
         "BTCUSDT": ["Close", "Volume"],
-        "ETHUSDT": ["Close", "Volume"],
+        # "ETHUSDT": ["Close", "Volume"],
     },
     'prediction_target': ("BTCUSDT", "Close"),
     'binance_primary_symbol': "BTCUSDT",
@@ -185,7 +185,7 @@ config = {
     # TRAINING CONFIGURATION
     # ============================================================
     'epochs': 12,
-    'batch_size': 16,
+    'batch_size': 24,
     'learning_rate': 0.000_01, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
     'save_every_n_minibatches': 500,
     'checkpoint_dir': 'trading_checkpoints',
