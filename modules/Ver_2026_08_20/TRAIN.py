@@ -147,14 +147,14 @@ def get_dataset(config):
     n_market_features = market_arr.shape[0]
     n_macro_features = macro_features.shape[0]
 
-    past_bars = 60 * 24 * int(config.get('past_days', 7))
+    past_bars = int(60 * config.get('past_hours', 36))
     future_bars = int(resolve_future_window(config))
     need_T = past_bars + future_bars
     if T < need_T:
         print(
             f"⚠ Time length T={T} is shorter than past+future "
             f"({past_bars}+{future_bars}={need_T}). "
-            f"Widen binance_start_date..binance_end_date or reduce past_days / horizons."
+            f"Widen binance_start_date..binance_end_date or reduce past_hours / horizons."
         )
         sys.exit(1)
 
@@ -172,7 +172,7 @@ def get_dataset(config):
         n_macro_features=n_macro_features,
         feature_names=market_feature_names + macro_feature_names_full,
         price_feature_idx=target_feature_id,
-        past_days=config['past_days'],
+        past_hours=config['past_hours'],
         future_minutes=resolve_future_window(config),
         step=config['step'],
         max_accum_deviation=config['max_accum_deviation'],
@@ -285,7 +285,7 @@ def main(config):
             'config test_viz_samples.'
         ),
     )
-    parser.add_argument('--past-days', type=int, default=config['past_days'], help='Past days for input')
+    parser.add_argument('--past-hours', type=float, default=config['past_hours'], help='Past hours for input')
     parser.add_argument(
         '--max-trend-future-horizon', type=int,
         default=config.get('max_trend_future_horizon', 50),
@@ -380,7 +380,7 @@ def main(config):
     config['epochs'] = args.epochs
     config['save_every_n_minibatches'] = args.save_every
     config['clean'] = args.clean
-    config['past_days'] = args.past_days
+    config['past_hours'] = args.past_hours
     config['max_trend_future_horizon'] = args.max_trend_future_horizon
     config['max_hope_future_horizon'] = args.max_hope_future_horizon
     config['batch_size'] = args.batch_size
@@ -1010,7 +1010,7 @@ def main(config):
 
     dataset, total_features = get_dataset(config)
     
-    past_window = 60 * 24 * config['past_days']
+    past_window = int(60 * config['past_hours'])
     # total_features is (F, T); model uses latent macro compression for embed_dim
     F = total_features.shape[0] if hasattr(total_features, 'shape') else len(total_features)
     n_features_after_latent = dataset.n_market_features + config['n_latent_macro_features']
@@ -1151,7 +1151,7 @@ def main(config):
     print(f"  Train: {len(dataset.train_indices)} samples")
     print(f"  Val: {len(dataset.val_indices)} samples")
     print(f"  Test: {len(dataset.test_indices)} samples")
-    print(f"Past days: {config['past_days']} ({past_window} minutes)")
+    print(f"Past hours: {config['past_hours']} ({past_window} minutes)")
     print(f"Label mode: {config.get('label', 'trend')}")
     print(f"Future window: {dataset.future_window} minutes")
     print(f"Step: {config['step']} minute(s)")

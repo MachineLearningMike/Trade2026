@@ -619,7 +619,7 @@ if __name__ == "__main__":
     config = get_config()
     device = config['device']
 
-    past_window = 60 * 24 * config['past_days']
+    past_window = int(60 * config['past_hours'])
     n_market = 4
     n_macro = 10
     n_latent = config['n_latent_macro_features']

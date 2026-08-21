@@ -188,7 +188,7 @@ def load_model(
     """
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-    past_window = 60 * 24 * config['past_days']
+    past_window = int(60 * config['past_hours'])
     max_seq_len = checkpoint.get('max_seq_len')
     if max_seq_len is None:
         max_seq_len = past_window // config['patch_size']

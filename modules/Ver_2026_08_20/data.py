@@ -273,7 +273,7 @@ def generate_dataset_signature(config: dict) -> str:
     layout = resolve_feature_layout(config)
     T = estimate_T_from_config(config)
 
-    past_days = config.get('past_days', 7)
+    past_hours = config.get('past_hours', 36)
     future_window = resolve_future_window(config)
     max_trend_future = int(config.get('max_trend_future_horizon', future_window))
 
@@ -299,7 +299,7 @@ def generate_dataset_signature(config: dict) -> str:
         'num_shapes': config.get('num_shapes', 4),
 
         # --- windowing / sampling ---
-        'past_days': past_days,
+        'past_hours': past_hours,
         'future_window': future_window,
         'step': config.get('step', 1),
 
@@ -343,14 +343,17 @@ def generate_dataset_signature(config: dict) -> str:
 BINANCE_CACHE_SUBDIR = 'binance'
 BINANCE_FEATURES_FILENAME = 'features.npy'
 BINANCE_META_FILENAME = 'meta.json'
+# Bump when the on-disk Binance cache contract changes (meta fields, keying,
+# or payload layout). Included in the folder hash so old folders miss.
+BINANCE_CACHE_VERSION = 2
 
 
-def generate_binance_data_key(config: dict) -> str:
+def _binance_key_params(config: dict) -> dict:
     """
-    Hash config parameters that determine the Binance market-series payload.
+    Config fields that determine the Binance market-series payload.
 
     Order of ``binance_symbols`` entries is preserved (feature layout depends
-    on it). Label / split / model hyperparams are intentionally omitted.
+    on it). Label / split / model / past_hours hyperparams are omitted.
     """
     symbol_dict = config.get('binance_symbols') or {}
     # List-of-pairs keeps symbol insertion order under sort_keys=True dumps.
@@ -359,7 +362,8 @@ def generate_binance_data_key(config: dict) -> str:
         for sym, cols in symbol_dict.items()
     ]
     pred = config.get('prediction_target', ('UNKNOWN', 'UNKNOWN'))
-    key_params = {
+    return {
+        'cache_version': BINANCE_CACHE_VERSION,
         'binance_datatype': config.get('binance_datatype', 'klines'),
         'binance_interval': config.get('binance_interval', '1m'),
         'binance_start_date': config.get('binance_start_date'),
@@ -367,7 +371,13 @@ def generate_binance_data_key(config: dict) -> str:
         'binance_symbols': symbols_ordered,
         'prediction_target': list(pred) if pred is not None else None,
     }
-    param_string = json.dumps(key_params, sort_keys=True, default=str)
+
+
+def generate_binance_data_key(config: dict) -> str:
+    """Hash ``_binance_key_params(config)`` to a short folder name."""
+    param_string = json.dumps(
+        _binance_key_params(config), sort_keys=True, default=str
+    )
     return hashlib.md5(param_string.encode()).hexdigest()[:16]
 
 
@@ -379,9 +389,24 @@ def binance_cache_dir(config: dict, key: Optional[str] = None) -> Path:
     return data_dir / BINANCE_CACHE_SUBDIR / key
 
 
+def _format_binance_key_params(key_params: dict) -> str:
+    symbols = key_params.get('binance_symbols') or []
+    sym_txt = ', '.join(
+        f"{s.get('symbol')}[{','.join(s.get('columns') or [])}]"
+        for s in symbols
+    ) or '(none)'
+    return (
+        f"{key_params.get('binance_datatype')}/"
+        f"{key_params.get('binance_interval')} "
+        f"{key_params.get('binance_start_date')} → "
+        f"{key_params.get('binance_end_date')} | {sym_txt}"
+    )
+
+
 def _save_binance_cache(
     cache_dir: Path,
     key: str,
+    key_params: dict,
     features: List[np.ndarray],
     T: int,
     nForget: int,
@@ -390,8 +415,8 @@ def _save_binance_cache(
 ) -> Path:
     """Persist stacked market features + load metadata under ``cache_dir``.
 
-    ``meta.json`` stores only fields needed to restore the arrays — not the
-    config inputs already hashed into ``binance_key`` / the folder name.
+    ``meta.json`` stores restore fields and the exact ``key_params`` used so
+    loads can reject folders that only match by hash accident / old schema.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
     features_arr = np.stack(
@@ -412,6 +437,8 @@ def _save_binance_cache(
 
     meta = {
         'binance_key': key,
+        'cache_version': BINANCE_CACHE_VERSION,
+        'key_params': key_params,
         'T': int(T),
         'F': int(features_arr.shape[0]),
         'nForget': int(nForget) if nForget is not None else 0,
@@ -425,7 +452,7 @@ def _save_binance_cache(
     return cache_dir
 
 
-def _load_binance_cache(cache_dir: Path, key: str):
+def _load_binance_cache(cache_dir: Path, key: str, key_params: dict):
     """
     Load cached Binance market data.
 
@@ -443,6 +470,30 @@ def _load_binance_cache(cache_dir: Path, key: str):
             print(
                 f"⚠ Binance cache key mismatch "
                 f"(meta={meta.get('binance_key')}, expected={key}); ignoring cache."
+            )
+            return None
+        # Reject pre-v2 folders (no key_params) and any param drift.
+        meta_params = meta.get('key_params')
+        if not isinstance(meta_params, dict):
+            print(
+                "⚠ Binance cache missing key_params (old schema); "
+                "ignoring cache."
+            )
+            return None
+        if meta.get('cache_version') != BINANCE_CACHE_VERSION:
+            print(
+                f"⚠ Binance cache_version "
+                f"{meta.get('cache_version')!r} != {BINANCE_CACHE_VERSION}; "
+                "ignoring cache."
+            )
+            return None
+        expected = json.dumps(key_params, sort_keys=True, default=str)
+        actual = json.dumps(meta_params, sort_keys=True, default=str)
+        if actual != expected:
+            print(
+                "⚠ Binance cache key_params mismatch; ignoring cache.\n"
+                f"  meta: {_format_binance_key_params(meta_params)}\n"
+                f"  want: {_format_binance_key_params(key_params)}"
             )
             return None
         features_arr = np.load(features_path)
@@ -488,15 +539,17 @@ def get_binance_data(config):
         features, T, nForget, target_feature_id, feature_names
         On failure all five values are None.
     """
+    key_params = _binance_key_params(config)
     key = generate_binance_data_key(config)
     cache_dir = binance_cache_dir(config, key)
     force = bool(config.get('force_recompute', False))
 
     print(f"🔑 Binance data key: {key}")
     print(f"📁 Binance cache dir: {cache_dir}")
+    print(f"   {_format_binance_key_params(key_params)}")
 
     if not force:
-        cached = _load_binance_cache(cache_dir, key)
+        cached = _load_binance_cache(cache_dir, key, key_params)
         if cached is not None:
             features, T, nForget, target_feature_id, feature_names = cached
             print(f"✓ Binance cache hit ({cache_dir.name})")
@@ -551,6 +604,7 @@ def get_binance_data(config):
             saved = _save_binance_cache(
                 cache_dir,
                 key,
+                key_params,
                 features,
                 T,
                 nForget,
@@ -1069,7 +1123,7 @@ class TradingDataset(Dataset):
         n_macro_features: int,
         feature_names: List[str],
         price_feature_idx: int,
-        past_days: int = 7,
+        past_hours: float = 36,
         future_minutes: Optional[int] = None,
         step: int = 1,
         max_accum_deviation: float = 12.0,
@@ -1085,7 +1139,7 @@ class TradingDataset(Dataset):
         self.feature_names = feature_names
         self.n_market_features = n_market_features
         self.n_macro_features = n_macro_features
-        self.past_days = past_days
+        self.past_hours = past_hours
         self.price_feature_idx = price_feature_idx
         self.step = step
         self.max_accum_deviation = max_accum_deviation
@@ -1206,7 +1260,7 @@ class TradingDataset(Dataset):
         self.Total = self._stack_features(features)
         self.T, self.F = self.Total.shape
         
-        self.past_window = 60 * 24 * past_days
+        self.past_window = int(60 * past_hours)
         self.future_window = self.future_minutes
         self.total_window = self.past_window + self.future_window
         
@@ -1254,7 +1308,7 @@ class TradingDataset(Dataset):
         
         print(f"\nTradingDataset initialized:")
         print(f"  Features: {self.F}, Time steps: {self.T}")
-        print(f"  Past window: {self.past_window} minutes ({past_days} days)")
+        print(f"  Past window: {self.past_window} minutes ({past_hours} hours)")
         _fw_src = {
             LABEL_YIELD: 'max_hope_future_horizon',
             LABEL_LATENT: 'max_latent_future_horizon',
