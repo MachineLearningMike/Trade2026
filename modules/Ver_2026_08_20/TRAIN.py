@@ -264,6 +264,18 @@ def main(config):
     parser.add_argument('--features', action='store_true', default=False,
                        help='Visualize total_features without training')
     parser.add_argument(
+        '--validate-yield', nargs='?', const=-1, default=None, type=int,
+        metavar='N',
+        help=(
+            'Load the latest checkpoint and plot chance / near over '
+            'validation samples (yield label mode). '
+            '--validate-yield uses all val samples; --validate-yield N uses '
+            'N samples spaced across the chronological validation period. '
+            'Shows series + pred-vs-true plots, then interactive yield windows. '
+            'Batch size is config validate_batch_size.'
+        ),
+    )
+    parser.add_argument(
         '--test', nargs='?', const=-1, default=None, type=int, metavar='N',
         help=(
             'Run test-set evaluation without training (same as INFER.py). '
@@ -939,6 +951,31 @@ def main(config):
             percent_hi=percent_hi,
             checkpoint_mode=_validate_mode,
         )
+        return
+
+    # ============================================================
+    # STEP 3a2: Handle --validate-yield / --validate-yield N
+    # ============================================================
+    if args.validate_yield is not None:
+        max_samples = None if args.validate_yield < 0 else args.validate_yield
+        val_bs = config.get(
+            'validate_batch_size',
+            config.get('test_batch_size', config.get('batch_size', 8)),
+        )
+
+        print("\n" + "=" * 60)
+        print("✅ VALIDATE-YIELD MODE")
+        print("=" * 60)
+        print("Loads dataset + latest checkpoint, evaluates validation samples.")
+        print(f"  Samples: {'all' if max_samples is None else max_samples}")
+        print(f"  Batch size (config validate_batch_size): {val_bs}")
+        print("  Plots: chance / near over val samples + interactive windows")
+        print("=" * 60 + "\n")
+
+        from INFER import run_validate_yield
+
+        run_validate_yield(config, max_samples=max_samples, visualize=True)
+        print("\n✅ Validate-yield completed!")
         return
 
     # ============================================================

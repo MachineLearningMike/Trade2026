@@ -65,7 +65,7 @@ config = {
     #   'both'   → output_dim=2  (chance, near)
     #   'chance' → output_dim=1  (chance,)
     #   'near'   → output_dim=1  (near,)
-    'yield_target': 'chance',
+    'yield_target': 'both',
 
     # ------------------------------------------------------------
     # LATENT (label=latent) — same model as trend/yield
@@ -128,7 +128,7 @@ config = {
     'binance_interval': '1m',
     # Half-open-ish span in minutes: need end > start. Past window alone is
     # past_days * 1440 bars (e.g. 3 days → 4320) plus future_horizon.
-    'binance_start_date': '2025-07-01 00:00:00',
+    'binance_start_date': '2024-01-01 00:00:00',
     'binance_end_date': '2026-07-01 00:00:00',
     'binance_symbols': {
         "BTCUSDT": ["Close", "Volume"],

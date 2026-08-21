@@ -332,17 +332,16 @@ def _select_test_indices(
     return selected
 
 
-def run_inference_on_test_set(
+def run_inference_on_indices(
     model,
     dataset,
+    indices: List[int],
     device: str = 'cuda',
     batch_size: int = 8,
-    max_samples: Optional[int] = None,
-    shuffle: bool = True,
-    seed: int = 42,
+    split_name: str = 'samples',
 ):
     """
-    Stream the test split in batches. Never stacks the full test windows.
+    Stream arbitrary dataset indices in batches. Never stacks full windows.
 
     model.forward expects:
         x:     (B, T, F)
@@ -358,26 +357,20 @@ def run_inference_on_test_set(
         labels: (N, target_dim) on `device`
                 trend/yield → denormalized targets (target_dim = output_dim)
                 latent      → label-normalized scalar observation (target_dim = 1)
-        used_indices: list of dataset indices that were evaluated
+        used_indices: list of dataset indices that were evaluated (same order)
     """
     model.eval()
 
-    test_indices = _select_test_indices(
-        dataset,
-        max_samples=max_samples,
-        shuffle=shuffle,
-        seed=seed,
-    )
-
-    n = len(test_indices)
+    used_indices = list(indices)
+    n = len(used_indices)
     if n == 0:
-        raise RuntimeError("No test samples available.")
+        raise RuntimeError(f"No {split_name} available.")
 
-    # Rough memory note so hangs are not mysterious next time
     bytes_per_window = dataset.past_window * dataset.F * 4
     full_gb = n * bytes_per_window / (1024 ** 3)
     print(
-        f"  Test samples: {n}  |  window≈{bytes_per_window / 1e6:.2f} MB each  "
+        f"  {split_name.capitalize()}: {n}  |  "
+        f"window≈{bytes_per_window / 1e6:.2f} MB each  "
         f"|  full stack would be ~{full_gb:.1f} GB → streaming batch_size={batch_size}",
         flush=True,
     )
@@ -390,10 +383,9 @@ def run_inference_on_test_set(
         for b in range(n_batches):
             start = b * batch_size
             end = min(start + batch_size, n)
-            batch_idx = test_indices[start:end]
+            batch_idx = used_indices[start:end]
 
             x, p, y, mean, std, shape = _collate_batch(dataset, batch_idx)
-            # Shapes into model: x (B,T,F), p (B,P), mean/std (B,F), shape (B,S,F)
             x = x.to(device, non_blocking=True)
             p = p.to(device, non_blocking=True)
             mean = mean.to(device, non_blocking=True)
@@ -410,11 +402,12 @@ def run_inference_on_test_set(
                 pred_chunks.append(pred_norm.detach().cpu())
                 label_chunks.append(y)
             else:
-                # Denormalize on CPU (dataset stats live on CPU)
                 pred_denorm = torch.stack(
-                    [dataset.denormalize_y(pred_norm[i].detach().cpu()) for i in range(pred_norm.shape[0])]
+                    [
+                        dataset.denormalize_y(pred_norm[i].detach().cpu())
+                        for i in range(pred_norm.shape[0])
+                    ]
                 )
-                # y from __getitem__ is model-target-normalized → denormalize for metrics
                 y_denorm = torch.stack(
                     [dataset.denormalize_y(y[i]) for i in range(y.shape[0])]
                 )
@@ -422,14 +415,47 @@ def run_inference_on_test_set(
                 label_chunks.append(y_denorm)
 
             if b == 0 or (b + 1) % max(1, n_batches // 20) == 0 or (b + 1) == n_batches:
-                print(f"  Inference batch {b + 1}/{n_batches}  ({end}/{n} samples)", flush=True)
+                print(
+                    f"  Inference batch {b + 1}/{n_batches}  ({end}/{n} samples)",
+                    flush=True,
+                )
 
-            # Free GPU tensors early
             del x, p, mean, std, shape, pred_norm
 
     preds = torch.cat(pred_chunks, dim=0).to(device)
     labels = torch.cat(label_chunks, dim=0).to(device)
-    return preds, labels, test_indices
+    return preds, labels, used_indices
+
+
+def run_inference_on_test_set(
+    model,
+    dataset,
+    device: str = 'cuda',
+    batch_size: int = 8,
+    max_samples: Optional[int] = None,
+    shuffle: bool = True,
+    seed: int = 42,
+):
+    """
+    Stream the test split in batches. Never stacks the full test windows.
+
+    Returns:
+        preds, labels, used_indices — same contract as ``run_inference_on_indices``.
+    """
+    test_indices = _select_test_indices(
+        dataset,
+        max_samples=max_samples,
+        shuffle=shuffle,
+        seed=seed,
+    )
+    return run_inference_on_indices(
+        model,
+        dataset,
+        test_indices,
+        device=device,
+        batch_size=batch_size,
+        split_name='test samples',
+    )
 
 
 def _sample_observation_time(dataset, idx: int) -> int:
@@ -1302,6 +1328,344 @@ def run_validate(
         'checkpoint_path': checkpoint_path,
         'checkpoint_key': checkpoint_key,
         'used_indices': used_indices,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# YIELD VALIDATION (--validate-yield)
+# ═══════════════════════════════════════════════════════════
+
+def _select_val_indices(
+    dataset,
+    max_samples: Optional[int] = None,
+):
+    """
+    Choose validation indices in chronological order.
+
+    When max_samples is set, take an evenly spaced subset of the sorted
+    validation split (same coverage idea as --test N).
+    """
+    chronological = sorted(dataset.val_indices)
+    if not chronological:
+        return []
+
+    if max_samples is not None and max_samples < len(chronological):
+        selected = _evenly_spaced_indices(chronological, int(max_samples))
+        print(
+            f"  (using {len(selected)} val samples spaced across the "
+            f"{len(chronological)}-window validation period)",
+            flush=True,
+        )
+    else:
+        selected = list(chronological)
+        print(
+            f"  (using all {len(selected)} validation samples)",
+            flush=True,
+        )
+    return selected
+
+
+def _plot_chance_near_over_samples(
+    preds: torch.Tensor,
+    labels: torch.Tensor,
+    yield_target: str,
+    title: str = 'Chance / Near over validation samples',
+    save_path: Optional[str] = None,
+):
+    """
+    Plot true vs predicted chance and near against sample order.
+
+    Layout depends on yield_target:
+      both   → 2×2: chance series, near series, chance scatter, near scatter
+      chance → 1×2: chance series + scatter
+      near   → 1×2: near series + scatter
+    """
+    import matplotlib.pyplot as plt
+
+    pred = preds.detach().cpu().float()
+    lab = labels.detach().cpu().float()
+    if pred.ndim == 1:
+        pred = pred.unsqueeze(-1)
+    if lab.ndim == 1:
+        lab = lab.unsqueeze(-1)
+
+    x = np.arange(pred.shape[0])
+    yt = str(yield_target).lower()
+
+    def _series_and_scatter(ax_s, ax_sc, true_v, pred_v, name: str, color: str):
+        ax_s.plot(x, true_v, label=f'true {name}', color=color, alpha=0.85, linewidth=1.2)
+        ax_s.plot(
+            x, pred_v, label=f'pred {name}', color=color,
+            alpha=0.55, linewidth=1.2, linestyle='--',
+        )
+        ax_s.set_xlabel('validation sample (chronological)')
+        ax_s.set_ylabel(name)
+        ax_s.set_title(f'{name} over validation samples')
+        ax_s.legend(loc='best', fontsize=8)
+        ax_s.grid(True, alpha=0.3)
+
+        ax_sc.scatter(true_v, pred_v, s=12, alpha=0.55, color=color, edgecolors='none')
+        lo = float(min(true_v.min(), pred_v.min()))
+        hi = float(max(true_v.max(), pred_v.max()))
+        pad = 0.05 * (hi - lo + 1e-8)
+        ax_sc.plot([lo - pad, hi + pad], [lo - pad, hi + pad], 'k--', linewidth=1.0, alpha=0.6)
+        ax_sc.set_xlabel(f'true {name}')
+        ax_sc.set_ylabel(f'pred {name}')
+        ax_sc.set_title(f'{name}: pred vs true')
+        ax_sc.grid(True, alpha=0.3)
+        ax_sc.set_aspect('equal', adjustable='datalim')
+
+    if yt == 'chance':
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+        _series_and_scatter(
+            axes[0], axes[1],
+            lab[:, 0].numpy(), pred[:, 0].numpy(),
+            'chance', '#1f77b4',
+        )
+    elif yt == 'near':
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+        _series_and_scatter(
+            axes[0], axes[1],
+            lab[:, 0].numpy(), pred[:, 0].numpy(),
+            'near', '#ff7f0e',
+        )
+    else:
+        # yield_target='both' → (chance, near)
+        if pred.shape[-1] < 2 or lab.shape[-1] < 2:
+            raise ValueError(
+                f"yield_target=both requires 2-D preds/labels; "
+                f"got pred={tuple(pred.shape)}, labels={tuple(lab.shape)}"
+            )
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        _series_and_scatter(
+            axes[0, 0], axes[0, 1],
+            lab[:, 0].numpy(), pred[:, 0].numpy(),
+            'chance', '#1f77b4',
+        )
+        _series_and_scatter(
+            axes[1, 0], axes[1, 1],
+            lab[:, 1].numpy(), pred[:, 1].numpy(),
+            'near', '#ff7f0e',
+        )
+
+    fig.suptitle(title, fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    if save_path:
+        fig.savefig(save_path, dpi=120)
+        print(f"  Chance/near plot saved to: {save_path}", flush=True)
+    plt.show()
+    return fig
+
+
+def run_validate_yield(
+    config: dict,
+    max_samples: Optional[int] = None,
+    visualize: bool = True,
+):
+    """
+    Load the latest checkpoint for ``config``, run inference on validation
+    samples, print chance/near metrics, plot chance and near over the val
+    set, and optionally open the interactive yield visualizer.
+
+    Args:
+        config: Full training/inference config (same as TRAIN).
+        max_samples: If set, evaluate this many val samples spaced across
+                     the chronological validation period; otherwise all.
+        visualize: If True, also page through yield price windows.
+
+    Batch size comes from config['validate_batch_size']
+    (falls back to test_batch_size, then batch_size).
+    """
+    from labels import resolve_yield_target
+
+    device = config['device']
+    batch_size = config.get(
+        'validate_batch_size',
+        config.get('test_batch_size', config.get('batch_size', 8)),
+    )
+
+    # This mode is specifically for yield labels.
+    label_mode = str(config.get('label', 'trend')).lower()
+    if label_mode not in ('yield', 'scattered_hope'):
+        print(
+            f"⚠ --validate-yield expects label=yield "
+            f"(config currently has label={config.get('label')!r}). "
+            f"Forcing label='yield' for this run.",
+            flush=True,
+        )
+        config['label'] = 'yield'
+
+    print("\nLoading dataset (same path as TRAIN)...", flush=True)
+    dataset, _total_features = get_dataset(config)
+    config['output_dim'] = dataset.output_dim
+    if getattr(dataset, 'label_mode', None) != 'yield':
+        raise RuntimeError(
+            f"--validate-yield requires a yield dataset; got label_mode="
+            f"{getattr(dataset, 'label_mode', None)!r}"
+        )
+    config['yield_target'] = getattr(dataset, 'yield_target', 'both')
+    yield_target = resolve_yield_target(
+        config,
+        yield_target=getattr(dataset, 'yield_target', None),
+    )
+
+    checkpoint_key = generate_checkpoint_key(config, dataset.cache_key)
+    print(f"🔑 Generated Checkpoint Key: {checkpoint_key}", flush=True)
+
+    ckpt_dir = config.get('checkpoint_dir', 'trading_checkpoints')
+    result = find_latest_checkpoint_by_key(ckpt_dir, checkpoint_key)
+    if result is None:
+        print(f"⚠ No checkpoint found for key: {checkpoint_key}")
+        print("  Looking for newest checkpoint across keys instead...")
+        result = find_latest_checkpoint_by_key(ckpt_dir, None)
+    if result is None:
+        print("No checkpoint found. Exiting.")
+        raise SystemExit(1)
+
+    checkpoint_path, checkpoint_key = result
+
+    print(f"\nLoading model from: {checkpoint_path}", flush=True)
+    print(f"Checkpoint Key: {checkpoint_key}", flush=True)
+    print(f"Validate-yield batch size: {batch_size}", flush=True)
+    if max_samples is not None:
+        print(f"Val sample cap: {max_samples}", flush=True)
+    else:
+        print("Val sample cap: all", flush=True)
+
+    model = load_model(checkpoint_path, config, dataset, device)
+    print("✓ Model loaded successfully", flush=True)
+
+    val_indices = _select_val_indices(dataset, max_samples=max_samples)
+    print("\nRunning batched inference on validation samples...", flush=True)
+    preds, val_labels, used_indices = run_inference_on_indices(
+        model,
+        dataset,
+        val_indices,
+        device=device,
+        batch_size=batch_size,
+        split_name='validation samples',
+    )
+    print(f"✓ Finished inference on {len(preds)} validation samples", flush=True)
+
+    out_dim = preds.shape[-1]
+    print("\n📊 Validation Yield Results:")
+    metrics = {}
+    if yield_target == 'chance':
+        metrics['chance_mse'] = torch.nn.functional.mse_loss(
+            preds[:, 0], val_labels[:, 0]
+        ).item()
+        print(f"  Chance MSE:      {metrics['chance_mse']:.4f}")
+    elif yield_target == 'near':
+        metrics['near_mse'] = torch.nn.functional.mse_loss(
+            preds[:, 0], val_labels[:, 0]
+        ).item()
+        print(f"  Near MSE:        {metrics['near_mse']:.4f}")
+    elif out_dim == 2:
+        metrics['chance_mse'] = torch.nn.functional.mse_loss(
+            preds[:, 0], val_labels[:, 0]
+        ).item()
+        metrics['near_mse'] = torch.nn.functional.mse_loss(
+            preds[:, 1], val_labels[:, 1]
+        ).item()
+        print(f"  Chance MSE:      {metrics['chance_mse']:.4f}")
+        print(f"  Near MSE:        {metrics['near_mse']:.4f}")
+    else:
+        raise ValueError(
+            f"Unexpected yield pred dim {out_dim} for yield_target={yield_target!r}"
+        )
+
+    print(f"\n📈 Sample Predictions (first 5):")
+    if yield_target == 'chance':
+        print(f"  {'Index':<6} {'True Chance':<12} {'Pred Chance':<12}")
+        print(f"  {'-'*6} {'-'*12} {'-'*12}")
+        for i in range(min(5, len(preds))):
+            print(
+                f"  {i:<6} {val_labels[i, 0].item():<12.4f} "
+                f"{preds[i, 0].item():<12.4f}"
+            )
+    elif yield_target == 'near':
+        print(f"  {'Index':<6} {'True Near':<12} {'Pred Near':<12}")
+        print(f"  {'-'*6} {'-'*12} {'-'*12}")
+        for i in range(min(5, len(preds))):
+            print(
+                f"  {i:<6} {val_labels[i, 0].item():<12.4f} "
+                f"{preds[i, 0].item():<12.4f}"
+            )
+    else:
+        print(
+            f"  {'Index':<6} {'True Chance':<12} {'Pred Chance':<12} "
+            f"{'True Near':<12} {'Pred Near':<12}"
+        )
+        print(f"  {'-'*6} {'-'*12} {'-'*12} {'-'*12} {'-'*12}")
+        for i in range(min(5, len(preds))):
+            print(
+                f"  {i:<6} {val_labels[i, 0].item():<12.4f} "
+                f"{preds[i, 0].item():<12.4f} "
+                f"{val_labels[i, 1].item():<12.4f} "
+                f"{preds[i, 1].item():<12.4f}"
+            )
+
+    pred_cpu = preds.detach().cpu()
+    lab_cpu = val_labels.detach().cpu()
+    plot_path = Path(checkpoint_path).parent / 'validate_yield_chance_near.png'
+    print("\n📈 Plotting chance and near over validation samples...", flush=True)
+    _plot_chance_near_over_samples(
+        pred_cpu,
+        lab_cpu,
+        yield_target=yield_target,
+        title=(
+            f'Chance / Near — validation '
+            f'(latest ckpt, n={len(used_indices)}, yield_target={yield_target})'
+        ),
+        save_path=str(plot_path),
+    )
+
+    if visualize:
+        n_viz = len(used_indices)
+        valid_starts = [dataset.valid_starts[i] for i in used_indices]
+        full_labels = torch.stack(
+            [dataset.label_tensor[i] for i in used_indices]
+        )
+        print(
+            f"\n📈 Visualizing yield labels "
+            f"(yield_target={yield_target}) on validation samples...",
+            flush=True,
+        )
+        visualize_yield(
+            total_tensor=dataset.Total,
+            valid_starts=valid_starts,
+            label_tensor=lab_cpu if yield_target != 'both' else full_labels,
+            price_feature_idx=dataset.price_feature_idx,
+            past_window=dataset.past_window,
+            future_window=dataset.future_window,
+            min_yield_percent=config.get(
+                'min_yield_percent',
+                getattr(dataset, 'min_yield_percent', 0.0),
+            ),
+            max_hope_future_horizon=config.get(
+                'max_hope_future_horizon',
+                getattr(dataset, 'max_hope_future_horizon', None),
+            ),
+            yield_target=yield_target,
+            num_samples=min(6, n_viz),
+            pred_tensor=pred_cpu,
+            fixed_order=True,
+            sample_ids=list(used_indices),
+            label_mean=getattr(dataset, '_label_stat_mean', None),
+            label_std=getattr(dataset, '_label_stat_std', None),
+        )
+
+    print("\n✓ Validate-yield complete!", flush=True)
+    return {
+        'preds': preds,
+        'labels': val_labels,
+        'used_indices': used_indices,
+        'metrics': metrics,
+        'output_dim': out_dim,
+        'yield_target': yield_target,
+        'checkpoint_path': checkpoint_path,
+        'checkpoint_key': checkpoint_key,
+        'plot_path': str(plot_path),
     }
 
 
