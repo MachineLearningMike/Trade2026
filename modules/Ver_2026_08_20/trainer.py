@@ -1318,6 +1318,7 @@ class ValidationEpochLoss:
         title: Optional[str] = None,
         percent_lo: float = 0.0,
         percent_hi: float = 100.0,
+        show: bool = True,
     ):
         if not self.batch_losses:
             print("No validation batch losses to plot.")
@@ -1390,7 +1391,10 @@ class ValidationEpochLoss:
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             print(f"✓ Validation loss plot saved to: {save_path}")
-        plt.show()
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
         return fig
 
     def print_summary(

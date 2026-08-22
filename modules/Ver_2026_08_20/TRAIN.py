@@ -36,6 +36,11 @@ from model import (
 from trainer import ResumableTrainer, generate_checkpoint_key
 
 
+def project_root_dir() -> Path:
+    """Repo root: ``…/Trade2026`` when this file lives in ``modules/Ver_…``."""
+    return Path(__file__).resolve().parents[2]
+
+
 def generate_synthetic_data(T: int, F: int, price_feature_idx: int = 0):
     """Generate synthetic trading data for testing."""
     features = []
@@ -241,6 +246,18 @@ def main(config):
             '--validation E → epoch E, [0%%, 100%%]; '
             '--validation E V2 → epoch E, [0%%, V2%%]; '
             '--validation E V1 V2 → epoch E, [V1%%, V2%%].'
+        ),
+    )
+    parser.add_argument(
+        '--report', type=str, default=None, metavar='DIR_NAME',
+        help=(
+            "Batch-export validation loss plots for every saved epoch under the "
+            "current checkpoint key. Canonical form: --report 'dir name'. "
+            "Images are written to <project_root>/_save/<dir_name>/ as "
+            "validation_e001.png (= --validation e) and "
+            "validation_e001_p0_30.png (= --validation e 30), "
+            "with zero-padded epoch ids for alphabetical order. "
+            "No interactive plots."
         ),
     )
     parser.add_argument(
@@ -879,7 +896,161 @@ def main(config):
         else:
             print("⚠ No validation loss history could be plotted.")
         return
-    
+
+    # ============================================================
+    # STEP 2d: Handle --report 'dir name' → <project_root>/_save/<dir_name>/
+    # ============================================================
+    if args.report is not None:
+        print("\n" + "=" * 60)
+        print("📑 VALIDATION REPORT EXPORT MODE")
+        print("=" * 60)
+
+        # Canonical: --report 'dir name'  (a folder *name*, not a path)
+        report_name = str(args.report).strip()
+        if not report_name:
+            print("⚠ --report requires a non-empty directory name, e.g. --report 'my run'.")
+            return
+        if report_name in ('.', '..') or '/' in report_name or '\\' in report_name:
+            print(
+                "⚠ --report takes a directory name only (no path separators). "
+                "Example: --report 'dir name'  →  <project_root>/_save/dir name/"
+            )
+            return
+
+        project_root = project_root_dir()
+        report_dir = (project_root / '_save' / report_name).resolve()
+        # Stay inside <project_root>/_save even if report_name is odd.
+        save_root = (project_root / '_save').resolve()
+        if save_root not in report_dir.parents and report_dir != save_root:
+            print(f"⚠ Refusing to write outside {save_root}: {report_dir}")
+            return
+        report_dir.mkdir(parents=True, exist_ok=True)
+
+        checkpoint_dir = Path(config['checkpoint_dir'])
+        if not checkpoint_dir.exists():
+            print(f"⚠ Checkpoint directory not found: {checkpoint_dir}")
+            return
+
+        from trainer import (
+            ValidationEpochLoss,
+            list_validation_loss_epochs,
+            validation_loss_path,
+        )
+
+        dataset_signature = generate_dataset_signature(config)
+        label_mode = str(config.get('label', 'trend')).lower()
+        if label_mode in ('yield', 'scattered_hope'):
+            from labels import Label_Yield, resolve_yield_target
+            config['output_dim'] = Label_Yield.resolve_output_dim(
+                yield_target=resolve_yield_target(config)
+            )
+        elif label_mode == 'latent':
+            from labels import Label_Latent
+            config['output_dim'] = Label_Latent.resolve_output_dim(config)
+        current_key = generate_checkpoint_key(config, dataset_signature)
+        current_dir = checkpoint_dir / current_key
+        print(f"🔑 Dataset signature: {dataset_signature}")
+        print(f"🔑 Checkpoint key:    {current_key}")
+        print(f"📁 Project root:      {project_root}")
+        print(f"📁 Report dir:        {report_dir}")
+
+        def _list_report_runs():
+            runs = []
+            for subdir in checkpoint_dir.iterdir():
+                if not subdir.is_dir():
+                    continue
+                ep = list_validation_loss_epochs(subdir)
+                if not ep:
+                    continue
+                newest = validation_loss_path(subdir, ep[-1])
+                runs.append((subdir, ep, newest.stat().st_mtime))
+            runs.sort(key=lambda item: item[2], reverse=True)
+            return runs
+
+        # Prefer exact config match; else newest run that has validation curves
+        # (same fallback policy as --validation).
+        source_dir = None
+        epochs = []
+        source_label = ''
+        if current_dir.exists():
+            epochs = list_validation_loss_epochs(current_dir)
+            if epochs:
+                source_dir = current_dir
+                source_label = 'exact config match'
+        if source_dir is None:
+            if current_dir.exists():
+                print(
+                    f"⚠ No validation_loss_epoch_*.json under current key: "
+                    f"{current_key}"
+                )
+            else:
+                print(f"⚠ No checkpoint folder for current key: {current_dir}")
+            runs = _list_report_runs()
+            available = [p.name for p in checkpoint_dir.iterdir() if p.is_dir()]
+            if available:
+                print(f"   Available checkpoint keys: {', '.join(available)}")
+            if not runs:
+                print("   No runs with validation loss history found.")
+                print(
+                    "   Train with validation enabled to generate "
+                    "validation_loss_epoch_<E>.json"
+                )
+                return
+            source_dir, epochs, _ = runs[0]
+            source_label = 'fallback: newest with val curves'
+            print(f"   Falling back to: {source_dir.name}")
+            print("   Tip: train under the current key, or match config to that run.")
+
+        print(f"📁 Source checkpoints: {source_dir} ({source_label})")
+
+        max_epoch = max(epochs)
+        # At least 3 digits (e001); widen for max_epoch >= 1000 so sort stays
+        # alphabetical (e0001 … e1000).
+        epoch_width = max(3, len(str(max_epoch)))
+        e_example = f'e{1:0{epoch_width}d}'
+        print(f"🎯 Epochs:            1..{max_epoch} "
+              f"(saved: {', '.join(str(e) for e in epochs)}; "
+              f"files like {e_example}.png)")
+
+        n_full = 0
+        n_slice = 0
+        n_missing = 0
+        for e in range(1, max_epoch + 1):
+            ve = ValidationEpochLoss.load(source_dir, e)
+            if ve is None or not ve.batch_losses:
+                print(f"⚠ Skipping epoch {e}: no validation loss curve")
+                n_missing += 1
+                continue
+
+            e_tag = f'{e:0{epoch_width}d}'
+            full_path = report_dir / f'validation_e{e_tag}.png'
+            fig = ve.plot(
+                save_path=str(full_path),
+                percent_lo=0.0,
+                percent_hi=100.0,
+                show=False,
+            )
+            if fig is not None:
+                n_full += 1
+
+            slice_path = report_dir / f'validation_e{e_tag}_p0_30.png'
+            fig30 = ve.plot(
+                save_path=str(slice_path),
+                percent_lo=0.0,
+                percent_hi=30.0,
+                show=False,
+            )
+            if fig30 is not None:
+                n_slice += 1
+
+        print(
+            f"\n✅ Report export completed: "
+            f"{n_full} full + {n_slice} p0_30 plots → {report_dir}"
+        )
+        if n_missing:
+            print(f"   Skipped {n_missing} missing epoch curve(s).")
+        return
+
     # ============================================================
     # STEP 3: Handle --clean flag
     # ============================================================

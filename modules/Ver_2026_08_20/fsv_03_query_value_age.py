@@ -835,22 +835,6 @@ def get_value_age_array(config):
             if len(no_null_features) > 10:
                 print(f"  ... and {len(no_null_features) - 10} more")
 
-        print("\n" + "=" * 60)
-        print("Sample data (first 3 features, first 5 minutes)")
-        print("=" * 60)
-
-        for i in range(min(3, arr.shape[0])):
-            feature = features[i]
-            print(f"\n  {feature}:")
-            for j in range(min(5, arr.shape[1])):
-                dt = pd.Timestamp(dt_from) + timedelta(minutes=j)
-                value = arr[i, j, 0]
-                decay = arr[i, j, 1]
-                print(
-                    f"    Minute {j} ({dt.strftime('%H:%M:%S')}): "
-                    f"value={value:.4f}, decay={decay:.4f}"
-                )
-
     print("\n" + "=" * 60)
     print("Done!")
     print("=" * 60)

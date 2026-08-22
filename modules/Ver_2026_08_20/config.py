@@ -128,8 +128,8 @@ config = {
     'binance_interval': '1m',
     # Half-open-ish span in minutes: need end > start. Past window alone is
     # past_hours * 60 bars (e.g. 36 hours → 2160) plus future_horizon.
-    'binance_start_date': '2024-01-01 00:00:00',
-    'binance_end_date': '2026-07-01 00:00:00',
+    'binance_start_date': '2023-12-01 00:00:00',
+    'binance_end_date': '2026-06-01 00:00:00',
     'binance_symbols': {
         "BTCUSDT": ["Close", "Volume"],
         # "ETHUSDT": ["Close", "Volume"],
@@ -184,9 +184,9 @@ config = {
     # ============================================================
     # TRAINING CONFIGURATION
     # ============================================================
-    'epochs': 12,
+    'epochs': 6,
     'batch_size': 24,
-    'learning_rate': 0.000_001, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
+    'learning_rate': 0.000_01, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
     'save_every_n_minibatches': 500,
     'checkpoint_dir': 'trading_checkpoints',
     # How many newest rolling weight files to keep (recency, not quality).
