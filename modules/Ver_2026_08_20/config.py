@@ -14,7 +14,7 @@ config = {
     # future_window length is NOT set here — see label-mode horizons below:
     #   trend  → max_trend_future_horizon
     #   yield → max_hope_future_horizon
-    'step': 3,
+    'step': 1,
     'num_features': 5,
     'num_shapes': 4,
     'total_synthetic_days': 30,
@@ -158,10 +158,10 @@ config = {
     # ============================================================
     # TRANSFORMER CONFIGURATION
     # ============================================================
-    'patch_size': 20,
+    'patch_size': 20,   # 20
     'embed_dim': None,  # AUTO-COMPUTED
-    'num_layers': 6,
-    'num_heads': 8,
+    'num_layers': 2,    # 6
+    'num_heads': 8,     # 8
     'ff_dim_multiplier': 4,
     'dropout': 0.1,
     'causal': False,
@@ -184,7 +184,7 @@ config = {
     # ============================================================
     # TRAINING CONFIGURATION
     # ============================================================
-    'epochs': 6,
+    'epochs': 1,
     'batch_size': 24,
     'learning_rate': 0.000_01, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
     'save_every_n_minibatches': 500,
