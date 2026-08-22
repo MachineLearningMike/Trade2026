@@ -158,7 +158,7 @@ config = {
     # ============================================================
     # TRANSFORMER CONFIGURATION
     # ============================================================
-    'patch_size': 20,   # 20
+    'patch_size': 10,   # 20
     'embed_dim': None,  # AUTO-COMPUTED
     'num_layers': 2,    # 6
     'num_heads': 8,     # 8
