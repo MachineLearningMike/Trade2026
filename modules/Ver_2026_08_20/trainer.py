@@ -61,11 +61,11 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
 class TrainingState:
     """Manages saving and loading of complete training state with atomic writes."""
     
-    def __init__(self, save_dir='trading_checkpoints', save_every_n_minibatches=100, 
+    def __init__(self, save_dir='trading_checkpoints', save_every_n_minutes=5,
                  recent_checkpoints=5, checkpoint_key=None):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.save_every_n_minibatches = save_every_n_minibatches
+        self.save_every_n_minutes = float(save_every_n_minutes)
         self.recent_checkpoints = int(recent_checkpoints)
         self.best_val_loss = None
         self.best_epoch = None
@@ -1461,7 +1461,7 @@ class ResumableTrainer:
     def __init__(self, dataset_signature,
                 model, loss_fn, optimizer, dataloader, 
                 save_dir='trading_checkpoints', device='cpu',
-                save_every_n_minibatches=100,
+                save_every_n_minutes=5,
                 val_loader=None, 
                 enable_validation=False, 
                 validate_every_n_epochs=1,
@@ -1495,10 +1495,12 @@ class ResumableTrainer:
         
         self.state_manager = TrainingState(
             save_dir=save_dir,
-            save_every_n_minibatches=save_every_n_minibatches,
+            save_every_n_minutes=save_every_n_minutes,
             recent_checkpoints=recent_checkpoints,
             checkpoint_key=checkpoint_key
         )
+        # Wall-clock anchor for periodic saves (set when train() starts).
+        self._last_checkpoint_save_time = None
         
         self.stop_requested = False
         self.is_running = False
@@ -1977,7 +1979,11 @@ class ResumableTrainer:
         if extend and abs(extend_epochs) > eps:
             print(f"  (Plan adjustment: {extend_epochs:+g} epochs)")
         print(f"Total minibatches processed so far: {self.total_minibatches_processed}")
-        print(f"Save checkpoint every: {self.state_manager.save_every_n_minibatches} minibatches")
+        print(
+            f"Save checkpoint every: "
+            f"{self.state_manager.save_every_n_minutes:g} minutes (wall clock)"
+        )
+        self._last_checkpoint_save_time = time.time()
         print(f"Checkpoint directory: {self.state_manager.save_dir}/")
         if self.enable_validation:
             print(f"Validation: Enabled (every {self.validate_every_n_epochs} epochs)")
@@ -2349,9 +2355,12 @@ class ResumableTrainer:
                     refresh=False,
                 )
 
-            if (self.total_minibatches_processed % 
-                self.state_manager.save_every_n_minibatches == 0):
-                
+            save_every_s = float(self.state_manager.save_every_n_minutes) * 60.0
+            if (
+                save_every_s > 0
+                and self._last_checkpoint_save_time is not None
+                and (time.time() - self._last_checkpoint_save_time) >= save_every_s
+            ):
                 dataloader_state = dataloader.get_state()
                 
                 # Clear the live bar before multi-line checkpoint logs so the
@@ -2377,6 +2386,7 @@ class ResumableTrainer:
                     embed_dim=getattr(self, 'embed_dim', None),
                     max_seq_len=getattr(self, 'max_seq_len', None),
                 )
+                self._last_checkpoint_save_time = time.time()
                 save_dt = time.perf_counter() - save_t0
                 total_save_time += save_dt
                 # Keep tqdm rate based on train throughput, not checkpoint stalls.
@@ -2483,7 +2493,7 @@ if __name__ == "__main__":
         dataloader=train_loader,
         save_dir='test_checkpoints',
         device='cpu',
-        save_every_n_minibatches=5,
+        save_every_n_minutes=5,
         val_loader=val_loader,
         enable_validation=True,
         validate_every_n_epochs=1,

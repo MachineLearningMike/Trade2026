@@ -158,10 +158,10 @@ config = {
     # ============================================================
     # TRANSFORMER CONFIGURATION
     # ============================================================
-    'patch_size': 10,   # 20
+    'patch_size': 5,   # 20
     'embed_dim': None,  # AUTO-COMPUTED
     'num_layers': 2,    # 6
-    'num_heads': 8,     # 8
+    'num_heads': 4,     # 8
     'ff_dim_multiplier': 4,
     'dropout': 0.1,
     'causal': False,
@@ -184,10 +184,10 @@ config = {
     # ============================================================
     # TRAINING CONFIGURATION
     # ============================================================
-    'epochs': 1,
+    'epochs': 12,
     'batch_size': 24,
     'learning_rate': 0.000_01, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
-    'save_every_n_minibatches': 500,
+    'save_every_n_minutes': 5,
     'checkpoint_dir': 'trading_checkpoints',
     # How many newest rolling weight files to keep (recency, not quality).
     # Best-val snapshot is stored separately as best_val.pt and is not rotated.

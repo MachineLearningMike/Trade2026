@@ -201,8 +201,10 @@ def main(config):
     
     parser = argparse.ArgumentParser(description='Resilient Trading Training with Transformer')
     parser.add_argument('--epochs', type=int, default=config['epochs'], help='Number of epochs')
-    parser.add_argument('--save-every', type=int, default=config['save_every_n_minibatches'],
-                       help='Save every N minibatches')
+    parser.add_argument(
+        '--save-every', type=float, default=config['save_every_n_minutes'],
+        help='Save checkpoint every N wall-clock minutes',
+    )
     parser.add_argument(
         '--clean', action='store_true',
         help='Delete checkpoints for the current checkpoint key only '
@@ -399,7 +401,7 @@ def main(config):
     
     # Update config with command-line arguments
     config['epochs'] = args.epochs
-    config['save_every_n_minibatches'] = args.save_every
+    config['save_every_n_minutes'] = args.save_every
     config['clean'] = args.clean
     config['past_hours'] = args.past_hours
     config['max_trend_future_horizon'] = args.max_trend_future_horizon
@@ -1352,7 +1354,7 @@ def main(config):
         dataloader=train_loader,
         save_dir=config['checkpoint_dir'],
         device=config['device'],
-        save_every_n_minibatches=config['save_every_n_minibatches'],
+        save_every_n_minutes=config['save_every_n_minutes'],
         val_loader=val_loader,
         enable_validation=config['validate'],
         validate_every_n_epochs=config['validate_every_n_epochs'],
@@ -1407,7 +1409,7 @@ def main(config):
     print(f"Slope loss weight: {config['slope_loss_weight']}")
     print(f"Intercept loss weight: {config['intercept_loss_weight']}")
     print(f"Reconstruction loss weight: {config['reconstruction_loss_weight']}")
-    print(f"Save every: {config['save_every_n_minibatches']} minibatches")
+    print(f"Save every: {config['save_every_n_minutes']:g} minutes (wall clock)")
     print(f"Checkpoints: {config['checkpoint_dir']}/")
     print(f"Validation: {'Enabled' if config['validate'] else 'Disabled'}")
     if config['validate']:
