@@ -34,10 +34,12 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
     included. Training hyperparams (dropout, loss weights, learning_rate,
     batch_size, …) are intentionally omitted: they do not redefine the net.
     """
+    model_type = str(config.get('model_type', 'transformer')).lower()
     key_params = {
         'dataset_signature': dataset_signature,
 
         # Architecture only (weight shapes / module layout)
+        'model_type': model_type,
         'patch_size': config.get('patch_size'),
         'num_layers': config.get('num_layers'),
         'num_heads': config.get('num_heads'),
@@ -49,6 +51,8 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
         'use_reconstruction': config.get('use_reconstruction'),
         'look_price': config.get('look_price', True),
     }
+    if model_type == 'vae':
+        key_params['vae_latent_dim'] = config.get('vae_latent_dim', 64)
 
     param_string = json.dumps(key_params, sort_keys=True, default=str)
     return hashlib.md5(param_string.encode()).hexdigest()[:16]
@@ -2422,30 +2426,47 @@ if __name__ == "__main__":
     print("=" * 60)
     print("TRAINER MODULE DEMO")
     print("=" * 60)
-    
-    class DummyModel(nn.Module):
-        def __init__(self, input_dim, output_dim):
-            super().__init__()
-            self.fc = nn.Linear(input_dim, output_dim)
-        def forward(self, x, p=None, mean=None, std=None, shape=None):
-            if x.dim() == 3:
-                x = x.reshape(x.size(0), -1)
-            return self.fc(x)
-    
-    input_dim = 10
+
     output_dim = 3
     batch_size = 4
     T = 5
     F = 2
+    P_LEN = 3
+    S = 4
     total_samples = 100
-    
+
+    class DummyModel(nn.Module):
+        def __init__(self, input_dim, output_dim):
+            super().__init__()
+            self.fc = nn.Linear(input_dim, output_dim)
+            self.n_max_past_horizon = P_LEN
+
+        def forward(self, x, p=None, mean=None, std=None, shape=None):
+            # Match production contract: (predictions, patch_map, recon)
+            if x.dim() == 3:
+                flat = x.reshape(x.size(0), -1)
+            else:
+                flat = x
+            predictions = self.fc(flat)
+            return predictions, None, None
+
     model = DummyModel(T * F, output_dim)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
-    
+
     class DummyDataset:
-        def __len__(self): return total_samples
-        def __getitem__(self, idx): return torch.randn(F, T), torch.randn(output_dim), torch.randn(F), torch.randn(F), torch.randn(F, 4)
-    
+        def __len__(self):
+            return total_samples
+
+        def __getitem__(self, idx):
+            return (
+                torch.randn(T, F),
+                torch.randn(P_LEN),
+                torch.randn(F),
+                torch.randn(F),
+                torch.randn(S, F),
+                torch.randn(output_dim),
+            )
+
     class DummyLoader:
         def __init__(self, dataset):
             self.dataset = dataset
@@ -2453,40 +2474,55 @@ if __name__ == "__main__":
             self.current_epoch_indices = list(range(len(dataset)))
             self.current_batch_start = 0
             self.dataset_len = len(dataset)
+
         def start_epoch(self, epoch, resume_indices=None, resume_batch_start=0):
             self.current_batch_start = resume_batch_start
             if resume_indices is not None:
                 self.current_epoch_indices = resume_indices
+
         def get_total_batches_in_epoch(self):
             return math.ceil(self.dataset_len / self.batch_size)
+
         def get_next_batch(self):
             if self.current_batch_start >= self.get_total_batches_in_epoch():
                 return None, 0, 0
             remaining = self.dataset_len - self.current_batch_start * self.batch_size
             bs = min(self.batch_size, remaining)
-            X_batch = torch.randn(bs, F, T)
-            Y_batch = torch.randn(bs, output_dim)
-            MEAN_batch = torch.randn(bs, F)
-            STD_batch = torch.randn(bs, F)
-            SHAPE_batch = torch.randn(bs, F, 4)
+            # (x, p, mean, std, shape, y) — x is (B, T, F)
+            batch = (
+                torch.randn(bs, T, F),
+                torch.randn(bs, P_LEN),
+                torch.randn(bs, F),
+                torch.randn(bs, F),
+                torch.randn(bs, S, F),
+                torch.randn(bs, output_dim),
+            )
             self.current_batch_start += 1
-            return (X_batch, Y_batch, MEAN_batch, STD_batch, SHAPE_batch), 0.001, 0.001
+            return batch, 0.001, 0.001
+
         def get_state(self):
-            return {'epoch_indices': self.current_epoch_indices, 'batch_start': self.current_batch_start}
+            return {
+                'epoch_indices': self.current_epoch_indices,
+                'batch_start': self.current_batch_start,
+            }
+
         def restore_state(self, state):
             self.current_epoch_indices = state['epoch_indices']
             self.current_batch_start = state['batch_start']
-    
-    train_dataset = DummyDataset()
-    val_dataset = DummyDataset()
-    
-    train_loader = DummyLoader(train_dataset)
-    val_loader = DummyLoader(val_dataset)
-    
+
+        def _stop_prefetch(self):
+            return None
+
+    train_loader = DummyLoader(DummyDataset())
+    val_loader = DummyLoader(DummyDataset())
+
     def dummy_loss(x, y_pred, y_truth):
+        if isinstance(y_pred, (tuple, list)):
+            y_pred = y_pred[0]
         return nn.functional.mse_loss(y_pred, y_truth)
-    
+
     trainer = ResumableTrainer(
+        dataset_signature='demo_signature',
         model=model,
         loss_fn=dummy_loss,
         optimizer=optimizer,
@@ -2497,20 +2533,20 @@ if __name__ == "__main__":
         val_loader=val_loader,
         enable_validation=True,
         validate_every_n_epochs=1,
-        checkpoint_key='test_key'
+        checkpoint_key='test_key',
     )
-    
+
     print("\nFirst run: training for 3 epochs with validation...")
     trainer.train(num_epochs=3, resume=False)
-    
+
     print("\n" + "=" * 60)
     print("Second run: should detect training_finished=True and show history")
     print("=" * 60)
     trainer.train(num_epochs=3, resume=True)
-    
+
     import shutil
     if Path('test_checkpoints').exists():
         shutil.rmtree('test_checkpoints')
         print("\nCleaned up test checkpoints.")
-    
+
     print("\nTrainer module demo complete!")

@@ -154,9 +154,21 @@ config = {
     'force_recompute': False,
 
     'n_latent_macro_features': 30,  # Number of latent macro features to use in the model
+
+    # ============================================================
+    # MODEL SELECTION
+    # ============================================================
+    # 'transformer' → model.MarketTransformerWithHeads
+    # 'vae'         → model_vae.MarketVAEWithHeads
+    #                 Reconstructs x; mean/std FiLM-condition encoder+decoder;
+    #                 shape accepted but unused. Train loss is recon+KL only
+    #                 (no yield/chance/near label loss).
+    'model_type': 'vae',
+    'vae_latent_dim': 64,
+    'vae_kl_weight': 0.1,
     
     # ============================================================
-    # TRANSFORMER CONFIGURATION
+    # TRANSFORMER / VAE ENCODER CONFIGURATION
     # ============================================================
     'patch_size': 5,   # 20
     'embed_dim': None,  # AUTO-COMPUTED
@@ -213,7 +225,7 @@ config = {
     # yield:
     'chance_loss_weight': 1.0,
     'near_loss_weight': 1.0,
-    'reconstruction_loss_weight': 0.01,
+    'reconstruction_loss_weight': 1.0,
     'use_reconstruction': False,
 }
 

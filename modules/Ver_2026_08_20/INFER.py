@@ -16,7 +16,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from config import get_config
-from model import MarketTransformerWithHeads
+from model_vae import build_market_model, resolve_max_seq_len, wrap_model_loss
 from labels import resolve_model_past_len
 from labels import visualize_trend, visualize_yield, visualize_latent
 from labels import Label_Latent, resolve_latent_distribution
@@ -191,31 +191,20 @@ def load_model(
     past_window = int(60 * config['past_hours'])
     max_seq_len = checkpoint.get('max_seq_len')
     if max_seq_len is None:
-        max_seq_len = past_window // config['patch_size']
+        max_seq_len = resolve_max_seq_len(config, past_window)
 
     F = dataset.F
     n_max_past = int(
         getattr(dataset, 'model_past_len', None)
         or resolve_model_past_len(config)
     )
-    model = MarketTransformerWithHeads(
+    model = build_market_model(
+        config,
         in_features=F,
         n_market_features=dataset.n_market_features,
         n_macro_features=dataset.n_macro_features,
-        n_latent_macro_features=config['n_latent_macro_features'],
         n_max_past_horizon=n_max_past,
-        patch_size=config['patch_size'],
-        num_layers=config['num_layers'],
-        num_heads=config['num_heads'],
-        ff_dim_multiplier=config['ff_dim_multiplier'],
-        dropout=config['dropout'],
         max_seq_len=max_seq_len,
-        causal=config['causal'],
-        head_hidden_dim_multiplier=config['head_hidden_dim_multiplier'],
-        output_dim=config['output_dim'],
-        use_reconstruction=config['use_reconstruction'],
-        num_shapes=config.get('num_shapes', 4),
-        look_price=config.get('look_price', True),
     )
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
@@ -1097,6 +1086,7 @@ def run_validate(
     percent_hi: float = 100.0,
     percent_lo: float = 0.0,
     checkpoint_mode: str = 'best',
+    checkpoint_key: Optional[str] = None,
 ):
     """
     Load a checkpoint for ``config``, evaluate a percent slice of sorted
@@ -1115,6 +1105,8 @@ def run_validate(
         checkpoint_mode:
             ``'best'``   → prefer best_val.pt (``--validate``)
             ``'latest'`` → prefer newest / latest_checkpoint (``--last-validate``)
+        checkpoint_key: If set, load from this folder under checkpoint_dir
+            instead of hashing the current config (e.g. a prior yield run).
 
     Samples are taken from ``sorted(dataset.val_indices)[start:end]``.
 
@@ -1156,25 +1148,38 @@ def run_validate(
             dataset, 'latent_distribution', config.get('latent_distribution', 'normal')
         )
 
-    checkpoint_key = generate_checkpoint_key(config, dataset.cache_key)
-    print(f"🔑 Generated Checkpoint Key: {checkpoint_key}", flush=True)
+    forced_key = (checkpoint_key or config.get('checkpoint_key') or '').strip() or None
+    hashed_key = generate_checkpoint_key(config, dataset.cache_key)
+    if forced_key:
+        checkpoint_key = forced_key
+        print(f"🔑 Using forced Checkpoint Key: {checkpoint_key}", flush=True)
+        print(f"   (config hash key would be: {hashed_key})", flush=True)
+    else:
+        checkpoint_key = hashed_key
+        print(f"🔑 Generated Checkpoint Key: {checkpoint_key}", flush=True)
 
     ckpt_dir = config.get('checkpoint_dir', 'trading_checkpoints')
     if mode == 'best':
         result = find_checkpoint_by_key(ckpt_dir, checkpoint_key)
-        if result is None:
+        if result is None and not forced_key:
             print(f"⚠ No checkpoint found for key: {checkpoint_key}")
             print("  Looking for latest best-val checkpoint instead...")
             result = find_checkpoint_by_key(ckpt_dir, None)
     else:
         result = find_latest_checkpoint_by_key(ckpt_dir, checkpoint_key)
-        if result is None:
+        if result is None and not forced_key:
             print(f"⚠ No checkpoint found for key: {checkpoint_key}")
             print("  Looking for newest checkpoint across keys instead...")
             result = find_latest_checkpoint_by_key(ckpt_dir, None)
 
     if result is None:
-        print("No checkpoint found. Exiting.")
+        if forced_key:
+            print(
+                f"No checkpoint found for forced key {forced_key!r} under {ckpt_dir}. "
+                "Exiting."
+            )
+        else:
+            print("No checkpoint found. Exiting.")
         raise SystemExit(1)
 
     checkpoint_path, checkpoint_key = result
@@ -1238,7 +1243,7 @@ def run_validate(
     model = load_model(checkpoint_path, config, dataset, device)
     print("✓ Model loaded successfully", flush=True)
 
-    loss_fn = bind_label_loss(
+    _base_loss_fn = bind_label_loss(
         getattr(dataset, 'label_mode', config.get('label', 'trend')),
         config,
         yield_target=getattr(dataset, 'yield_target', config.get('yield_target', 'both')),
@@ -1246,6 +1251,7 @@ def run_validate(
             dataset, 'latent_distribution', config.get('latent_distribution', 'normal')
         ),
     )
+    loss_fn = wrap_model_loss(model, _base_loss_fn, config)
 
     model.eval()
     weighted_loss_sum = 0.0
@@ -1328,6 +1334,382 @@ def run_validate(
         'checkpoint_path': checkpoint_path,
         'checkpoint_key': checkpoint_key,
         'used_indices': used_indices,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# VAE vs YIELD COVARIANCE (--vae-compare)
+# ═══════════════════════════════════════════════════════════
+
+def run_vae_compare(
+    config: dict,
+    vae_key: str,
+    yield_key: str,
+    percent_hi: float = 100.0,
+    percent_lo: float = 0.0,
+):
+    """
+    Load a VAE checkpoint and a yield (transformer) checkpoint, evaluate the
+    same sorted validation samples, and plot per-sample losses to inspect
+    covariance (scatter + dual series + Pearson/Spearman).
+    """
+    import matplotlib.pyplot as plt
+    from labels import Label_Yield, resolve_yield_target
+
+    vae_key = str(vae_key).strip()
+    yield_key = str(yield_key).strip()
+    if not vae_key or not yield_key:
+        raise ValueError("--vae-compare requires both --vae-key and --yield-key")
+
+    percent_lo = float(percent_lo)
+    percent_hi = float(percent_hi)
+    if not (0.0 <= percent_lo < percent_hi <= 100.0):
+        raise ValueError(
+            f"--vae-compare requires 0 <= V1 < V2 <= 100 "
+            f"(got V1={percent_lo}, V2={percent_hi})"
+        )
+
+    device = config['device']
+    batch_size = int(
+        config.get(
+            'validate_batch_size',
+            config.get('test_batch_size', config.get('batch_size', 8)),
+        )
+    )
+    recon_w = float(config.get('reconstruction_loss_weight', 1.0))
+    kl_w = float(config.get('vae_kl_weight', 0.1))
+
+    print("\n" + "=" * 60)
+    print("VAE ↔ YIELD LOSS COVARIANCE")
+    print("=" * 60)
+    print(f"  VAE key:   {vae_key}")
+    print(f"  Yield key: {yield_key}")
+    print(f"  Coverage:  [{percent_lo:g}%, {percent_hi:g}%] of sorted val samples")
+    print(f"  VAE loss:  {recon_w:g}·MSE(x̂,x) + {kl_w:g}·KL  (per sample)")
+    print("  Yield loss: chance/near MSE (per sample)")
+    print("=" * 60 + "\n")
+
+    print("Loading dataset...", flush=True)
+    dataset, _ = get_dataset(config)
+    config['output_dim'] = dataset.output_dim
+    if getattr(dataset, 'label_mode', None) != 'yield':
+        print(
+            f"⚠ label_mode={getattr(dataset, 'label_mode', None)!r}; "
+            "yield branch expects label=yield."
+        )
+
+    ckpt_dir = config.get('checkpoint_dir', 'trading_checkpoints')
+    vae_found = find_checkpoint_by_key(ckpt_dir, vae_key)
+    yield_found = find_checkpoint_by_key(ckpt_dir, yield_key)
+    if vae_found is None:
+        raise SystemExit(f"No VAE checkpoint under key {vae_key!r}")
+    if yield_found is None:
+        raise SystemExit(f"No yield checkpoint under key {yield_key!r}")
+    vae_path, _ = vae_found
+    yield_path, _ = yield_found
+
+    cfg_vae = dict(config)
+    cfg_vae['model_type'] = 'vae'
+    cfg_yield = dict(config)
+    cfg_yield['model_type'] = 'transformer'
+
+    print(f"Loading VAE from:   {vae_path}", flush=True)
+    model_vae = load_model(vae_path, cfg_vae, dataset, device)
+    print(f"Loading yield from: {yield_path}", flush=True)
+    model_yield = load_model(yield_path, cfg_yield, dataset, device)
+
+    yield_aux = Label_Yield.make_auxiliary(config)
+    chance_w = float(yield_aux.get('chance_weight', 1.0))
+    near_w = float(yield_aux.get('near_weight', yield_aux.get('wait_weight', 1.0)))
+    yt = resolve_yield_target(config)
+
+    val_sorted = sorted(dataset.val_indices)
+    n_total = len(val_sorted)
+    start = int(n_total * percent_lo / 100.0)
+    end = n_total if percent_hi >= 100.0 else int(n_total * percent_hi / 100.0)
+    end = max(0, min(n_total, end))
+    used_indices = val_sorted[start:end]
+    n_take = len(used_indices)
+    if n_take == 0:
+        raise RuntimeError(
+            f"Percent slice [{percent_lo:g}%, {percent_hi:g}%] selected 0 samples"
+        )
+    print(
+        f"Val samples: [{start}:{end}) → {n_take} / {n_total}",
+        flush=True,
+    )
+
+    # Map each sample to calendar time at the last history bar
+    # (start + past_window - 1 minutes from binance_start_date).
+    from datetime import datetime, timedelta
+
+    try:
+        series_origin = datetime.strptime(
+            str(config.get('binance_start_date')), '%Y-%m-%d %H:%M:%S'
+        )
+    except Exception:
+        series_origin = None
+        print(
+            "⚠ Could not parse binance_start_date; day-of-week breakdown skipped.",
+            flush=True,
+        )
+    past_window = int(getattr(dataset, 'past_window', int(60 * config.get('past_hours', 36))))
+    dow_names = (
+        'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'
+    )
+
+    vae_losses: List[float] = []
+    yield_losses: List[float] = []
+    dow_ids: List[int] = []
+    n_batches = (n_take + batch_size - 1) // batch_size
+
+    model_vae.eval()
+    model_yield.eval()
+    with torch.no_grad():
+        pbar = tqdm(
+            total=n_batches,
+            desc=f"vae-compare [{percent_lo:g}%, {percent_hi:g}%]",
+            mininterval=0.5,
+            dynamic_ncols=True,
+        )
+        for b in range(n_batches):
+            batch_start = b * batch_size
+            batch_end = min(batch_start + batch_size, n_take)
+            batch_idx = used_indices[batch_start:batch_end]
+
+            x, p, y, mean, std, shape = _collate_batch(dataset, batch_idx)
+            x = x.to(device, non_blocking=True)
+            p = p.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            mean = mean.to(device, non_blocking=True)
+            std = std.to(device, non_blocking=True)
+            shape = shape.to(device, non_blocking=True)
+
+            # ---- VAE per-sample loss ----
+            _ = model_vae(x, p, mean, std, shape)
+            x_hat = model_vae.last_x_hat
+            recon_per = ((x_hat - x) ** 2).reshape(x.shape[0], -1).mean(dim=1)
+            kl_per = model_vae.last_kl_per
+            if kl_per is None:
+                kl_per = torch.zeros_like(recon_per)
+            vae_per = recon_w * recon_per + kl_w * kl_per
+
+            # ---- Yield per-sample loss ----
+            y_pred_t = model_yield(x, p, mean, std, shape)
+            if isinstance(y_pred_t, (tuple, list)):
+                y_pred = y_pred_t[0]
+            else:
+                y_pred = y_pred_t
+            if yt == 'both' and y_pred.shape[-1] >= 2 and y.shape[-1] >= 2:
+                yield_per = (
+                    chance_w * ((y_pred[:, 0] - y[:, 0]) ** 2)
+                    + near_w * ((y_pred[:, 1] - y[:, 1]) ** 2)
+                )
+            else:
+                yield_per = ((y_pred - y) ** 2).mean(dim=-1)
+
+            vae_losses.extend(vae_per.detach().cpu().tolist())
+            yield_losses.extend(yield_per.detach().cpu().tolist())
+            if series_origin is not None:
+                for di in batch_idx:
+                    bar0 = int(dataset.valid_starts[int(di)])
+                    # Last bar of the history window ≈ decision / sample time.
+                    ts = series_origin + timedelta(minutes=bar0 + past_window - 1)
+                    dow_ids.append(int(ts.weekday()))  # Mon=0 … Sun=6
+            pbar.update(1)
+            del x, p, y, mean, std, shape, y_pred_t, y_pred, vae_per, yield_per
+        pbar.close()
+
+    vae_arr = np.asarray(vae_losses, dtype=np.float64)
+    yield_arr = np.asarray(yield_losses, dtype=np.float64)
+    n = len(vae_arr)
+    if n < 2:
+        raise RuntimeError("Need at least 2 samples for correlation")
+
+    # Pearson
+    pearson = float(np.corrcoef(vae_arr, yield_arr)[0, 1])
+    # Spearman via rank
+    def _rank(a: np.ndarray) -> np.ndarray:
+        order = np.argsort(a)
+        ranks = np.empty_like(order, dtype=np.float64)
+        ranks[order] = np.arange(len(a), dtype=np.float64)
+        return ranks
+
+    spearman = float(np.corrcoef(_rank(vae_arr), _rank(yield_arr))[0, 1])
+
+    def _pct(a: np.ndarray, q: float) -> float:
+        return float(np.percentile(a, q))
+
+    print("\n" + "=" * 60)
+    print("COVARIANCE SUMMARY")
+    print("=" * 60)
+    print(f"  n samples:     {n}")
+    print(
+        f"  VAE loss:      mean={vae_arr.mean():.6f}  std={vae_arr.std():.6f}  "
+        f"median={_pct(vae_arr, 50):.6f}  p90={_pct(vae_arr, 90):.6f}"
+    )
+    print(
+        f"  Yield loss:    mean={yield_arr.mean():.6f}  std={yield_arr.std():.6f}  "
+        f"median={_pct(yield_arr, 50):.6f}  p90={_pct(yield_arr, 90):.6f}"
+    )
+    print(f"  Pearson r:     {pearson:.6f}")
+    print(f"  Spearman ρ:    {spearman:.6f}")
+    if yield_arr.mean() > 1e-8 and _pct(yield_arr, 50) < 0.1 * yield_arr.mean():
+        print(
+            "  note: yield median ≪ mean → heavy-tailed / many near-zero samples"
+        )
+    print("=" * 60)
+
+    dow_stats = None
+    if series_origin is not None and len(dow_ids) == n:
+        dow_arr = np.asarray(dow_ids, dtype=np.int64)
+        print("\n" + "=" * 60)
+        print("DAY-OF-WEEK BREAKDOWN  (time = last history bar)")
+        print("=" * 60)
+        print(
+            f"  {'weekday':<10} {'n':>7}  "
+            f"{'VAE mean':>10} {'VAE med':>10}  "
+            f"{'Yld mean':>10} {'Yld med':>10}"
+        )
+        dow_stats = []
+        for d in range(7):
+            mask = dow_arr == d
+            nd = int(mask.sum())
+            if nd == 0:
+                dow_stats.append(
+                    {
+                        'weekday': dow_names[d],
+                        'n': 0,
+                        'vae_mean': float('nan'),
+                        'vae_median': float('nan'),
+                        'yield_mean': float('nan'),
+                        'yield_median': float('nan'),
+                    }
+                )
+                print(
+                    f"  {dow_names[d]:<10} {nd:7d}  "
+                    f"{'—':>10} {'—':>10}  {'—':>10} {'—':>10}"
+                )
+                continue
+            vm = float(vae_arr[mask].mean())
+            vmed = float(np.median(vae_arr[mask]))
+            ym = float(yield_arr[mask].mean())
+            ymed = float(np.median(yield_arr[mask]))
+            dow_stats.append(
+                {
+                    'weekday': dow_names[d],
+                    'n': nd,
+                    'vae_mean': vm,
+                    'vae_median': vmed,
+                    'yield_mean': ym,
+                    'yield_median': ymed,
+                }
+            )
+            print(
+                f"  {dow_names[d]:<10} {nd:7d}  "
+                f"{vm:10.6f} {vmed:10.6f}  {ym:10.6f} {ymed:10.6f}"
+            )
+        print("=" * 60)
+
+    idx = np.arange(n)
+    fig = plt.figure(figsize=(14, 9))
+    ax0 = fig.add_subplot(2, 2, 1)
+    ax1 = fig.add_subplot(2, 2, 2)
+    ax2 = fig.add_subplot(2, 1, 2)
+
+    ax0.scatter(vae_arr, yield_arr, s=8, alpha=0.35, c='#1565C0', edgecolors='none')
+    ax0.set_xlabel(f'VAE loss ({recon_w:g}·MSE + {kl_w:g}·KL)')
+    ax0.set_ylabel('Yield loss (chance/near MSE)')
+    ax0.set_title(f'Scatter  Pearson r={pearson:.3f}  Spearman ρ={spearman:.3f}')
+    ax0.grid(True, alpha=0.3)
+
+    color_yield = '#C62828'
+    color_vae = '#2E7D32'
+    ln_y = ax1.plot(
+        idx, yield_arr, color=color_yield, linewidth=1.0, alpha=0.85,
+        label='Yield loss', zorder=1,
+    )
+    ax1.set_xlabel('Validation sample index (sorted chronologically)')
+    ax1.set_ylabel('Yield loss', color=color_yield)
+    ax1.tick_params(axis='y', labelcolor=color_yield)
+    ax1.grid(True, alpha=0.3)
+
+    ax1b = ax1.twinx()
+    ln_v = ax1b.plot(
+        idx, vae_arr, color=color_vae, linewidth=1.0, alpha=0.85,
+        label='VAE loss', zorder=2,
+    )
+    ax1b.set_ylabel('VAE loss', color=color_vae)
+    ax1b.tick_params(axis='y', labelcolor=color_vae)
+
+    lines = ln_y + ln_v
+    ax1.legend(lines, [ln.get_label() for ln in lines], fontsize=9, loc='upper right')
+    ax1.set_title('Dual series (twin y-axes)')
+
+    # Day-of-week bar chart (VAE + yield means)
+    if dow_stats is not None:
+        x_pos = np.arange(7)
+        width = 0.38
+        vae_means = [
+            s['vae_mean'] if s['n'] > 0 else 0.0 for s in dow_stats
+        ]
+        yld_means = [
+            s['yield_mean'] if s['n'] > 0 else 0.0 for s in dow_stats
+        ]
+        bars_v = ax2.bar(
+            x_pos - width / 2, vae_means, width,
+            color=color_vae, alpha=0.85, label='VAE mean',
+        )
+        ax2.set_ylabel('VAE mean loss', color=color_vae)
+        ax2.tick_params(axis='y', labelcolor=color_vae)
+        ax2.set_xticks(x_pos)
+        ax2.set_xticklabels([s['weekday'][:3] for s in dow_stats])
+        ax2.set_xlabel('Day of week (last history bar)')
+        ax2.grid(True, axis='y', alpha=0.3)
+
+        ax2b = ax2.twinx()
+        bars_y = ax2b.bar(
+            x_pos + width / 2, yld_means, width,
+            color=color_yield, alpha=0.85, label='Yield mean',
+        )
+        ax2b.set_ylabel('Yield mean loss', color=color_yield)
+        ax2b.tick_params(axis='y', labelcolor=color_yield)
+
+        # Annotate sample counts
+        for i, s in enumerate(dow_stats):
+            ax2.text(
+                i, 0.0, f"n={s['n']}", ha='center', va='bottom',
+                fontsize=8, color='#333333',
+            )
+
+        ax2.legend(
+            [bars_v, bars_y], ['VAE mean', 'Yield mean'],
+            fontsize=9, loc='upper right',
+        )
+        ax2.set_title('Mean loss by day of week')
+    else:
+        ax2.set_visible(False)
+
+    fig.suptitle(
+        f'VAE ({vae_key[:8]}…) vs Yield ({yield_key[:8]}…)  '
+        f'[{percent_lo:g}%, {percent_hi:g}%]',
+        fontsize=12,
+        fontweight='bold',
+    )
+    plt.tight_layout()
+    plt.show()
+
+    return {
+        'vae_key': vae_key,
+        'yield_key': yield_key,
+        'n': n,
+        'vae_losses': vae_arr,
+        'yield_losses': yield_arr,
+        'pearson': pearson,
+        'spearman': spearman,
+        'percent_lo': percent_lo,
+        'percent_hi': percent_hi,
+        'dow_stats': dow_stats,
     }
 
 

@@ -29,9 +29,13 @@ from labels import (
     resolve_model_past_len,
 )
 from model import (
-    MarketTransformerWithHeads,
     report_model_size,
     check_all_weights_updated,
+)
+from model_vae import (
+    build_market_model,
+    resolve_max_seq_len,
+    wrap_model_loss,
 )
 from trainer import ResumableTrainer, generate_checkpoint_key
 
@@ -263,6 +267,32 @@ def main(config):
         ),
     )
     parser.add_argument(
+        '--checkpoint-key', type=str, default=None, metavar='KEY',
+        help=(
+            'Force a checkpoint folder under checkpoint_dir (e.g. a prior '
+            'yield transformer run). Use with --validate / --test / '
+            '--validate-yield. Architecture must still match the weights '
+            '(set --model-type transformer for yield models).'
+        ),
+    )
+    parser.add_argument(
+        '--vae-compare', type=float, nargs='*', default=None, metavar='V',
+        help=(
+            'Compare per-sample VAE loss vs yield loss on sorted val samples '
+            '(scatter + dual series + Pearson/Spearman). Requires --vae-key '
+            'and --yield-key. Optional percent slice like --validate: '
+            '--vae-compare | --vae-compare V | --vae-compare V1 V2.'
+        ),
+    )
+    parser.add_argument(
+        '--vae-key', type=str, default=None, metavar='KEY',
+        help='VAE checkpoint folder name for --vae-compare.',
+    )
+    parser.add_argument(
+        '--yield-key', type=str, default=None, metavar='KEY',
+        help='Yield (transformer) checkpoint folder name for --vae-compare.',
+    )
+    parser.add_argument(
         '--validate', type=float, nargs='*', default=None, metavar='V',
         help=(
             'Run validation with the best checkpoint on a percent slice of '
@@ -335,9 +365,15 @@ def main(config):
         help='Minimum yield percent for yield',
     )
     parser.add_argument(
+        '--model-type', type=str,
+        default=config.get('model_type', 'transformer'),
+        choices=['transformer', 'vae'],
+        help="Model backend: 'transformer' or 'vae' (x recon; mean/std FiLM cond)",
+    )
+    parser.add_argument(
         '--label', type=str, default=config.get('label', 'trend'),
         choices=['trend', 'yield', 'latent'],
-        help='Label family (latent uses shared MarketTransformerWithHeads)',
+        help='Label family (shared head contract for transformer and VAE)',
     )
     parser.add_argument(
         '--latent-distribution', type=str,
@@ -412,8 +448,11 @@ def main(config):
     config['max_accum_deviation'] = args.max_accum_deviation
     config['min_trend_horizon'] = args.min_trend_horizon
     config['min_yield_percent'] = args.min_yield_percent
+    config['model_type'] = args.model_type
     config['label'] = args.label
     config['latent_distribution'] = args.latent_distribution
+    if getattr(args, 'checkpoint_key', None):
+        config['checkpoint_key'] = str(args.checkpoint_key).strip()
     if args.label == 'latent':
         # Force shared model head width from density mode.
         from labels import Label_Latent
@@ -1107,6 +1146,34 @@ def main(config):
         return
 
     # ============================================================
+    # STEP 3a0: Handle --vae-compare [--vae-key] [--yield-key]
+    # ============================================================
+    if args.vae_compare is not None:
+        vals = [float(x) for x in args.vae_compare]
+        if len(vals) == 0:
+            percent_lo, percent_hi = 0.0, 100.0
+        elif len(vals) == 1:
+            percent_lo, percent_hi = 0.0, vals[0]
+        elif len(vals) == 2:
+            percent_lo, percent_hi = vals[0], vals[1]
+        else:
+            print("⚠ --vae-compare accepts zero, one, or two values:  |  V  |  V1 V2")
+            return
+        if not args.vae_key or not args.yield_key:
+            print("⚠ --vae-compare requires both --vae-key and --yield-key.")
+            return
+        from INFER import run_vae_compare
+        run_vae_compare(
+            config,
+            vae_key=args.vae_key,
+            yield_key=args.yield_key,
+            percent_lo=percent_lo,
+            percent_hi=percent_hi,
+        )
+        print("\n✅ VAE↔yield compare completed!")
+        return
+
+    # ============================================================
     # STEP 3a: Handle --validate / --last-validate [V [V2]]
     # ============================================================
     if args.validate is not None and getattr(args, 'last_validate', None) is not None:
@@ -1171,6 +1238,7 @@ def main(config):
             percent_lo=percent_lo,
             percent_hi=percent_hi,
             checkpoint_mode=_validate_mode,
+            checkpoint_key=config.get('checkpoint_key'),
         )
         return
 
@@ -1242,13 +1310,15 @@ def main(config):
             f"Adjust patch_size / n_latent_macro_features / num_heads."
         )
     config['embed_dim'] = embed_dim
-    config['max_seq_len'] = past_window // config['patch_size']
+    config['max_seq_len'] = resolve_max_seq_len(config, past_window)
     
     # Keep config in sync if dataset forced output_dim (e.g. yield → 2)
     config['output_dim'] = dataset.output_dim
+    _model_type = str(config.get('model_type', 'transformer')).lower()
     print(f"\nData shapes:")
     print(f"  Input x: (F={F}, past_window={past_window})")
     print(f"  Label mode: {getattr(dataset, 'label_mode', config.get('label', 'trend'))}")
+    print(f"  Model type: {_model_type}")
     _od = config['output_dim']
     _yt = getattr(dataset, 'yield_target', config.get('yield_target', 'both'))
     _ld = getattr(
@@ -1271,7 +1341,7 @@ def main(config):
     print(f"  Test samples: {len(dataset.test_indices)}")
     print(f"  n_market_features: {dataset.n_market_features}")
     print(f"  n_macro_features: {dataset.n_macro_features}")
-    print(f"\nTransformer config:")
+    print(f"\nModel config ({_model_type}):")
     print(f"  Patch size: {config['patch_size']}")
     print(f"  Embed dim: {config['embed_dim']} "
           f"(= (n_market + n_latent_macro) * patch_size)")
@@ -1282,40 +1352,40 @@ def main(config):
     print(f"  Causal: {config['causal']}")
     print(f"  Use reconstruction: {config['use_reconstruction']}")
     print(f"  look_price: {config.get('look_price', True)}")
+    if _model_type == 'vae':
+        print(f"  vae_latent_dim: {config.get('vae_latent_dim', 64)}")
+        print(f"  vae_kl_weight: {config.get('vae_kl_weight', 0.1)}")
+        print(
+            f"  VAE train loss: "
+            f"{config.get('reconstruction_loss_weight', 1.0):g}·MSE(x̂,x) + "
+            f"{config.get('vae_kl_weight', 0.1):g}·KL  "
+            f"(no yield/chance/near)"
+        )
     
     _model_past_len = int(
         getattr(dataset, 'model_past_len', resolve_model_past_len(config))
     )
-    model = MarketTransformerWithHeads(
+    model = build_market_model(
+        config,
         in_features=F,
         n_market_features=dataset.n_market_features,
         n_macro_features=dataset.n_macro_features,
-        n_latent_macro_features=config['n_latent_macro_features'],
         n_max_past_horizon=_model_past_len,
-        patch_size=config['patch_size'],
-        num_layers=config['num_layers'],
-        num_heads=config['num_heads'],
-        ff_dim_multiplier=config['ff_dim_multiplier'],
-        dropout=config['dropout'],
         max_seq_len=config['max_seq_len'],
-        causal=config['causal'],
-        head_hidden_dim_multiplier=config['head_hidden_dim_multiplier'],
-        output_dim=config['output_dim'],
-        use_reconstruction=config['use_reconstruction'],
-        num_shapes=config.get('num_shapes', 4),
-        look_price=config.get('look_price', True),
     )
+    _model_name = type(model).__name__
 
     # Size report + one-step gradient coverage check at start
-    report_model_size(model, name="MarketTransformerWithHeads")
+    report_model_size(model, name=_model_name)
     _probe_T = (past_window // config['patch_size']) * config['patch_size']
     _probe_B = 2
     _probe_device = torch.device(config['device']) if config.get('device') else torch.device('cpu')
     model = model.to(_probe_device)
     _probe_P = _model_past_len
-    # Concrete label-class loss (trend / yield / latent) — not a generic custom_loss.
-    # All three share MarketTransformerWithHeads.
-    loss_fn = bind_label_loss(
+    # Concrete label-class loss (trend / yield / latent).
+    # VAE: wrap_model_loss uses recon+KL only (ignores yield/chance/near).
+    # Transformer: supervised label loss from bind_label_loss.
+    _base_loss_fn = bind_label_loss(
         dataset.label_mode,
         config,
         yield_target=getattr(dataset, 'yield_target', config.get('yield_target', 'both')),
@@ -1323,6 +1393,7 @@ def main(config):
             dataset, 'latent_distribution', config.get('latent_distribution', 'normal')
         ),
     )
+    loss_fn = wrap_model_loss(model, _base_loss_fn, config)
 
     check_all_weights_updated(
         model,
@@ -1334,7 +1405,7 @@ def main(config):
             torch.randn(_probe_B, config.get('num_shapes', 4), F, device=_probe_device),
         ),
         loss_fn=loss_fn,
-        name="MarketTransformerWithHeads",
+        name=_model_name,
     )
 
     # Create dataloaders
@@ -1390,7 +1461,7 @@ def main(config):
         print(
             f"latent_distribution: {_ld}, "
             f"output_dim (density params): {config.get('output_dim')}, "
-            f"shared model: MarketTransformerWithHeads"
+            f"shared model: {config.get('model_type', 'transformer')}"
         )
     else:
         print(
