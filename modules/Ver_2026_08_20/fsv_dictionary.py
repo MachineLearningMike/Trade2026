@@ -19,6 +19,9 @@ How availability is computed (fsv_02)
                        (in feature timezone; US business-day adjust unless
                         continuous_market / non-US)
 
+    fsv_03 converts those feature-local release intervals to UTC before
+    filling the minute grid that aligns with Binance (also UTC).
+
     next_release_datetime = release of the following observation
                             (last obs → open-ended far-future sentinel)
 

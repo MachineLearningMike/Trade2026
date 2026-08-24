@@ -293,6 +293,27 @@ def main(config):
         help='Yield (transformer) checkpoint folder name for --vae-compare.',
     )
     parser.add_argument(
+        '--vae-sweep', action='store_true', default=False,
+        help=(
+            'Run a VAE hyperparameter scout over patch_size × num_layers '
+            '(default 5/10/20 × 2/4/6), append scores to '
+            '<project_root>/_save/vae_sweep/results.csv. Forces model_type=vae. '
+            'Resumes existing trial keys; use --sweep-extend to add epochs.'
+        ),
+    )
+    parser.add_argument(
+        '--sweep-epochs', type=int, default=1, metavar='N',
+        help='Base epoch plan per trial for --vae-sweep (default 1).',
+    )
+    parser.add_argument(
+        '--sweep-extend', type=float, default=1.0, metavar='N',
+        help=(
+            'If a trial checkpoint already exists, add this many epochs '
+            '(default 1) and append a new row to results.csv. '
+            'Fresh trials still use --sweep-epochs only.'
+        ),
+    )
+    parser.add_argument(
         '--validate', type=float, nargs='*', default=None, metavar='V',
         help=(
             'Run validation with the best checkpoint on a percent slice of '
@@ -1298,7 +1319,24 @@ def main(config):
     # ============================================================
 
     dataset, total_features = get_dataset(config)
-    
+
+    # ============================================================
+    # STEP 4b: VAE hyperparameter sweep (optional)
+    # ============================================================
+    if getattr(args, 'vae_sweep', False):
+        from vae_sweep import run_vae_hparam_sweep
+
+        config['model_type'] = 'vae'
+        csv_path = run_vae_hparam_sweep(
+            config,
+            dataset,
+            total_features,
+            epochs_per_trial=max(1, int(getattr(args, 'sweep_epochs', 1))),
+            extend_epochs=float(getattr(args, 'sweep_extend', 1.0)),
+        )
+        print(f"\n✅ VAE sweep completed → {csv_path}")
+        return
+
     past_window = int(60 * config['past_hours'])
     # total_features is (F, T); model uses latent macro compression for embed_dim
     F = total_features.shape[0] if hasattr(total_features, 'shape') else len(total_features)

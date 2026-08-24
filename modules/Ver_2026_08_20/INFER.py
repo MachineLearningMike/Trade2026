@@ -1439,8 +1439,8 @@ def run_vae_compare(
         flush=True,
     )
 
-    # Map each sample to calendar time at the last history bar
-    # (start + past_window - 1 minutes from binance_start_date).
+    # Map each sample to calendar time at the last history bar.
+    # binance_start_date is UTC wall time; weekday() here is therefore UTC DOW.
     from datetime import datetime, timedelta
 
     try:
@@ -1564,7 +1564,7 @@ def run_vae_compare(
     if series_origin is not None and len(dow_ids) == n:
         dow_arr = np.asarray(dow_ids, dtype=np.int64)
         print("\n" + "=" * 60)
-        print("DAY-OF-WEEK BREAKDOWN  (time = last history bar)")
+        print("DAY-OF-WEEK BREAKDOWN  (UTC; time = last history bar)")
         print("=" * 60)
         print(
             f"  {'weekday':<10} {'n':>7}  "

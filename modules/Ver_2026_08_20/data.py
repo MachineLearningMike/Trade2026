@@ -576,14 +576,15 @@ def get_binance_data(config):
         symbol_dict = config['binance_symbols']
         target = config['prediction_target']
         
+        # Config strings are UTC wall times (naive). Binance stamps them UTC.
         start = datetime.strptime(start_date, '%Y-%m-%d %H:%M:%S')
         end = datetime.strptime(end_date, '%Y-%m-%d %H:%M:%S')
         
         print(f"Fetching Binance data:")
         print(f"  Datatype: {datatype}")
         print(f"  Interval: {interval}")
-        print(f"  Start: {start}")
-        print(f"  End: {end}")
+        print(f"  Start (UTC): {start}")
+        print(f"  End (UTC): {end}")
         print(f"  Symbols: {list(symbol_dict.keys())}")
 
         features, nForget, target_feature_id, feature_names = bn.get_combined_history_3(

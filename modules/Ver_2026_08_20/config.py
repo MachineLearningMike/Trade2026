@@ -10,7 +10,7 @@ config = {
     # ============================================================
     # DATA CONFIGURATION
     # ============================================================
-    'past_hours': 36,     # 1, 2, 36 (= 1.5 days)
+    'past_hours': 24,     # 1, 2, 36 (= 1.5 days)
     # future_window length is NOT set here — see label-mode horizons below:
     #   trend  → max_trend_future_horizon
     #   yield → max_hope_future_horizon
@@ -128,6 +128,8 @@ config = {
     'binance_interval': '1m',
     # Half-open-ish span in minutes: need end > start. Past window alone is
     # past_hours * 60 bars (e.g. 36 hours → 2160) plus future_horizon.
+    # Times are UTC wall clock (naive strings). Binance klines are UTC; FSV
+    # converts US-local release schedules to UTC before aligning on this grid.
     'binance_start_date': '2023-12-01 00:00:00',
     'binance_end_date': '2026-06-01 00:00:00',
     'binance_symbols': {

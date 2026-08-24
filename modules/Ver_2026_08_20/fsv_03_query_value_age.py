@@ -129,13 +129,41 @@ def generate_cache_filename(
 
     features_str = ",".join(features)  # preserve order (order matters for array layout)
     excl = ",".join(sorted(features_to_exclude or []))
+    # clock=UTC: release intervals are converted feature-local → UTC at index
+    # build time so the minute grid matches Binance UTC bars.
     param_str = (
         f"{features_str}|excl={excl}|{dt_from_str}|{dt_to_str}|"
-        f"{is_utc}|iv={intervals_fingerprint}"
+        f"{is_utc}|clock=UTC|iv={intervals_fingerprint}"
     )
     param_hash = hashlib.md5(param_str.encode()).hexdigest()[:8]
 
     return f"{prefix}_{param_hash}.npy"
+
+
+def local_naive_to_utc_naive_series(
+    values: np.ndarray, tz_str: str
+) -> np.ndarray:
+    """
+    Convert feature-local naive datetimes to UTC-naive datetime64[ns].
+
+    Interval CSV / fsv_02 store release clocks in the feature timezone
+    (usually America/New_York). Binance bars are UTC; converting here once
+    puts macro intervals on the same clock before minute-grid alignment.
+    """
+    s = pd.to_datetime(pd.Series(values))
+    tz_norm = (tz_str or "UTC").strip()
+    if tz_norm.upper() in ("UTC", "ETC/UTC", "GMT"):
+        return s.values.astype("datetime64[ns]")
+    try:
+        localized = s.dt.tz_localize(
+            tz_norm, ambiguous="infer", nonexistent="shift_forward"
+        )
+    except (pytz.AmbiguousTimeError, pytz.NonExistentTimeError, ValueError, TypeError):
+        localized = s.dt.tz_localize(
+            tz_norm, ambiguous=True, nonexistent="shift_forward"
+        )
+    utc = localized.dt.tz_convert("UTC").dt.tz_localize(None)
+    return utc.values.astype("datetime64[ns]")
 
 
 def find_interval_index(
@@ -382,11 +410,16 @@ class FSVValueLookup:
                 mask, ["release_datetime", "next_release_datetime", "value"]
             ].sort_values("release_datetime")
 
-            release = feature_df["release_datetime"].values.astype("datetime64[ns]")
-            next_release = feature_df["next_release_datetime"].values.astype(
-                "datetime64[ns]"
+            # CSV times are feature-local naive (US/Eastern etc from fsv_02).
+            # Convert to UTC-naive so the minute grid matches Binance UTC bars.
+            tz_str = self._timezone_map.get(feature, "America/New_York")
+            release = local_naive_to_utc_naive_series(
+                feature_df["release_datetime"].values, tz_str
             )
-            # NaT → open-ended sentinel
+            next_release = local_naive_to_utc_naive_series(
+                feature_df["next_release_datetime"].values, tz_str
+            )
+            # NaT → open-ended sentinel (UTC)
             nat_mask = np.isnat(next_release)
             if nat_mask.any():
                 next_release = next_release.copy()
@@ -397,35 +430,51 @@ class FSVValueLookup:
                 "next_release": next_release,
                 "value": feature_df["value"].values.astype("float64"),
                 "timeframe": get_timeframe_minutes(feature, self.features_catalog),
+                "timezone": tz_str,
+                "clock": "UTC",
             }
 
+        logger.info(
+            "FSV interval index: release/next_release converted to UTC "
+            "(feature-local CSV → UTC) for Binance alignment"
+        )
         return index
 
-    def _convert_to_local_timezone(
-        self,
-        query_dt: pd.Timestamp,
-        feature: str,
-    ) -> pd.Timestamp:
-        """Convert UTC datetime to feature's local timezone (naive local wall time)."""
-        tz_str = self._timezone_map.get(feature, "America/New_York")
-
-        if query_dt.tz is None:
-            query_dt = query_dt.tz_localize("UTC")
-        elif str(query_dt.tz) != "UTC":
-            query_dt = query_dt.tz_convert("UTC")
-
-        tz = pytz.timezone(tz_str)
-        return query_dt.tz_convert(tz).replace(tzinfo=None)
-
-    def _prepare_query_dt_local(
+    def _prepare_query_dt_utc(
         self,
         query_dt: pd.Timestamp,
         feature: str,
         is_utc: bool = False,
     ) -> pd.Timestamp:
+        """
+        Normalize a query time to UTC-naive for interval membership.
+
+        Index intervals are UTC-naive. If ``is_utc``, naive queries are UTC
+        wall times (Binance / config). If not, naive queries are feature-local
+        and are converted to UTC.
+        """
+        query_dt = pd.Timestamp(query_dt)
         if is_utc:
-            return self._convert_to_local_timezone(query_dt, feature)
-        return query_dt
+            if query_dt.tz is None:
+                return query_dt
+            return query_dt.tz_convert("UTC").tz_localize(None)
+
+        tz_str = self._timezone_map.get(feature, "America/New_York")
+        if tz_str.upper() in ("UTC", "ETC/UTC", "GMT"):
+            if query_dt.tz is None:
+                return query_dt
+            return query_dt.tz_convert("UTC").tz_localize(None)
+
+        if query_dt.tz is None:
+            try:
+                query_dt = query_dt.tz_localize(
+                    tz_str, ambiguous="infer", nonexistent="shift_forward"
+                )
+            except (pytz.AmbiguousTimeError, pytz.NonExistentTimeError, ValueError, TypeError):
+                query_dt = query_dt.tz_localize(
+                    tz_str, ambiguous=True, nonexistent="shift_forward"
+                )
+        return query_dt.tz_convert("UTC").tz_localize(None)
 
     def _get_value_impl(
         self,
@@ -435,7 +484,7 @@ class FSVValueLookup:
     ) -> Tuple[Optional[float], Optional[float]]:
         """Single-query path — same membership rule as FeatureState."""
         query_dt = pd.Timestamp(query_dt_str)
-        query_dt_local = self._prepare_query_dt_local(query_dt, feature, is_utc)
+        query_dt_utc = self._prepare_query_dt_utc(query_dt, feature, is_utc)
 
         if feature not in self._index:
             return None, None
@@ -446,13 +495,13 @@ class FSVValueLookup:
         values = intervals["value"]
         timeframe = intervals["timeframe"]
 
-        query_np = np.datetime64(pd.Timestamp(query_dt_local).to_datetime64())
+        query_np = np.datetime64(pd.Timestamp(query_dt_utc).to_datetime64())
         i = find_interval_index(release_dt, next_release_dt, query_np)
         if i < 0:
             return None, None
 
         age_seconds = (
-            query_dt_local - pd.Timestamp(release_dt[i])
+            query_dt_utc - pd.Timestamp(release_dt[i])
         ).total_seconds()
         age_minutes = age_seconds / 60.0
         decay = compute_decay(age_minutes, timeframe)
@@ -529,22 +578,15 @@ class FSVValueLookup:
             state.set_intervals(self._index[feature])
 
             feature_results = []
-            tz_str = self._timezone_map.get(feature, "America/New_York")
-            tz = pytz.timezone(tz_str) if is_utc else None
-
+            # Intervals are UTC-naive. Minute grid from config is UTC when
+            # is_utc=True (Binance alignment); otherwise feature-local queries
+            # are converted to UTC in _prepare_query_dt_utc.
             for query_dt in minute_dts:
-                if is_utc:
-                    # query_dt is naive UTC wall time
-                    query_dt_local = (
-                        query_dt.tz_localize("UTC")
-                        .tz_convert(tz)
-                        .replace(tzinfo=None)
-                    )
-                else:
-                    query_dt_local = query_dt
-
-                query_np = np.datetime64(pd.Timestamp(query_dt_local).to_datetime64())
-                value, decay = state.advance_to(query_np, query_dt_local)
+                query_dt_utc = self._prepare_query_dt_utc(
+                    pd.Timestamp(query_dt), feature, is_utc
+                )
+                query_np = np.datetime64(pd.Timestamp(query_dt_utc).to_datetime64())
+                value, decay = state.advance_to(query_np, query_dt_utc)
                 if value is None:
                     miss_counts[feature] += 1
                 feature_results.append((value, decay))
@@ -611,14 +653,17 @@ def get_value_age_array(config):
     print(f"Available features: {len(lookup.get_features())}")
     print(f"Intervals fingerprint: {lookup.intervals_fingerprint}")
 
+    # Same clock as Binance: config dates are UTC wall times; FSV release
+    # intervals are converted from feature-local (US/Eastern, …) → UTC in
+    # the interval index before this minute grid is filled.
     dt_from = config.get("binance_start_date", "2024-01-01 00:00:00")
     dt_to = config.get("binance_end_date", "2026-07-01 00:00:00")
     features = lookup.get_arranged_features(None)
     is_utc = True
 
     print(f"\nFeatures to query: {features}, len={len(features)}")
-    print(f"Time range: {dt_from} to {dt_to}")
-    print(f"Is UTC: {is_utc}")
+    print(f"Time range (UTC): {dt_from} to {dt_to}")
+    print(f"Is UTC: {is_utc} (macro intervals indexed in UTC for Binance join)")
 
     cache_filename = generate_cache_filename(
         features=features,
@@ -722,6 +767,7 @@ def get_value_age_array(config):
                 "dt_from": str(dt_from),
                 "dt_to": str(dt_to),
                 "is_utc": is_utc,
+                "intervals_clock": "UTC",
                 "shape": list(arr.shape),
                 "features_to_exclude": lookup.get_excluded_features(),
                 "intervals_fingerprint": lookup.intervals_fingerprint,
