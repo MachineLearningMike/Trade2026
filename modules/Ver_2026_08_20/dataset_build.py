@@ -58,7 +58,7 @@ def get_dataset(config):
         print(f"Generated synthetic market data: F={F}, T={T}")
 
     # Add Financial State Vectors (FSV) to features
-    from macro_03_query_value_age import get_value_age_array
+    from modules.Ver_2026_08_20.macro_03_query_value_age import get_value_age_array
     macro_features, macro_feature_names = get_value_age_array(config)
     macro_features = np.asarray(macro_features, dtype=np.float32)
     if macro_features.ndim == 1:
@@ -69,7 +69,7 @@ def get_dataset(config):
             raise ValueError(
                 f"macro_features must be 2-D (n_channels, T); got 1-D shape "
                 f"{macro_features.shape}. Recompute FSV cache (delete "
-                f"{config.get('data_dir', 'dataset_cache')}/macro_value_decay_*.npy)."
+                f"{config.get('data_dir', 'dataset_cache')}/fsv_value_decay_*.npy)."
             )
     if macro_features.ndim != 2:
         raise ValueError(

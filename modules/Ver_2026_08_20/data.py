@@ -150,7 +150,7 @@ def resolve_feature_layout(config: dict) -> Dict[str, Any]:
         price_feature_idx = int(config.get('price_feature_idx', 0))
 
     # Macro base names: get_features(config) = core + extras, include/exclude filters
-    from macro_dictionary import get_features
+    from modules.Ver_2026_08_20.macro_dictionary import get_features
     macro_catalog = get_features(config, apply_filters=True)
     macro_base_names = list(macro_catalog.keys())
     macro_feature_names_full: List[str] = []
