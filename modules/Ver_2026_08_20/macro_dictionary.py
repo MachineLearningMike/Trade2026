@@ -1,17 +1,17 @@
 """
-fsv_dictionary.py
+macro_dictionary.py
 
 Feature Dictionary with Release Metadata
 ========================================
 
 Core catalog: FEATURES (versioned in this module).
 Runtime catalog: get_features(config) merges config['macro_features_extra']
-and applies features_to_include / features_to_exclude.
+and applies macros_to_include / macros_to_exclude.
 
 Consumed by:
-    fsv_01_downloader.py     — which series to pull (source / series / symbol)
-    fsv_02_find_value_intervals.py — when a value becomes public (lag + time)
-    fsv_03_query_value_age.py      — decay half-life from release_timeframe
+    macro_01_downloader.py     — which series to pull (source / series / symbol)
+    macro_02_find_value_intervals.py — when a value becomes public (lag + time)
+    macro_03_query_value_age.py      — decay half-life from release_timeframe
 
 How availability is computed (fsv_02)
 -------------------------------------
@@ -308,7 +308,7 @@ FEATURES = {
     # ------------------------------------------------------------------
     # ted_spread | FRED:TEDRATE
     # Historically LIBOR–T-bill; series is legacy / often sparse on FRED.
-    # Excluded by default in config features_to_exclude — kept for completeness.
+    # Excluded by default in config macros_to_exclude — kept for completeness.
     # Conservative T+1 afternoon.
     # ------------------------------------------------------------------
     "ted_spread": {
@@ -329,7 +329,7 @@ FEATURES = {
     # ------------------------------------------------------------------
     # commercial_paper_3m | FRED:CPF3M | 3M AA financial CP
     # Short FRED publication lag; treat as T+1 ~16:15.
-    # Often excluded in config (features_to_exclude).
+    # Often excluded in config (macros_to_exclude).
     # ------------------------------------------------------------------
     "commercial_paper_3m": {
         "source": "FRED",
@@ -934,18 +934,18 @@ def merge_feature_catalog(
 def filter_feature_catalog(
     catalog: Mapping[str, dict],
     *,
-    features_to_include: Optional[Iterable[str]] = None,
-    features_to_exclude: Optional[Iterable[str]] = None,
+    macros_to_include: Optional[Iterable[str]] = None,
+    macros_to_exclude: Optional[Iterable[str]] = None,
 ) -> Dict[str, dict]:
     """
     Apply optional whitelist then exclude list (stable order preserved).
 
-    - features_to_include None/empty → keep all keys in catalog order
+    - macros_to_include None/empty → keep all keys in catalog order
     - unknown include names are ignored (with no error) so configs stay soft
     """
-    exclude = set(features_to_exclude or [])
-    if features_to_include:
-        include = set(features_to_include)
+    exclude = set(macros_to_exclude or [])
+    if macros_to_include:
+        include = set(macros_to_include)
         ordered = {k: catalog[k] for k in catalog if k in include and k not in exclude}
         return ordered
     return {k: v for k, v in catalog.items() if k not in exclude}
@@ -965,8 +965,8 @@ def get_features(
     config :
         Optional training config. Reads:
           - macro_features_extra : dict[name → meta]  (config-only FRED/etc.)
-          - features_to_include  : optional whitelist of base names
-          - features_to_exclude  : optional denylist
+          - macros_to_include    : optional whitelist of base names
+          - macros_to_exclude    : optional denylist
           - macro_override_core  : if True, extras may replace core names
     apply_filters :
         If True (default), apply include/exclude. Use False in fsv_01/02 so
@@ -984,6 +984,6 @@ def get_features(
 
     return filter_feature_catalog(
         catalog,
-        features_to_include=config.get("features_to_include"),
-        features_to_exclude=config.get("features_to_exclude"),
+        macros_to_include=config.get("macros_to_include"),
+        macros_to_exclude=config.get("macros_to_exclude"),
     )

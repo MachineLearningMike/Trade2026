@@ -1,6 +1,6 @@
 # vae_sweep.py
 # Sequential hyperparameter scout: patch_size × num_layers, CSV logging.
-# Works for config model_type in {'transformer', 'vae'}.
+# Works for config model_type in {'regression', 'vae'}.
 
 from __future__ import annotations
 
@@ -28,10 +28,11 @@ CSV_FIELDS = [
     'model_type',
     'patch_size',
     'num_layers',
+    'delay',
     'num_heads',
     'ff_dim_multiplier',
     'vae_latent_dim',
-    'n_latent_macro_features',
+    'n_latent_macros',
     'embed_dim',
     'max_seq_len',
     'reconstruction_loss_weight',
@@ -54,7 +55,7 @@ def project_root_dir() -> Path:
 
 def sweep_csv_path(model_type: str = 'vae') -> Path:
     """CSV under ``_save/<model_type>_sweep/results.csv``."""
-    mt = str(model_type or 'transformer').lower().strip() or 'transformer'
+    mt = str(model_type or 'regression').lower().strip() or 'regression'
     return project_root_dir() / '_save' / f'{mt}_sweep' / 'results.csv'
 
 
@@ -106,11 +107,11 @@ def run_hparam_sweep(
     mt = str(
         model_type
         if model_type is not None
-        else cfg.get('model_type', 'transformer')
+        else cfg.get('model_type', 'regression')
     ).lower().strip()
-    if mt not in ('transformer', 'vae'):
+    if mt not in ('regression', 'vae'):
         raise ValueError(
-            f"model_type must be 'transformer' or 'vae', got {mt!r}"
+            f"model_type must be 'regression' or 'vae', got {mt!r}"
         )
     cfg['model_type'] = mt
     cfg['resume'] = True
@@ -118,7 +119,8 @@ def run_hparam_sweep(
     if csv_path is None:
         csv_path = sweep_csv_path(mt)
 
-    past_window = int(60 * cfg['past_hours'])
+    from telepred import resolve_past_window
+    past_window = int(resolve_past_window(cfg))
     F = (
         total_features.shape[0]
         if hasattr(total_features, 'shape')
@@ -126,7 +128,7 @@ def run_hparam_sweep(
     )
     n_market = int(dataset.n_market_features)
     n_macro = int(dataset.n_macro_features)
-    n_latent = int(cfg['n_latent_macro_features'])
+    n_latent = int(cfg['n_latent_macros'])
     n_heads = int(cfg['num_heads'])
     _model_past_len = int(
         getattr(dataset, 'model_past_len', resolve_model_past_len(cfg))
@@ -172,12 +174,13 @@ def run_hparam_sweep(
                 'model_type': mt,
                 'patch_size': patch_size,
                 'num_layers': num_layers,
+                'delay': int(cfg.get('telepred_delay', 0) or 0),
                 'num_heads': n_heads,
                 'ff_dim_multiplier': cfg.get('ff_dim_multiplier'),
                 'vae_latent_dim': (
                     cfg.get('vae_latent_dim', 64) if mt == 'vae' else ''
                 ),
-                'n_latent_macro_features': n_latent,
+                'n_latent_macros': n_latent,
                 'reconstruction_loss_weight': (
                     cfg.get('reconstruction_loss_weight', 1.0) if mt == 'vae' else ''
                 ),
@@ -282,6 +285,9 @@ def run_hparam_sweep(
                     val_loader=val_loader,
                     enable_validation=True,
                     validate_every_n_epochs=1,
+                    # Must pass trial key: otherwise trainer re-hashes get_config()
+                    # (default patch/layers) and every sweep trial shares one folder.
+                    checkpoint_key=ckpt_key,
                     embed_dim=trial_cfg['embed_dim'],
                     max_seq_len=trial_cfg['max_seq_len'],
                     recent_checkpoints=trial_cfg.get(

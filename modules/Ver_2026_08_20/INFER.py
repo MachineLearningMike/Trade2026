@@ -22,7 +22,8 @@ from labels import visualize_trend, visualize_yield, visualize_latent
 from labels import Label_Latent, resolve_latent_distribution
 from labels import decode_latent_params, latent_params_to_obs_space
 from trainer import generate_checkpoint_key
-from TRAIN import get_dataset
+from dataset_build import get_dataset
+from telepred import resolve_past_window
 from data import normalize_window
 
 
@@ -188,7 +189,7 @@ def load_model(
     """
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-    past_window = int(60 * config['past_hours'])
+    past_window = int(resolve_past_window(config))
     max_seq_len = checkpoint.get('max_seq_len')
     if max_seq_len is None:
         max_seq_len = resolve_max_seq_len(config, past_window)
@@ -449,11 +450,14 @@ def run_inference_on_test_set(
 
 def _sample_observation_time(dataset, idx: int) -> int:
     """
-    Bar index of the latent observation (``future[0]``).
+    Bar index of the latent observation (``future[0]`` = p[t+1]).
 
-    History window is ``[start, start + past_window)``; observation is the
-    first future bar at ``start + past_window`` — matches Label_Latent.find.
+    TelePred: bot time ``t`` in ``dataset.valid_t``; observation is ``t + 1``.
+    Legacy fallback: ``valid_starts[idx] + past_window``.
     """
+    valid_t = getattr(dataset, 'valid_t', None)
+    if valid_t is not None:
+        return int(valid_t[idx]) + 1
     return int(dataset.valid_starts[idx]) + int(dataset.past_window)
 
 
@@ -521,7 +525,7 @@ def collect_latent_price_series(
     """
     model.eval()
     label_std = dataset._label_stat_std
-    normalize = bool(getattr(dataset, 'normalize', True))
+    normalize = bool(getattr(dataset, 'normalize_window', True))
     price_idx = int(dataset.price_feature_idx)
     pw = int(dataset.past_window)
     T = int(dataset.T)
@@ -926,7 +930,7 @@ def run_test(
                 flush=True,
             )
             interval = int(
-                config.get('max_latent_future_horizon')
+                config.get('future_window')
                 or getattr(dataset, 'future_window', 50)
             )
             interval = max(interval, 120)
@@ -988,8 +992,8 @@ def run_test(
                     getattr(dataset, 'min_yield_percent', 0.0),
                 ),
                 max_hope_future_horizon=config.get(
-                    'max_hope_future_horizon',
-                    getattr(dataset, 'max_hope_future_horizon', None),
+                    'future_window',
+                    getattr(dataset, 'future_window', None),
                 ),
                 yield_target=yield_target,
                 num_samples=min(6, n_viz),
@@ -1013,12 +1017,9 @@ def run_test(
             raw_means = torch.stack([dataset.mean_tensor[i] for i in used_indices])
             raw_stds = torch.stack([dataset.std_tensor[i] for i in used_indices])
             pred_horizon = int(
-                config.get('max_trend_future_horizon')
-                if config.get('max_trend_future_horizon') is not None
-                else getattr(
-                    dataset, 'max_trend_future_horizon',
-                    getattr(dataset, 'max_horizon', dataset.future_window),
-                )
+                config.get('future_window',
+                    getattr(dataset, 'future_window',
+                            getattr(dataset, 'max_horizon', 50)))
             )
             h_past_full = getattr(dataset, 'h_past_tensor', None)
             h_past_viz = None
@@ -1045,12 +1046,12 @@ def run_test(
                     getattr(dataset, 'min_trend_horizon', getattr(dataset, 'min_horizon', 3)),
                 ),
                 max_horizon=config.get(
-                    'max_trend_future_horizon',
-                    getattr(dataset, 'max_trend_future_horizon', None),
+                    'future_window',
+                    getattr(dataset, 'future_window', None),
                 ),
                 max_past_horizon=config.get(
-                    'max_trend_future_horizon',
-                    getattr(dataset, 'max_trend_future_horizon', None),
+                    'future_window',
+                    getattr(dataset, 'future_window', None),
                 ),
                 fitness_threshold=config.get(
                     'fitness_threshold', getattr(dataset, 'fitness_threshold', 0.75)
@@ -1061,7 +1062,7 @@ def run_test(
                 regime_use_past=config.get(
                     'regime_use_past', getattr(dataset, 'regime_use_past', True)
                 ),
-                normalize_prices=config.get('normalize', getattr(dataset, 'normalize', True)),
+                normalize_prices=config.get('normalize_window', getattr(dataset, 'normalize_window', True)),
             )
 
     print(f"\n✓ Inference complete!", flush=True)
@@ -1349,7 +1350,7 @@ def run_vae_compare(
     percent_lo: float = 0.0,
 ):
     """
-    Load a VAE checkpoint and a yield (transformer) checkpoint, evaluate the
+    Load a VAE checkpoint and a yield (regression) checkpoint, evaluate the
     same sorted validation samples, and plot per-sample losses to inspect
     covariance (scatter + dual series + Pearson/Spearman).
     """
@@ -1411,7 +1412,7 @@ def run_vae_compare(
     cfg_vae = dict(config)
     cfg_vae['model_type'] = 'vae'
     cfg_yield = dict(config)
-    cfg_yield['model_type'] = 'transformer'
+    cfg_yield['model_type'] = 'regression'
 
     print(f"Loading VAE from:   {vae_path}", flush=True)
     model_vae = load_model(vae_path, cfg_vae, dataset, device)
@@ -1453,7 +1454,7 @@ def run_vae_compare(
             "⚠ Could not parse binance_start_date; day-of-week breakdown skipped.",
             flush=True,
         )
-    past_window = int(getattr(dataset, 'past_window', int(60 * config.get('past_hours', 36))))
+    past_window = int(getattr(dataset, 'past_window', resolve_past_window(config)))
     dow_names = (
         'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'
     )
@@ -2025,8 +2026,8 @@ def run_validate_yield(
                 getattr(dataset, 'min_yield_percent', 0.0),
             ),
             max_hope_future_horizon=config.get(
-                'max_hope_future_horizon',
-                getattr(dataset, 'max_hope_future_horizon', None),
+                'future_window',
+                getattr(dataset, 'future_window', None),
             ),
             yield_target=yield_target,
             num_samples=min(6, n_viz),

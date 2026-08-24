@@ -39,7 +39,7 @@ def resolve_vae_max_seq_len(past_window: int, patch_size: int) -> int:
 def resolve_max_seq_len(config: dict, past_window: int) -> int:
     """Seq length for the active model_type."""
     P = int(config['patch_size'])
-    if str(config.get('model_type', 'transformer')).lower() == 'vae':
+    if str(config.get('model_type', 'regression')).lower() == 'vae':
         return resolve_vae_max_seq_len(past_window, P)
     return int(past_window) // P
 
@@ -53,13 +53,13 @@ def build_market_model(
     n_max_past_horizon: int,
     max_seq_len: int,
 ):
-    """Construct transformer or VAE from ``config['model_type']``."""
-    model_type = str(config.get('model_type', 'transformer')).lower()
+    """Construct regression or VAE from ``config['model_type']``."""
+    model_type = str(config.get('model_type', 'regression')).lower()
     common = dict(
         in_features=in_features,
         n_market_features=n_market_features,
         n_macro_features=n_macro_features,
-        n_latent_macro_features=config['n_latent_macro_features'],
+        n_latent_macros=config['n_latent_macros'],
         n_max_past_horizon=n_max_past_horizon,
         patch_size=config['patch_size'],
         num_layers=config['num_layers'],
@@ -79,9 +79,9 @@ def build_market_model(
             **common,
             vae_latent_dim=int(config.get('vae_latent_dim', 64)),
         )
-    if model_type != 'transformer':
+    if model_type != 'regression':
         raise ValueError(
-            f"Unknown model_type={model_type!r}; expected 'transformer' or 'vae'"
+            f"Unknown model_type={model_type!r}; expected 'regression' or 'vae'"
         )
     from model import MarketTransformerWithHeads
     return MarketTransformerWithHeads(**common)
@@ -91,7 +91,7 @@ def wrap_model_loss(model: nn.Module, base_loss_fn, config: dict):
     """
     Build ``loss_fn(x, pred, y)`` for ResumableTrainer.
 
-    - transformer: supervised label loss only (``base_loss_fn``).
+    - regression: supervised label loss only (``base_loss_fn``).
     - vae: **no** yield/trend/latent label loss — only
       ``reconstruction_loss_weight * MSE(x_hat, x) + vae_kl_weight * KL``.
       ``y`` is ignored. Recon is always applied for VAE (independent of
@@ -99,7 +99,7 @@ def wrap_model_loss(model: nn.Module, base_loss_fn, config: dict):
     """
     recon_w = float(config.get('reconstruction_loss_weight', 1.0))
     kl_w = float(config.get('vae_kl_weight', 0.1))
-    is_vae = str(config.get('model_type', 'transformer')).lower() == 'vae'
+    is_vae = str(config.get('model_type', 'regression')).lower() == 'vae'
 
     def loss_fn(x, pred, y):
         if not is_vae:
@@ -201,7 +201,7 @@ class MarketVAEWithHeads(nn.Module):
         in_features: int,
         n_market_features: int,
         n_macro_features: int,
-        n_latent_macro_features: int,
+        n_latent_macros: int,
         n_max_past_horizon: int,
         patch_size: int,
         num_layers: int,
@@ -225,7 +225,7 @@ class MarketVAEWithHeads(nn.Module):
         self.in_features = int(in_features)
         self.n_market_features = int(n_market_features)
         self.n_macro_features = int(n_macro_features)
-        self.n_latent_macro_features = int(n_latent_macro_features)
+        self.n_latent_macros = int(n_latent_macros)
         self.causal = bool(causal)
         self.max_seq_len = int(max_seq_len)
         self.use_reconstruction = bool(use_reconstruction)
@@ -237,7 +237,7 @@ class MarketVAEWithHeads(nn.Module):
         self.n_stat_tokens = 1 + 1 + self.num_shapes  # API parity only
         self.F = int(in_features)
 
-        L = self.n_latent_macro_features
+        L = self.n_latent_macros
         self.latent_macro_transform_x = nn.Linear(self.n_macro_features, L)
 
         n_feat_enc = self.n_market_features + L
@@ -467,10 +467,11 @@ if __name__ == "__main__":
 
     config = get_config()
     device = torch.device(config.get('device', 'cpu'))
-    past_window = int(60 * config['past_hours'])
+    from telepred import resolve_past_window
+    past_window = int(resolve_past_window(config))
     P = int(config['patch_size'])
     T = (past_window // P) * P
-    L = int(config['n_latent_macro_features'])
+    L = int(config['n_latent_macros'])
     n_heads = int(config['num_heads'])
     n_market = 2
     while ((n_market + L) * P) % n_heads != 0:
@@ -487,7 +488,7 @@ if __name__ == "__main__":
         in_features=feat_dim,
         n_market_features=n_market,
         n_macro_features=n_macro,
-        n_latent_macro_features=L,
+        n_latent_macros=L,
         n_max_past_horizon=n_max_past,
         patch_size=P,
         num_layers=config['num_layers'],

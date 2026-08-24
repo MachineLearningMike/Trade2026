@@ -34,7 +34,7 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
     included. Training hyperparams (dropout, loss weights, learning_rate,
     batch_size, …) are intentionally omitted: they do not redefine the net.
     """
-    model_type = str(config.get('model_type', 'transformer')).lower()
+    model_type = str(config.get('model_type', 'regression')).lower()
     key_params = {
         'dataset_signature': dataset_signature,
 
@@ -43,7 +43,7 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
         'patch_size': config.get('patch_size'),
         'num_layers': config.get('num_layers'),
         'num_heads': config.get('num_heads'),
-        'n_latent_macro_features': config.get('n_latent_macro_features'),
+        'n_latent_macros': config.get('n_latent_macros'),
         'ff_dim_multiplier': config.get('ff_dim_multiplier'),
         'head_hidden_dim_multiplier': config.get('head_hidden_dim_multiplier'),
         'output_dim': config.get('output_dim', 3),
@@ -55,7 +55,25 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
         key_params['vae_latent_dim'] = config.get('vae_latent_dim', 64)
 
     param_string = json.dumps(key_params, sort_keys=True, default=str)
-    return hashlib.md5(param_string.encode()).hexdigest()[:16]
+    # Uniform 8-hex ids across data caches and checkpoints.
+    return hashlib.md5(param_string.encode()).hexdigest()[:8]
+
+
+def resolve_checkpoint_identity(config: dict) -> Tuple[str, str, Path]:
+    """
+    Sync label ``output_dim``, then return ``(dataset_signature, key, key_dir)``.
+
+    Shared by TRAIN CLI modes (--history / --loss / --validation / --report /
+    --clean) and any caller that must match ResumableTrainer's folder layout.
+    """
+    from labels import sync_output_dim
+    from data import generate_dataset_signature
+
+    sync_output_dim(config)
+    signature = generate_dataset_signature(config)
+    key = generate_checkpoint_key(config, signature)
+    key_dir = Path(config['checkpoint_dir']) / key
+    return signature, key, key_dir
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1864,8 +1882,13 @@ class ResumableTrainer:
                 total_batches_in_epoch = self.dataloader.get_total_batches_in_epoch()
 
                 if result["status"] == "finished":
-                    if not (extend and extend_epochs > eps):
-                        # finished + negative/zero extend → nothing to do
+                    # Episodes already completed (1-based count).
+                    completed = float(self.start_epoch + 1)
+                    plan_needs_more = num_epochs > completed + eps
+                    explicit_extend = extend and extend_epochs > eps
+
+                    if not plan_needs_more and not explicit_extend:
+                        # finished + plan already satisfied → nothing to do
                         print("\n" + "=" * 60)
                         print("✓ TRAINING ALREADY FINISHED")
                         print("=" * 60)
@@ -1874,12 +1897,24 @@ class ResumableTrainer:
                         print(f"Current plan: {num_epochs:g}")
                         if extend and extend_epochs < 0:
                             print("  (--extend negative cannot untrain finished work; plan clamped.)")
-                        print("Use --extend +N to train more epochs.")
+                        print("Raise config epochs or use --extend +N to train more.")
                         print("=" * 60)
                         self._show_history_if_available()
-                        return
+                        return 'skipped_finished'
 
-                    print("⚠ Training was finished; positive --extend continues past the last epoch.")
+                    # Plan now exceeds saved progress (higher --epochs) and/or
+                    # explicit --extend: clear finished and continue.
+                    why = []
+                    if plan_needs_more:
+                        why.append(
+                            f"plan {num_epochs:g} > completed {completed:g}"
+                        )
+                    if explicit_extend:
+                        why.append(f"--extend {extend_epochs:g}")
+                    print(
+                        "⚠ Prior run marked finished, but continuing "
+                        f"({'; '.join(why)})."
+                    )
                     self.state_manager.clear_finished_flag()
                     start_epoch_for_loop = self.start_epoch + 1
                     self.start_batch = 0
@@ -1888,11 +1923,11 @@ class ResumableTrainer:
                             f"\n⚠ Plan {num_epochs:g} does not go past progress "
                             f"({start_epoch_for_loop})."
                         )
-                        print("  Use a larger positive --extend value.")
-                        return
+                        print("  Use a larger --epochs or positive --extend.")
+                        return 'skipped_finished'
                     print(
-                        f"✓ Extension resume: starting at epoch {start_epoch_for_loop + 1} "
-                        f"/ {num_epochs:g}"
+                        f"✓ Resume after finished: starting at epoch "
+                        f"{start_epoch_for_loop + 1} / {num_epochs:g}"
                     )
 
                 elif result["status"] == "checkpoint":
@@ -1935,7 +1970,7 @@ class ResumableTrainer:
                                 f"\n⚠ Progress {cont:g} already at/past plan {num_epochs:g}."
                             )
                             print("  Use a larger positive --extend value.")
-                            return
+                            return 'skipped_finished'
                         # Plan shortened to current progress (or already done)
                         self.state_manager.mark_training_finished(
                             model=self.model,
@@ -1962,9 +1997,13 @@ class ResumableTrainer:
                         print("Use --extend +N to train further.")
                         print("=" * 60)
                         self._show_history_if_available()
-                        return
+                        return 'skipped_finished'
             else:
                 print("\nStarting fresh training.")
+                print(
+                    f"  (No loadable checkpoint under {self.state_manager.save_dir} "
+                    f"— need training_state.json + a .pt file.)"
+                )
         else:
             print("\nStarting fresh training (resume disabled).")
         
@@ -1980,6 +2019,8 @@ class ResumableTrainer:
         print(f"{'='*60}")
         print(f"Key: {self.checkpoint_key}")
         print(f"Epochs: {num_epochs:g} (starting from {start_epoch_for_loop + 1})")
+        if start_epoch_for_loop == 0 and self.total_minibatches_processed == 0:
+            print("  (weights randomly initialized — not a resume)")
         if extend and abs(extend_epochs) > eps:
             print(f"  (Plan adjustment: {extend_epochs:+g} epochs)")
         print(f"Total minibatches processed so far: {self.total_minibatches_processed}")
@@ -2105,23 +2146,24 @@ class ResumableTrainer:
                 epoch += 1
                 # After first loop iteration, resume batch only applies once
                 self.start_batch = 0
-                        
+
         except KeyboardInterrupt:
             self._emergency_save()
-            
+            return 'interrupted'
+
         except Exception as e:
             print(f"\n⚠ Unexpected error: {e}")
             self._emergency_save()
             raise
-        
+
         finally:
             self.is_running = False
-            
+
             if self.stop_requested:
                 print(f"\n⏸ Training stopped at minibatch {self.total_minibatches_processed}")
                 print(f"   Key: {self.checkpoint_key}")
                 print(f"   Epoch {self.current_epoch + 1}, batch {self.current_batch}")
-                print(f"   Resume with: python train.py")
+                print(f"   Resume with: python TRAIN.py")
             else:
                 # Continuous progress after loop
                 try:
@@ -2163,7 +2205,11 @@ class ResumableTrainer:
                     print(f"\n⚠ Training ended at minibatch {self.total_minibatches_processed}")
                     print(f"   Key: {self.checkpoint_key}")
                     print(f"   Epoch {self.current_epoch + 1}/{num_epochs:g}")
-    
+
+        if self.stop_requested:
+            return 'interrupted'
+        return 'trained'
+
     def train_epoch(self, epoch, max_batches: Optional[int] = None):
         """Train one epoch with optimized timing and reduced overhead.
         

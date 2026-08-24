@@ -1,14 +1,14 @@
 """
-fsv_02_find_value_intervals.py
+macro_02_find_value_intervals.py
 
 Financial State Vector Availability Engine.
 
 Input:
-    fsv_raw.csv
-    fsv_dictionary.py
+    macro_raw.csv
+    macro_dictionary.py
 
 Output:
-    fsv_value_intervals.csv
+    macro_value_intervals.csv
 
 Converts each raw observation to:
     (feature, release_datetime, next_release_datetime, value)
@@ -21,7 +21,7 @@ so it remains valid after its release.
 
 Release timing:
     1. Prefer ALFRED first-publication column ``{feature}__first_release``
-       when present (from fsv_01 when use_vintage_data=True).
+       when present (from macro_01 when use_vintage_data=True).
     2. Else heuristic: observation date + release_lag_days + release_time,
        with business-day adjustment only for non-continuous markets.
 
@@ -37,7 +37,7 @@ import pandas as pd
 import pytz
 from pandas.tseries.holiday import USFederalHolidayCalendar
 
-from fsv_dictionary import get_features
+from macro_dictionary import get_features
 
 # Configure logging
 logging.basicConfig(
@@ -324,15 +324,17 @@ if __name__ == "__main__":
 
     import sys
     import os
-    from config import get_config
 
-    data_dir = get_config().get("data_dir", "dataset_cache")
+    # Config-free artifact: path may come from env, but catalog is core FEATURES
+    # only (no include/exclude, no macro_features_extra). TRAIN selects features
+    # later when building the minute grid (fsv_03).
+    data_dir = os.environ.get("MACRO_DATA_DIR") or os.environ.get("FSV_DATA_DIR", "dataset_cache")
 
-    RAW_FILE = f"{data_dir}/fsv_raw.csv"
-    OUTPUT_FILE = f"{data_dir}/fsv_value_intervals.csv"
+    RAW_FILE = f"{data_dir}/macro_raw.csv"
+    OUTPUT_FILE = f"{data_dir}/macro_value_intervals.csv"
 
     print("\n" + "=" * 60)
-    print("FSV Availability Builder")
+    print("FSV Availability Builder (config-independent intervals CSV)")
     print("=" * 60)
 
     print(f"\nLoading raw FSV from {RAW_FILE}...")
@@ -349,9 +351,9 @@ if __name__ == "__main__":
         sys.exit(1)
 
     print("\nBuilding availability records...")
-    # Full merged catalog (core + extras); filters apply only at query time.
-    catalog = get_features(get_config(), apply_filters=False)
-    print(f"Using {len(catalog)} feature metas for interval build")
+    # Core dictionary only — do not pass training config.
+    catalog = get_features(None, apply_filters=False)
+    print(f"Using {len(catalog)} core feature metas for interval build")
     availability = build_availability(raw, catalog)
 
     print(f"\nSaving availability data to {OUTPUT_FILE}...")

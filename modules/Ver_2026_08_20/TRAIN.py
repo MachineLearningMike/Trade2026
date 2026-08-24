@@ -2,198 +2,21 @@
 # Main training script - Clean version with all logic in trainer
 
 import sys
-import os
 from pathlib import Path
 
 import argparse
 import json
-import math
 import shutil
-from datetime import datetime
 
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
+from config import update_config
+from dataset_build import get_dataset, project_root_dir
+from labels import sync_output_dim
+from telepred import parse_delay_list
+from trainer import resolve_checkpoint_identity
+from train_run import train_one_run
 
-from data import (
-    TradingDataset,
-    ThreadedDataLoader,
-    get_binance_data,
-    generate_dataset_signature,
-)
-from labels import (
-    bind_label_loss,
-    label_target_names,
-    resolve_future_window,
-    resolve_model_past_len,
-)
-from model import (
-    report_model_size,
-    check_all_weights_updated,
-)
-from model_vae import (
-    build_market_model,
-    resolve_max_seq_len,
-    wrap_model_loss,
-)
-from trainer import ResumableTrainer, generate_checkpoint_key
-
-
-def project_root_dir() -> Path:
-    """Repo root: ``…/Trade2026`` when this file lives in ``modules/Ver_…``."""
-    return Path(__file__).resolve().parents[2]
-
-
-def generate_synthetic_data(T: int, F: int, price_feature_idx: int = 0):
-    """Generate synthetic trading data for testing."""
-    features = []
-    for i in range(F):
-        if i == price_feature_idx:
-            price = np.cumsum(np.random.randn(T) * 0.5 + 0.1)
-            features.append(price.astype(np.float32))
-        elif i == 1:
-            volume = np.abs(np.random.randn(T) * 100 + 1000)
-            features.append(volume.astype(np.float32))
-        else:
-            features.append(np.random.randn(T).astype(np.float32))
-    return features
-
-def get_dataset(config):
-    """Build TradingDataset from Binance (or synthetic) market data + FSV macros."""
-    market_features = None
-    target_feature_id = None
-    market_feature_names = None
-
-    if config.get('use_binance_data', False):
-        start_s = config.get('binance_start_date')
-        end_s = config.get('binance_end_date')
-        if start_s and end_s and str(start_s) >= str(end_s):
-            # String compare works for 'YYYY-MM-DD HH:MM:SS' layout.
-            print(
-                f"⚠ binance_start_date ({start_s}) must be strictly before "
-                f"binance_end_date ({end_s}). Zero-length range yields T=0."
-            )
-            sys.exit(1)
-        market_features, T, nForget, target_feature_id, market_feature_names = get_binance_data(config)
-        if market_features is None or target_feature_id is None:
-            print("⚠ Failed to fetch Binance data.")
-            sys.exit(1)
-        # get_binance_data returns a list of 1-d arrays → stack to (F_m, T)
-        if isinstance(market_features, list):
-            market_arr = np.stack(market_features, axis=0).astype(np.float32)
-        else:
-            market_arr = np.asarray(market_features, dtype=np.float32)
-        if market_arr.ndim != 2 or market_arr.shape[1] == 0:
-            print(
-                f"⚠ Market series is empty (shape={getattr(market_arr, 'shape', None)}). "
-                f"Check binance_start_date / binance_end_date and data availability."
-            )
-            sys.exit(1)
-    else:
-        T = 60 * 24 * config.get('total_synthetic_days', 30)
-        F = config.get('num_features', 5)
-        target_feature_id = config.get('price_feature_idx', 0)
-        market_list = generate_synthetic_data(T, F, target_feature_id)
-        market_arr = np.stack(market_list, axis=0).astype(np.float32)
-        market_feature_names = [f'feature_{i}' for i in range(F)]
-        print(f"Generated synthetic market data: F={F}, T={T}")
-
-    # Add Financial State Vectors (FSV) to features
-    from fsv_03_query_value_age import get_value_age_array
-    macro_features, macro_feature_names = get_value_age_array(config)
-    macro_features = np.asarray(macro_features, dtype=np.float32)
-    if macro_features.ndim == 1:
-        # Legacy empty / corrupt cache: promote to (0, T) or fail clearly
-        if macro_features.size == 0:
-            macro_features = np.zeros((0, market_arr.shape[1]), dtype=np.float32)
-        else:
-            raise ValueError(
-                f"macro_features must be 2-D (n_channels, T); got 1-D shape "
-                f"{macro_features.shape}. Recompute FSV cache (delete "
-                f"{config.get('data_dir', 'dataset_cache')}/fsv_value_decay_*.npy)."
-            )
-    if macro_features.ndim != 2:
-        raise ValueError(
-            f"macro_features must be 2-D (n_channels, T); got shape "
-            f"{macro_features.shape}"
-        )
-
-    macro_feature_names_full = []
-    for name in (macro_feature_names or []):
-        macro_feature_names_full.append(name + "_value")
-        macro_feature_names_full.append(name + "_decay")
-
-    if macro_features.shape[0] == 0:
-        print(
-            "⚠ No macro FSV channels loaded (empty feature list or FSV failure). "
-            "Continuing with market features only."
-        )
-    elif macro_features.shape[0] != len(macro_feature_names_full):
-        print(
-            f"⚠ macro channel count {macro_features.shape[0]} != "
-            f"name count {len(macro_feature_names_full)}; "
-            f"trimming names/channels to the shorter length."
-        )
-        n_ch = min(macro_features.shape[0], len(macro_feature_names_full))
-        macro_features = macro_features[:n_ch]
-        macro_feature_names_full = macro_feature_names_full[:n_ch]
-
-    # Align time lengths (market vs macro caches can differ slightly)
-    if macro_features.shape[0] > 0:
-        T = min(int(market_arr.shape[1]), int(macro_features.shape[1]))
-        if market_arr.shape[1] != macro_features.shape[1]:
-            print(
-                f"⚠ Aligning time lengths: market T={market_arr.shape[1]}, "
-                f"macro T={macro_features.shape[1]} → using T={T}"
-            )
-        market_arr = market_arr[:, :T]
-        macro_features = macro_features[:, :T]
-        total_features = np.concatenate([market_arr, macro_features], axis=0)  # (F, T)
-    else:
-        T = int(market_arr.shape[1])
-        total_features = market_arr
-    n_market_features = market_arr.shape[0]
-    n_macro_features = macro_features.shape[0]
-
-    past_bars = int(60 * config.get('past_hours', 36))
-    future_bars = int(resolve_future_window(config))
-    need_T = past_bars + future_bars
-    if T < need_T:
-        print(
-            f"⚠ Time length T={T} is shorter than past+future "
-            f"({past_bars}+{future_bars}={need_T}). "
-            f"Widen binance_start_date..binance_end_date or reduce past_hours / horizons."
-        )
-        sys.exit(1)
-
-    # TradingDataset stacks list/rows on axis=1 → (T, F)
-    features_for_dataset = [total_features[i] for i in range(total_features.shape[0])]
-
-    train_ratio = config.get('train_ratio', 0.70)
-    val_ratio = config.get('val_ratio', 0.20)
-    test_ratio = 1.0 - train_ratio - val_ratio
-    split_ratios = (train_ratio, val_ratio, test_ratio)
-
-    dataset = TradingDataset(
-        features=features_for_dataset,
-        n_market_features=n_market_features,
-        n_macro_features=n_macro_features,
-        feature_names=market_feature_names + macro_feature_names_full,
-        price_feature_idx=target_feature_id,
-        past_hours=config['past_hours'],
-        future_minutes=resolve_future_window(config),
-        step=config['step'],
-        max_accum_deviation=config['max_accum_deviation'],
-        min_trend_horizon=config.get('min_trend_horizon', 3),
-        max_trend_future_horizon=config.get('max_trend_future_horizon'),
-        device=config['device'],
-        normalize=config['normalize'],
-        data_dir=config.get('data_dir', 'dataset_cache'),
-        force_recompute=config.get('force_recompute', False),
-        split_ratios=split_ratios
-    )
-    return dataset, total_features
+# Compatibility re-export for callers that still do ``from TRAIN import get_dataset``.
+__all__ = ['main', 'get_dataset', 'project_root_dir']
 
 
 def main(config):
@@ -203,7 +26,7 @@ def main(config):
     if 'price_feature_idx' not in config:
         config['price_feature_idx'] = 0
     
-    parser = argparse.ArgumentParser(description='Resilient Trading Training with Transformer')
+    parser = argparse.ArgumentParser(description='Resilient Trading Training (regression / VAE)')
     parser.add_argument('--epochs', type=int, default=config['epochs'], help='Number of epochs')
     parser.add_argument(
         '--save-every', type=float, default=config['save_every_n_minutes'],
@@ -272,7 +95,7 @@ def main(config):
             'Force a checkpoint folder under checkpoint_dir (e.g. a prior '
             'yield transformer run). Use with --validate / --test / '
             '--validate-yield. Architecture must still match the weights '
-            '(set --model-type transformer for yield models).'
+            '(set --model-type regression for yield models).'
         ),
     )
     parser.add_argument(
@@ -290,7 +113,7 @@ def main(config):
     )
     parser.add_argument(
         '--yield-key', type=str, default=None, metavar='KEY',
-        help='Yield (transformer) checkpoint folder name for --vae-compare.',
+        help='Yield (regression) checkpoint folder name for --vae-compare.',
     )
     parser.add_argument(
         '--sweep', action='store_true', default=False,
@@ -316,6 +139,34 @@ def main(config):
             'If a trial checkpoint already exists, add this many epochs '
             '(default 1) and append a new row to results.csv. '
             'Fresh trials still use --sweep-epochs only.'
+        ),
+    )
+    parser.add_argument(
+        '--telepred-delay', type=int,
+        default=int(config.get('telepred_delay', 0) or 0),
+        metavar='D',
+        help='TelePred delay d (bars): input ends at bot_time-d (default 0)',
+    )
+    parser.add_argument(
+        '--telepred-delays', type=str, default=None, metavar='LIST',
+        help=(
+            'Comma-separated delays for --ensemble / --ensemble-sweep '
+            '(default: config telepred_delays)'
+        ),
+    )
+    parser.add_argument(
+        '--ensemble', action='store_true', default=False,
+        help=(
+            'Train the full TelePred delay bank (one checkpoint per d). '
+            'Appends rows to '
+            '<project_root>/_save/ensemble_<label>_<model_type>/results.csv'
+        ),
+    )
+    parser.add_argument(
+        '--ensemble-sweep', action='store_true', default=False,
+        help=(
+            'Hyperparameter scout: outer patch_size×num_layers; '
+            'each trial trains the full TelePred delay bank'
         ),
     )
     parser.add_argument(
@@ -364,16 +215,15 @@ def main(config):
             'config test_viz_samples.'
         ),
     )
-    parser.add_argument('--past-hours', type=float, default=config['past_hours'], help='Past hours for input')
     parser.add_argument(
-        '--max-trend-future-horizon', type=int,
-        default=config.get('max_trend_future_horizon', 50),
-        help='Max future trend horizon (also future_window for trend)',
+        '--past-window', type=int,
+        default=int(config.get('past_window', 1440)),
+        help='TelePred delta1: past input length in bars',
     )
     parser.add_argument(
-        '--max-hope-future-horizon', type=int,
-        default=config.get('max_hope_future_horizon', 60),
-        help='Max hope future horizon (also future_window for yield)',
+        '--future-window', type=int,
+        default=int(config.get('future_window', 50)),
+        help='TelePred delta2: label future length in bars (yield/trend/latent)',
     )
     parser.add_argument('--batch-size', type=int, default=config['batch_size'], help='Batch size')
     parser.add_argument('--total-days', type=int, default=config['total_synthetic_days'], help='Total days of data')
@@ -392,14 +242,14 @@ def main(config):
     )
     parser.add_argument(
         '--model-type', type=str,
-        default=config.get('model_type', 'transformer'),
-        choices=['transformer', 'vae'],
-        help="Model backend: 'transformer' or 'vae' (x recon; mean/std FiLM cond)",
+        default=config.get('model_type', 'regression'),
+        choices=['regression', 'vae'],
+        help="Model backend: 'regression' or 'vae' (x recon; mean/std FiLM cond)",
     )
     parser.add_argument(
         '--label', type=str, default=config.get('label', 'trend'),
         choices=['trend', 'yield', 'latent'],
-        help='Label family (shared head contract for transformer and VAE)',
+        help='Label family (shared head contract for regression and VAE)',
     )
     parser.add_argument(
         '--latent-distribution', type=str,
@@ -413,7 +263,7 @@ def main(config):
             'student → output_dim=3 (loc, scale_raw, df_raw)'
         ),
     )
-    parser.add_argument('--no-normalize', action='store_true', help='Disable per-window normalization')
+    parser.add_argument('--no-normalize-window', action='store_true', help='Disable per-window z-score normalization')
     parser.add_argument('--lr', type=float, default=config['learning_rate'], help='Learning rate')
     parser.add_argument('--slope-weight', type=float, default=config['slope_loss_weight'],
                        help='Weight for slope loss')
@@ -465,9 +315,8 @@ def main(config):
     config['epochs'] = args.epochs
     config['save_every_n_minutes'] = args.save_every
     config['clean'] = args.clean
-    config['past_hours'] = args.past_hours
-    config['max_trend_future_horizon'] = args.max_trend_future_horizon
-    config['max_hope_future_horizon'] = args.max_hope_future_horizon
+    config['past_window'] = int(args.past_window)
+    config['future_window'] = int(args.future_window)
     config['batch_size'] = args.batch_size
     config['total_synthetic_days'] = args.total_days
     config['step'] = args.step
@@ -479,10 +328,8 @@ def main(config):
     config['latent_distribution'] = args.latent_distribution
     if getattr(args, 'checkpoint_key', None):
         config['checkpoint_key'] = str(args.checkpoint_key).strip()
-    if args.label == 'latent':
-        # Force shared model head width from density mode.
-        from labels import Label_Latent
-        config['output_dim'] = Label_Latent.resolve_output_dim(config)
+    # Force head width for yield/latent so checkpoint keys match training.
+    sync_output_dim(config)
     config['learning_rate'] = args.lr
     config['slope_loss_weight'] = args.slope_weight
     config['intercept_loss_weight'] = args.intercept_weight
@@ -503,10 +350,21 @@ def main(config):
     config['validate'] = not args.no_validate
     config['validate_every_n_epochs'] = args.validate_every
     config['validate_batch_size'] = args.val_batch_size
-    
-    if args.no_normalize:
-        config['normalize'] = False
-    
+    config['telepred_delay'] = int(args.telepred_delay)
+    if args.telepred_delays is not None:
+        config['telepred_delays'] = parse_delay_list(args.telepred_delays)
+    else:
+        config['telepred_delays'] = parse_delay_list(
+            config.get('telepred_delays', [config['telepred_delay']])
+        )
+
+    if args.no_normalize_window:
+        config['normalize_window'] = False
+
+    # Push CLI overrides into the module config so any get_config() fallback
+    # (and signature helpers) see the same values as this run.
+    update_config(config)
+
     # ============================================================
     # STEP 1: Handle --trend flag (visualize trends only, no training)
     # ============================================================
@@ -633,9 +491,7 @@ def main(config):
             return
 
         # Case 3: --history (current config) — config-only key, no get_dataset()
-        dataset_signature = generate_dataset_signature(config)
-        current_key = generate_checkpoint_key(config, dataset_signature)
-        current_dir = checkpoint_dir / current_key
+        dataset_signature, current_key, current_dir = resolve_checkpoint_identity(config)
         print(f"🔑 Dataset signature: {dataset_signature}")
         print(f"🔑 Checkpoint key:    {current_key}")
 
@@ -765,9 +621,7 @@ def main(config):
             return
 
         # Case 3: --loss (current config key)
-        dataset_signature = generate_dataset_signature(config)
-        current_key = generate_checkpoint_key(config, dataset_signature)
-        current_dir = checkpoint_dir / current_key
+        dataset_signature, current_key, current_dir = resolve_checkpoint_identity(config)
         print(f"🔑 Dataset signature: {dataset_signature}")
         print(f"🔑 Checkpoint key:    {current_key}")
 
@@ -899,19 +753,7 @@ def main(config):
             return None
 
         # Prefer current config key (same signature/key scheme as --loss / --history).
-        dataset_signature = generate_dataset_signature(config)
-        # Align output_dim with training so the key matches ResumableTrainer.
-        label_mode = str(config.get('label', 'trend')).lower()
-        if label_mode in ('yield', 'scattered_hope'):
-            from labels import Label_Yield, resolve_yield_target
-            config['output_dim'] = Label_Yield.resolve_output_dim(
-                yield_target=resolve_yield_target(config)
-            )
-        elif label_mode == 'latent':
-            from labels import Label_Latent
-            config['output_dim'] = Label_Latent.resolve_output_dim(config)
-        current_key = generate_checkpoint_key(config, dataset_signature)
-        current_dir = checkpoint_dir / current_key
+        dataset_signature, current_key, current_dir = resolve_checkpoint_identity(config)
         print(f"🔑 Dataset signature: {dataset_signature}")
         print(f"🔑 Checkpoint key:    {current_key}")
         if requested_epoch is None:
@@ -1004,18 +846,7 @@ def main(config):
             validation_loss_path,
         )
 
-        dataset_signature = generate_dataset_signature(config)
-        label_mode = str(config.get('label', 'trend')).lower()
-        if label_mode in ('yield', 'scattered_hope'):
-            from labels import Label_Yield, resolve_yield_target
-            config['output_dim'] = Label_Yield.resolve_output_dim(
-                yield_target=resolve_yield_target(config)
-            )
-        elif label_mode == 'latent':
-            from labels import Label_Latent
-            config['output_dim'] = Label_Latent.resolve_output_dim(config)
-        current_key = generate_checkpoint_key(config, dataset_signature)
-        current_dir = checkpoint_dir / current_key
+        dataset_signature, current_key, current_dir = resolve_checkpoint_identity(config)
         print(f"🔑 Dataset signature: {dataset_signature}")
         print(f"🔑 Checkpoint key:    {current_key}")
         print(f"📁 Project root:      {project_root}")
@@ -1124,21 +955,8 @@ def main(config):
     # Only remove this config's key folder. Sibling checkpoint keys stay intact.
     checkpoint_dir = Path(config['checkpoint_dir'])
     if config['clean']:
-        # Match TradingDataset.cache_key: signature uses config before output_dim
-        # forcing. Then mirror get_dataset() → config['output_dim'] sync so the
-        # architecture hash matches ResumableTrainer's generate_checkpoint_key.
-        dataset_signature = generate_dataset_signature(config)
-        label_mode = str(config.get('label', 'trend')).lower()
-        if label_mode in ('yield', 'scattered_hope'):
-            from labels import Label_Yield, resolve_yield_target
-            config['output_dim'] = Label_Yield.resolve_output_dim(
-                yield_target=resolve_yield_target(config)
-            )
-        elif label_mode == 'latent':
-            from labels import Label_Latent
-            config['output_dim'] = Label_Latent.resolve_output_dim(config)
-        current_key = generate_checkpoint_key(config, dataset_signature)
-        key_dir = checkpoint_dir / current_key
+        # Match ResumableTrainer key (signature + synced output_dim).
+        dataset_signature, current_key, key_dir = resolve_checkpoint_identity(config)
         if key_dir.exists():
             shutil.rmtree(key_dir)
             print(f"✓ Cleaned checkpoints for key: {current_key}")
@@ -1256,7 +1074,7 @@ def main(config):
         print("  Plot: batch loss / moving avg / running loss (no save)")
         print("=" * 60 + "\n")
 
-        # Lazy import: INFER imports get_dataset from this module.
+        # Lazy import keeps TRAIN → INFER one-way (dataset_build owns get_dataset).
         from INFER import run_validate
 
         run_validate(
@@ -1312,29 +1130,56 @@ def main(config):
         print(f"  Batch size (config test_batch_size): {test_bs}")
         print("=" * 60 + "\n")
 
-        # Lazy import: INFER imports get_dataset from this module.
+        # Lazy import keeps TRAIN → INFER one-way (dataset_build owns get_dataset).
         from INFER import run_test
 
         run_test(config, max_samples=max_samples, visualize=True)
         print("\n✅ Test evaluation completed!")
         return
 
+
     # ============================================================
-    # STEP 4: Get data (Binance or Synthetic)
+    # STEP 4: Ensemble sweep / ensemble train / single-element train
     # ============================================================
 
+    if getattr(args, 'ensemble_sweep', False):
+        from ensemble_train import run_ensemble_sweep
+        csv_path = run_ensemble_sweep(
+            config,
+            delays=config.get('telepred_delays'),
+            epochs_per_trial=max(1, int(getattr(args, 'sweep_epochs', 1))),
+            extend_epochs=float(getattr(args, 'sweep_extend', 1.0)),
+            get_dataset=get_dataset,
+        )
+        print(f"\n✅ Ensemble sweep completed → {csv_path}")
+        return
+
+    if getattr(args, 'ensemble', False):
+        from ensemble_train import run_ensemble_train, ensemble_csv_path
+        run_ensemble_train(
+            config,
+            delays=config.get('telepred_delays'),
+            get_dataset=get_dataset,
+            num_epochs=float(config['epochs']),
+            extend=(args.extend is not None and args.extend != 0),
+            extend_epochs=args.extend if args.extend is not None else 0.0,
+            write_csv=True,
+        )
+        csv_path = ensemble_csv_path(
+            label=str(config.get('label', 'yield')),
+            model_type=str(config.get('model_type', 'regression')),
+        )
+        print(f"\n✅ Ensemble training completed → {csv_path}")
+        return
+
+    # Single-element path (and legacy --sweep on one delay's dataset)
     dataset, total_features = get_dataset(config)
 
-    # ============================================================
-    # STEP 4b: Hyperparameter sweep (optional)
-    # ============================================================
     if getattr(args, 'sweep', False) or getattr(args, 'vae_sweep', False):
         from vae_sweep import run_hparam_sweep
-
         if getattr(args, 'vae_sweep', False):
             config['model_type'] = 'vae'
-        # else: keep config / --model-type designation
-        mt = str(config.get('model_type', 'transformer')).lower()
+        mt = str(config.get('model_type', 'regression')).lower()
         csv_path = run_hparam_sweep(
             config,
             dataset,
@@ -1346,205 +1191,19 @@ def main(config):
         print(f"\n✅ {mt} sweep completed → {csv_path}")
         return
 
-    past_window = int(60 * config['past_hours'])
-    # total_features is (F, T); model uses latent macro compression for embed_dim
-    F = total_features.shape[0] if hasattr(total_features, 'shape') else len(total_features)
-    n_features_after_latent = dataset.n_market_features + config['n_latent_macro_features']
-    embed_dim = n_features_after_latent * config['patch_size']
-    if embed_dim % config['num_heads'] != 0:
-        raise ValueError(
-            f"embed_dim ({embed_dim}) must be divisible by num_heads ({config['num_heads']}). "
-            f"Adjust patch_size / n_latent_macro_features / num_heads."
-        )
-    config['embed_dim'] = embed_dim
-    config['max_seq_len'] = resolve_max_seq_len(config, past_window)
-    
-    # Keep config in sync if dataset forced output_dim (e.g. yield → 2)
-    config['output_dim'] = dataset.output_dim
-    _model_type = str(config.get('model_type', 'transformer')).lower()
-    print(f"\nData shapes:")
-    print(f"  Input x: (F={F}, past_window={past_window})")
-    print(f"  Label mode: {getattr(dataset, 'label_mode', config.get('label', 'trend'))}")
-    print(f"  Model type: {_model_type}")
-    _od = config['output_dim']
-    _yt = getattr(dataset, 'yield_target', config.get('yield_target', 'both'))
-    _ld = getattr(
-        dataset, 'latent_distribution', config.get('latent_distribution', 'normal')
-    )
-    _onames = label_target_names(
-        getattr(dataset, 'label_mode', config.get('label', 'trend')),
-        _od,
-        yield_target=_yt,
-        latent_distribution=_ld,
-    )
-    print(f"  Output: {_onames} - {_od} values (output_dim)")
-    if getattr(dataset, 'label_mode', None) == 'yield' or config.get('label') == 'yield':
-        print(f"  yield_target: {_yt}")
-    if getattr(dataset, 'label_mode', None) == 'latent' or config.get('label') == 'latent':
-        print(f"  latent_distribution: {_ld}")
-    print(f"  Total samples: {len(dataset)}")
-    print(f"  Train samples: {len(dataset.train_indices)}")
-    print(f"  Val samples: {len(dataset.val_indices)}")
-    print(f"  Test samples: {len(dataset.test_indices)}")
-    print(f"  n_market_features: {dataset.n_market_features}")
-    print(f"  n_macro_features: {dataset.n_macro_features}")
-    print(f"\nModel config ({_model_type}):")
-    print(f"  Patch size: {config['patch_size']}")
-    print(f"  Embed dim: {config['embed_dim']} "
-          f"(= (n_market + n_latent_macro) * patch_size)")
-    print(f"  Max seq len: {config['max_seq_len']}")
-    print(f"  Num layers: {config['num_layers']}")
-    print(f"  Num heads: {config['num_heads']}")
-    print(f"  FF dim multiplier: {config['ff_dim_multiplier']}")
-    print(f"  Causal: {config['causal']}")
-    print(f"  Use reconstruction: {config['use_reconstruction']}")
-    print(f"  look_price: {config.get('look_price', True)}")
-    if _model_type == 'vae':
-        print(f"  vae_latent_dim: {config.get('vae_latent_dim', 64)}")
-        print(f"  vae_kl_weight: {config.get('vae_kl_weight', 0.1)}")
-        print(
-            f"  VAE train loss: "
-            f"{config.get('reconstruction_loss_weight', 1.0):g}·MSE(x̂,x) + "
-            f"{config.get('vae_kl_weight', 0.1):g}·KL  "
-            f"(no yield/chance/near)"
-        )
-    
-    _model_past_len = int(
-        getattr(dataset, 'model_past_len', resolve_model_past_len(config))
-    )
-    model = build_market_model(
+    train_one_run(
         config,
-        in_features=F,
-        n_market_features=dataset.n_market_features,
-        n_macro_features=dataset.n_macro_features,
-        n_max_past_horizon=_model_past_len,
-        max_seq_len=config['max_seq_len'],
-    )
-    _model_name = type(model).__name__
-
-    # Size report + one-step gradient coverage check at start
-    report_model_size(model, name=_model_name)
-    _probe_T = (past_window // config['patch_size']) * config['patch_size']
-    _probe_B = 2
-    _probe_device = torch.device(config['device']) if config.get('device') else torch.device('cpu')
-    model = model.to(_probe_device)
-    _probe_P = _model_past_len
-    # Concrete label-class loss (trend / yield / latent).
-    # VAE: wrap_model_loss uses recon+KL only (ignores yield/chance/near).
-    # Transformer: supervised label loss from bind_label_loss.
-    _base_loss_fn = bind_label_loss(
-        dataset.label_mode,
-        config,
-        yield_target=getattr(dataset, 'yield_target', config.get('yield_target', 'both')),
-        latent_distribution=getattr(
-            dataset, 'latent_distribution', config.get('latent_distribution', 'normal')
-        ),
-    )
-    loss_fn = wrap_model_loss(model, _base_loss_fn, config)
-
-    check_all_weights_updated(
-        model,
-        sample_batch=(
-            torch.randn(_probe_B, _probe_T, F, device=_probe_device),
-            torch.randn(_probe_B, _probe_P, device=_probe_device),  # recent past p
-            torch.randn(_probe_B, F, device=_probe_device),
-            torch.randn(_probe_B, F, device=_probe_device).abs() + 1e-3,
-            torch.randn(_probe_B, config.get('num_shapes', 4), F, device=_probe_device),
-        ),
-        loss_fn=loss_fn,
-        name=_model_name,
-    )
-
-    # Create dataloaders
-    # Please please please keep shuffle = True, False, and False for train, val, and test, respectively.
-    train_loader = ThreadedDataLoader(dataset.train_dataset, batch_size=config['batch_size'], shuffle=True)
-    val_loader = ThreadedDataLoader(dataset.val_dataset, batch_size=config['validate_batch_size'], shuffle=False)
-    test_loader = ThreadedDataLoader(dataset.test_dataset, batch_size=config['validate_batch_size'], shuffle=False)
-
-    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
-    
-    # Create trainer with validation
-    trainer = ResumableTrainer(
-        dataset_signature=dataset.cache_key,
-        model=model,
-        loss_fn=loss_fn,
-        optimizer=optimizer,
-        dataloader=train_loader,
-        save_dir=config['checkpoint_dir'],
-        device=config['device'],
-        save_every_n_minutes=config['save_every_n_minutes'],
-        val_loader=val_loader,
-        enable_validation=config['validate'],
-        validate_every_n_epochs=config['validate_every_n_epochs'],
-        embed_dim=config['embed_dim'],
-        max_seq_len=config['max_seq_len'],
-        recent_checkpoints=config.get(
-            'recent_checkpoints', config.get('max_checkpoints', 3)
-        ),
-    )
-    
-    print("\n" + "=" * 60)
-    print("TRADING MODEL TRAINING WITH TRANSFORMER")
-    print("=" * 60)
-    print(f"Dataset: {len(dataset)} samples, batch size: {config['batch_size']}")
-    print(f"  Train: {len(dataset.train_indices)} samples")
-    print(f"  Val: {len(dataset.val_indices)} samples")
-    print(f"  Test: {len(dataset.test_indices)} samples")
-    print(f"Past hours: {config['past_hours']} ({past_window} minutes)")
-    print(f"Label mode: {config.get('label', 'trend')}")
-    print(f"Future window: {dataset.future_window} minutes")
-    print(f"Step: {config['step']} minute(s)")
-    print(f"Max accum deviation: {config['max_accum_deviation']}")
-    if config.get('label', 'trend') == 'yield':
-        print(
-            f"min_yield_percent: {config.get('min_yield_percent')}, "
-            f"max_hope_future_horizon: {config.get('max_hope_future_horizon')}, "
-            f"yield_target: {config.get('yield_target', getattr(dataset, 'yield_target', 'both'))}"
-        )
-    elif config.get('label') == 'latent':
-        _ld = getattr(
-            dataset, 'latent_distribution', config.get('latent_distribution', 'normal')
-        )
-        print(
-            f"latent_distribution: {_ld}, "
-            f"output_dim (density params): {config.get('output_dim')}, "
-            f"shared model: {config.get('model_type', 'transformer')}"
-        )
-    else:
-        print(
-            f"min_trend_horizon: {config.get('min_trend_horizon')}, "
-            f"max_trend_future_horizon: {config.get('max_trend_future_horizon')}"
-        )
-    print(f"Normalize: {config['normalize']}")
-    print(f"Epochs: {config['epochs']}")
-    if args.extend is not None and args.extend != 0:
-        sign = '+' if args.extend > 0 else ''
-        print(f"  (Will adjust plan by {sign}{args.extend} epochs)")
-    print(f"Minibatches per epoch: {math.ceil(len(dataset.train_indices) / config['batch_size'])}")
-    print(f"Model: Transformer with {config['num_layers']} layers, {config['num_heads']} heads")
-    print(f"Device: {trainer.device}")
-    print(f"Learning rate: {config['learning_rate']}")
-    print(f"Slope loss weight: {config['slope_loss_weight']}")
-    print(f"Intercept loss weight: {config['intercept_loss_weight']}")
-    print(f"Reconstruction loss weight: {config['reconstruction_loss_weight']}")
-    print(f"Save every: {config['save_every_n_minutes']:g} minutes (wall clock)")
-    print(f"Checkpoints: {config['checkpoint_dir']}/")
-    print(f"Validation: {'Enabled' if config['validate'] else 'Disabled'}")
-    if config['validate']:
-        print(f"  Validate every {config['validate_every_n_epochs']} epochs")
-        print(f"  Val batch size: {config['validate_batch_size']}")
-    print("=" * 60)
-    print()
-    
-    # ============================================================
-    # STEP 5: START TRAINING - ALL logic is in trainer
-    # ============================================================
-    trainer.train(
-        num_epochs=config['epochs'],
-        resume=config['resume'],
+        dataset,
+        total_features,
+        num_epochs=float(config['epochs']),
+        resume=config.get('resume', True),
         extend=(args.extend is not None and args.extend != 0),
         extend_epochs=args.extend if args.extend is not None else 0.0,
+        probe_weights=True,
+        show_banner=True,
     )
+
+
 
 
 if __name__ == "__main__":

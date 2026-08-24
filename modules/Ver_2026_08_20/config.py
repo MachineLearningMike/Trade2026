@@ -1,20 +1,40 @@
 # config.py
 # Central configuration for all hyper-parameters
+#
+# Window lengths (1m bars): past_window = TelePred delta1, future_window = delta2.
+# Shared by yield / trend / latent. Legacy names past_hours,
+# max_hope_future_horizon, max_trend_future_horizon, max_latent_future_horizon
+# were removed (clean signature break).
+# Deferred: max_accum_deviation (prefer fitness_threshold);
+#           scattered_hope / linear_regime (legacy label ids in labels.py).
 
 config = {
+
     # ============================================================
     # DATA STORAGE CONFIGURATION
     # ============================================================
     'data_dir': 'dataset_cache',
 
     # ============================================================
-    # DATA CONFIGURATION
+    # DATA / TELEPRED WINDOWS (bars on binance_interval, usually 1m)
     # ============================================================
-    'past_hours': 24,     # 1, 2, 36 (= 1.5 days)
-    # future_window length is NOT set here — see label-mode horizons below:
-    #   trend  → max_trend_future_horizon
-    #   yield → max_hope_future_horizon
-    'step': 1,
+    # delta1: model input length X(t,d)
+    'past_window': 60 * 36,   # 24h of 1m bars (formerly past_hours=24)
+    # delta2: label future length p[t+1 : t+1+future_window]
+    # Shared by yield, trend, and latent (TelePred delta2).
+    'future_window': 50,
+    'step': 3,
+
+    # ============================================================
+    # TELEPRED / ENSEMBLE (see ensemble_plan.txt, telepred.py)
+    # ============================================================
+    # Delay d (bars): model input ends at bot_time - d; label Y(t) unchanged.
+    # telepred_delay: single-element TRAIN / INFER.
+    # telepred_delays: bank for --ensemble / --ensemble-sweep.
+    'telepred_delay': 0,
+    'telepred_delays': [0, 2, 5, 10],
+    # Bump via telepred.DEFINITION_ID when slice math changes.
+    'telepred_definition_id': 'telepred_v1',
     'num_features': 5,
     'num_shapes': 4,
     'total_synthetic_days': 30,
@@ -22,8 +42,8 @@ config = {
     # ============================================================
     # DATA SPLIT CONFIGURATION
     # ============================================================
-    'train_ratio': 0.95,
-    'val_ratio': 0.05,
+    'train_ratio': 0.80,
+    'val_ratio': 0.10,
     # False: train / val / test are consecutive in time (earliest → latest).
     # Training still shuffles the train split each epoch (DataLoader).
     'shuffle_split': False,
@@ -59,8 +79,6 @@ config = {
     # YIELD (distribution of chance and near)
     # ------------------------------------------------------------
     'min_yield_percent': 0.26,   #
-    # Also sets the sample future_window when label=yield
-    'max_hope_future_horizon': 50,
     # Model target from full cache (chance, near):
     #   'both'   → output_dim=2  (chance, near)
     #   'chance' → output_dim=1  (chance,)
@@ -78,20 +96,15 @@ config = {
     # Scale channels use softplus internally (stable + learnable).
     # Aliases: normal_distribution, student_distribution, student_t, ...
     'latent_distribution': 'normal',
-    # Optional future span; None → max_trend_future_horizon.
-    # Must be >= 1 so future[0] exists for the latent observation.
-    'max_latent_future_horizon': None,
+    # Latent uses shared future_window (need >= 1 so future[0] exists).
     'latent_loss_weight': 1.0,
 
     # ------------------------------------------------------------
-    # TREND HORIZONS (label=trend)
+    # TREND (label=trend) — uses shared future_window as max horizon /
+    # joint past+future search cap / model p length
     # ------------------------------------------------------------
     'max_accum_deviation': 0.351,   # legacy alias; prefer fitness_threshold
     'min_trend_horizon': 3,
-    # Max future bars for the linear regime search; also:
-    #   - sample future_window when label=trend
-    #   - max past extent for joint past+future regime + model p vector
-    'max_trend_future_horizon': 50,
     'regime_use_past': True,
     # Dimensionless fitness: sum(|residual|) / history_sigma
     'fitness_threshold': 0.75,
@@ -126,15 +139,15 @@ config = {
     'use_binance_data': True,
     'binance_datatype': 'klines',
     'binance_interval': '1m',
-    # Half-open-ish span in minutes: need end > start. Past window alone is
-    # past_hours * 60 bars (e.g. 36 hours → 2160) plus future_horizon.
+    # Half-open-ish span in minutes: need end > start. Need enough bars for
+    # past_window + future_window (plus telepred_delay if d > 0).
     # Times are UTC wall clock (naive strings). Binance klines are UTC; FSV
     # converts US-local release schedules to UTC before aligning on this grid.
-    'binance_start_date': '2023-12-01 00:00:00',
-    'binance_end_date': '2026-06-01 00:00:00',
+    'binance_start_date': '2023-11-01 00:00:00',    # 2023
+    'binance_end_date': '2026-07-01 00:00:00',
     'binance_symbols': {
         "BTCUSDT": ["Close", "Volume"],
-        # "ETHUSDT": ["Close", "Volume"],
+        "ETHUSDT": ["Close", "Volume"],
     },
     'prediction_target': ("BTCUSDT", "Close"),
     'binance_primary_symbol': "BTCUSDT",
@@ -142,42 +155,44 @@ config = {
     # ============================================================
     # MACRO / FSV CATALOG
     # ============================================================
-    # Series definitions live in fsv_dictionary.FEATURES only.
-    # features_to_include: None → all FEATURES minus exclude; list → whitelist.
-    # features_to_exclude: applied after include.
-    'features_to_include': None,
-    'features_to_exclude': ["ted_spread", "commercial_paper_3m", "fhfa_price"],
+    # Series definitions live in macro_dictionary.FEATURES only.
+    # macros_to_include: None → all FEATURES minus exclude; list → whitelist.
+    # macros_to_exclude: applied after include.
+    'macros_to_include': None,
+    'macros_to_exclude': ["ted_spread", "commercial_paper_3m", "fhfa_price"],   # They have NaN's.
+    # Used by macro_01_downloader (env FRED_API_KEY / TWELVEDATA_API_KEY override).
+    'fred_api_key': 'ef542ded8a399000da02e42d5eb0321f',
+    'twelvedata_api_key': '95b1a91f6be84db89dcdbbdfaf9e041c',
 
     # ============================================================
     # NORMALIZATION CONFIGURATION
     # ============================================================
-    'normalize': True,
-    
-    'force_recompute': False,
+    # Per-sample window z-score of x (and related moments) in TradingDataset.
+    'normalize_window': True,
 
-    'n_latent_macro_features': 30,  # Number of latent macro features to use in the model
+    'n_latent_macros': 30,  # Number of latent macro features to use in the model
 
     # ============================================================
     # MODEL SELECTION
     # ============================================================
-    # 'transformer' → model.MarketTransformerWithHeads
+    # 'regression' → model.MarketTransformerWithHeads
     # 'vae'         → model_vae.MarketVAEWithHeads
     #                 Reconstructs x; mean/std FiLM-condition encoder+decoder;
     #                 shape accepted but unused. Train loss is recon+KL only
     #                 (no yield/chance/near label loss).
-    'model_type': 'transformer',
+    'model_type': 'regression',
     'vae_latent_dim': 64,
     'vae_kl_weight': 0.1,
     
     # ============================================================
     # TRANSFORMER / VAE ENCODER CONFIGURATION
     # ============================================================
-    'patch_size': 5,   # 20
+    'patch_size': 20,   # 20, 10
     'embed_dim': None,  # AUTO-COMPUTED
-    'num_layers': 2,    # 6
-    'num_heads': 4,     # 8
+    'num_layers': 6,    # 6, 2
+    'num_heads': 8,     # 8, 4
     'ff_dim_multiplier': 4,
-    'dropout': 0.1,
+    'dropout': 0.0,
     'causal': False,
     'max_seq_len': None,  # AUTO-COMPUTED
     
@@ -198,7 +213,7 @@ config = {
     # ============================================================
     # TRAINING CONFIGURATION
     # ============================================================
-    'epochs': 12,
+    'epochs': 1,
     'batch_size': 24,
     'learning_rate': 0.000_01, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
     'save_every_n_minutes': 5,

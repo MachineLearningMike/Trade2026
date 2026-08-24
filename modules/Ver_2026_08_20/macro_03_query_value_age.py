@@ -1,5 +1,5 @@
 """
-fsv_03_query_value_age.py
+macro_03_query_value_age.py
 
 Query FSV value intervals for a given datetime.
 
@@ -10,7 +10,7 @@ Returns: (value, decay)
 Interval model (half-open):
     release_datetime <= t < next_release_datetime
 
-The last interval uses a far-future next_release (from fsv_02) so the
+The last interval uses a far-future next_release (from macro_02) so the
 latest observation remains available after its release.
 
 One state structure for all features.
@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 import pytz
 
-from fsv_dictionary import FEATURES, get_features
+from macro_dictionary import FEATURES, get_features
 
 # Configure logging
 logging.basicConfig(
@@ -95,11 +95,11 @@ def file_fingerprint(path: str) -> str:
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(chunk)
-        return h.hexdigest()[:12]
+        return h.hexdigest()[:8]
     except OSError:
         try:
             st = os.stat(path)
-            return hashlib.md5(f"size:{st.st_size}".encode()).hexdigest()[:12]
+            return hashlib.md5(f"size:{st.st_size}".encode()).hexdigest()[:8]
         except OSError:
             return "missing"
 
@@ -111,7 +111,7 @@ def generate_cache_filename(
     is_utc: bool,
     features_to_exclude: Optional[List[str]] = None,
     intervals_fingerprint: str = "",
-    prefix: str = "fsv_value_decay",
+    prefix: str = "macro_value_decay",
 ) -> str:
     """
     Generate a short unique filename by hashing all parameters that affect
@@ -304,7 +304,7 @@ class FSVValueLookup:
 
     def __init__(
         self,
-        csv_file: str = "dataset_cache/fsv_value_intervals.csv",
+        csv_file: str = "dataset_cache/macro_value_intervals.csv",
         features_to_exclude: Optional[List[str]] = None,
         cache_size: int = 10000,
         features_catalog: Optional[Dict[str, Any]] = None,
@@ -410,7 +410,7 @@ class FSVValueLookup:
                 mask, ["release_datetime", "next_release_datetime", "value"]
             ].sort_values("release_datetime")
 
-            # CSV times are feature-local naive (US/Eastern etc from fsv_02).
+            # CSV times are feature-local naive (US/Eastern etc from macro_02).
             # Convert to UTC-naive so the minute grid matches Binance UTC bars.
             tz_str = self._timezone_map.get(feature, "America/New_York")
             release = local_naive_to_utc_naive_series(
@@ -639,7 +639,7 @@ def get_value_age_array(config):
     features_to_include = config.get("features_to_include")
     # Full meta for decay/tz (extras included); include/exclude filter at index time.
     catalog = get_features(config, apply_filters=False)
-    intervals_csv = f"{data_dir}/fsv_value_intervals.csv"
+    intervals_csv = f"{data_dir}/macro_value_intervals.csv"
 
     lookup = FSVValueLookup(
         intervals_csv,

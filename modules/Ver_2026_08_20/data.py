@@ -1,5 +1,7 @@
 # data.py
-# Dataset and DataLoader with per-window normalization and caching
+# Dataset and DataLoader with per-window normalization and caching.
+# Label algorithms / target mapping live in labels.py; this module
+# owns series fetch, windowing, norm/label caches, and loaders.
 
 import sys
 import os
@@ -15,7 +17,6 @@ import time
 import numpy as np
 from tqdm import tqdm
 from typing import List, Tuple, Optional, Dict, Any
-from pathlib import Path
 import pickle
 import hashlib
 import json
@@ -25,135 +26,42 @@ from config import get_config
 from datetime import datetime
 
 from Binance import Binance
-
-# Default label fitness threshold (overridden by config['fitness_threshold']).
-# Kept as a module constant so older call sites / cache docs stay consistent.
-LABEL_FITNESS_THRESHOLD = 0.75
-
-# Label families (config key ``label``).
-LABEL_TREND = 'trend'       # (horizon, slope, intercept) → model slice
-LABEL_YIELD = 'yield'     # (chance, near)
-LABEL_LATENT = 'latent'   # placeholder latent vector (shares model.py)
-VALID_LABEL_MODES = (LABEL_TREND, LABEL_YIELD, LABEL_LATENT)
-
-# Full layout for trend cache / label_tensor.
-LABEL_FULL_DIM_TREND = 3
-LABEL_FULL_DIM_YIELD = 2
-LABEL_FULL_DIM_LATENT = 1
+from labels import (
+    LABEL_FITNESS_THRESHOLD,
+    LABEL_TREND,
+    LABEL_YIELD,
+    LABEL_LATENT,
+    VALID_LABEL_MODES,
+    LABEL_FULL_DIM_TREND,
+    LABEL_FULL_DIM_YIELD,
+    LABEL_FULL_DIM_LATENT,
+    HORIZON_SEARCH_LONGEST_LINEAR,
+    HORIZON_SEARCH_SHORTEST_TO_THRESHOLD,
+    VALID_HORIZON_SEARCH_MODES,
+    Label_Trend,
+    Label_Yield,
+    get_label_class,
+    label_target_slice,
+    label_target_names,
+    resolve_future_window,
+)
+from telepred import (
+    signature_fields as telepred_signature_fields,
+    resolve_delay as telepred_resolve_delay,
+    resolve_past_window,
+    valid_bot_times,
+    windows_for_sample,
+)
 
 # Bump when label *implementation* changes but config params stay the same
 # (e.g. yield chance now on raw prices). Used only inside the pickle — never
 # hashed into generate_dataset_signature / checkpoint keys.
 LABEL_CACHE_ALGO_VERSION = 6  # v6: latent target = future[0] (next bar after history)
 
-# Horizon search rules for find_trend (free OLS, no f[0] anchor).
-HORIZON_SEARCH_LONGEST_LINEAR = 'longest_linear'
-HORIZON_SEARCH_SHORTEST_TO_THRESHOLD = 'shortest_to_threshold'
-VALID_HORIZON_SEARCH_MODES = (
-    HORIZON_SEARCH_LONGEST_LINEAR,
-    HORIZON_SEARCH_SHORTEST_TO_THRESHOLD,
-)
-
-
-def label_target_slice(
-    label_mode: str,
-    output_dim: int,
-    yield_target: str = 'both',
-) -> slice:
-    """
-    Map (label_mode, output_dim[, yield_target]) → slice into stored labels.
-
-    trend (stored as h, m, b):
-      output_dim=3 → [horizon, slope, intercept]
-      output_dim=2 → [slope, intercept]
-    yield (stored as chance, near):
-      yield_target both   → [0:2]
-      yield_target chance → [0:1]
-      yield_target near   → [1:2]
-    """
-    if label_mode == LABEL_YIELD:
-        from labels import Label_Yield
-        return Label_Yield.target_slice(
-            output_dim,
-            yield_target=yield_target,
-        )
-    if label_mode == LABEL_LATENT:
-        from labels import Label_Latent
-        return Label_Latent.target_slice(output_dim)
-    if label_mode == LABEL_TREND:
-        if output_dim == 3:
-            return slice(0, 3)
-        if output_dim == 2:
-            return slice(1, 3)
-        raise ValueError(f"output_dim must be 2 or 3 for trend, got {output_dim}")
-    raise ValueError(
-        f"Unknown label mode {label_mode!r}; expected one of {VALID_LABEL_MODES}"
-    )
-
-
-def label_target_names(
-    label_mode: str,
-    output_dim: int,
-    yield_target: str = 'both',
-    latent_distribution: Optional[str] = None,
-) -> Tuple[str, ...]:
-    if label_mode == LABEL_YIELD:
-        from labels import Label_Yield
-        return Label_Yield.target_names(
-            output_dim,
-            yield_target=yield_target,
-        )
-    if label_mode == LABEL_LATENT:
-        from labels import Label_Latent
-        return Label_Latent.target_names(
-            output_dim,
-            latent_distribution=latent_distribution,
-        )
-    if label_mode == LABEL_TREND:
-        if output_dim == 3:
-            return ('horizon', 'slope', 'intercept')
-        if output_dim == 2:
-            return ('slope', 'intercept')
-        raise ValueError(f"output_dim must be 2 or 3 for trend, got {output_dim}")
-    raise ValueError(
-        f"Unknown label mode {label_mode!r}; expected one of {VALID_LABEL_MODES}"
-    )
-
 
 def _normalize_label_mode(mode: str) -> str:
     """Map legacy label ids to current ones (trend / yield / latent)."""
-    aliases = {
-        'linear_regime': LABEL_TREND,
-        'linear_trend': LABEL_TREND,
-        'scattered_hope': LABEL_YIELD,
-        LABEL_TREND: LABEL_TREND,
-        LABEL_YIELD: LABEL_YIELD,
-        LABEL_LATENT: LABEL_LATENT,
-    }
-    if mode not in aliases:
-        raise ValueError(
-            f"Unknown label mode {mode!r}; expected one of {VALID_LABEL_MODES} "
-            f"(legacy: linear_regime, linear_trend, scattered_hope)"
-        )
-    return aliases[mode]
-
-
-def resolve_future_window(config: dict) -> int:
-    """
-    Sample future_window length from the active label mode's max future horizon.
-
-      trend  → max_trend_future_horizon
-      yield  → max_hope_future_horizon
-      latent → max_latent_future_horizon (else max_trend_future_horizon)
-    """
-    mode = _normalize_label_mode(config.get('label', LABEL_TREND))
-    if mode == LABEL_YIELD:
-        return int(config.get('max_hope_future_horizon', 60))
-    if mode == LABEL_LATENT:
-        from labels import Label_Latent
-        return Label_Latent.resolve_future_window(config)
-    # trend (default)
-    return int(config.get('max_trend_future_horizon', 50))
+    return get_label_class(mode).name
 
 
 # ═══════════════════════════════════════════════════════════
@@ -242,7 +150,7 @@ def resolve_feature_layout(config: dict) -> Dict[str, Any]:
         price_feature_idx = int(config.get('price_feature_idx', 0))
 
     # Macro base names: get_features(config) = core + extras, include/exclude filters
-    from fsv_dictionary import get_features
+    from macro_dictionary import get_features
     macro_catalog = get_features(config, apply_filters=True)
     macro_base_names = list(macro_catalog.keys())
     macro_feature_names_full: List[str] = []
@@ -273,9 +181,8 @@ def generate_dataset_signature(config: dict) -> str:
     layout = resolve_feature_layout(config)
     T = estimate_T_from_config(config)
 
-    past_hours = config.get('past_hours', 36)
+    past_window = resolve_past_window(config)
     future_window = resolve_future_window(config)
-    max_trend_future = int(config.get('max_trend_future_horizon', future_window))
 
     train_ratio = config.get('train_ratio', 0.70)
     val_ratio = config.get('val_ratio', 0.20)
@@ -289,8 +196,8 @@ def generate_dataset_signature(config: dict) -> str:
         'binance_end_date': config.get('binance_end_date'),
         'binance_symbols': config.get('binance_symbols'),
         'total_synthetic_days': config.get('total_synthetic_days'),
-        'features_to_exclude': sorted(config.get('features_to_exclude', [])),
-        'features_to_include': sorted(config.get('features_to_include') or []),
+        'macros_to_exclude': sorted(config.get('macros_to_exclude', [])),
+        'macros_to_include': sorted(config.get('macros_to_include') or []),
         'prediction_target': list(config.get('prediction_target', ('UNKNOWN', 'UNKNOWN'))),
         'price_feature_idx': layout['price_feature_idx'],
         'feature_names': list(layout['feature_names']),
@@ -298,8 +205,8 @@ def generate_dataset_signature(config: dict) -> str:
         'T': T,  # nominal length from config (see estimate_T_from_config)
         'num_shapes': config.get('num_shapes', 4),
 
-        # --- windowing / sampling ---
-        'past_hours': past_hours,
+        # --- windowing / sampling (TelePred delta1 / delta2) ---
+        'past_window': past_window,
         'future_window': future_window,
         'step': config.get('step', 1),
 
@@ -310,20 +217,17 @@ def generate_dataset_signature(config: dict) -> str:
         # TradingDataset._load_or_compute_labels instead.
         'label': _normalize_label_mode(config.get('label', LABEL_TREND)),
         'min_yield_percent': config.get('min_yield_percent', 0.0),
-        'max_hope_future_horizon': config.get('max_hope_future_horizon', 60),
         # Model target selection for yield (chance / near / both) — must
         # distinguish single-dim chance vs near checkpoints/stats.
         'yield_target': config.get('yield_target', 'both'),
         'min_trend_horizon': config.get('min_trend_horizon', 3),
-        'max_trend_future_horizon': max_trend_future,
-        'max_latent_future_horizon': config.get('max_latent_future_horizon'),
         # Density mode forces model head width (2=normal, 3=student).
         'latent_distribution': config.get('latent_distribution', 'normal'),
         'regime_use_past': config.get('regime_use_past', True),
         'fitness_threshold': config.get('fitness_threshold', LABEL_FITNESS_THRESHOLD),
         'horizon_search': config.get('horizon_search', HORIZON_SEARCH_LONGEST_LINEAR),
         'output_dim': config.get('output_dim', 3),
-        'normalize': config.get('normalize', True),
+        'normalize_window': config.get('normalize_window', True),
 
 
         # --- train-split stats ---
@@ -331,21 +235,27 @@ def generate_dataset_signature(config: dict) -> str:
         'val_ratio': val_ratio,
         'shuffle_split': config.get('shuffle_split', False),
     }
+    # TelePred delay / definition (omit d=0 and telepred_v1 for key stability).
+    key_params.update(telepred_signature_fields(config))
 
     param_string = json.dumps(key_params, sort_keys=True, default=str)
-    return hashlib.md5(param_string.encode()).hexdigest()[:12]
+    return hashlib.md5(param_string.encode()).hexdigest()[:8]
 
 
 # ═══════════════════════════════════════════════════════════
 # BINANCE DATA LOADER + KEYED CACHE
 # ═══════════════════════════════════════════════════════════
 
+# Uniform short id length for all pipeline keys (binance / labels / FSV / ckpt).
+CACHE_KEY_HEX_LEN = 8
+
 BINANCE_CACHE_SUBDIR = 'binance'
-BINANCE_FEATURES_FILENAME = 'features.npy'
-BINANCE_META_FILENAME = 'meta.json'
+# Flat keyed files: candles_<8hex>.npy + candles_<8hex>_meta.json
+BINANCE_CANDLES_PREFIX = 'candles_'
 # Bump when the on-disk Binance cache contract changes (meta fields, keying,
 # or payload layout). Included in the folder hash so old folders miss.
-BINANCE_CACHE_VERSION = 2
+# v4: flat candles_<key>.npy (was binance/<key>/candles.npy).
+BINANCE_CACHE_VERSION = 4
 
 
 def _binance_key_params(config: dict) -> dict:
@@ -353,7 +263,7 @@ def _binance_key_params(config: dict) -> dict:
     Config fields that determine the Binance market-series payload.
 
     Order of ``binance_symbols`` entries is preserved (feature layout depends
-    on it). Label / split / model / past_hours hyperparams are omitted.
+    on it). Label / split / model / window hyperparams are omitted.
     """
     symbol_dict = config.get('binance_symbols') or {}
     # List-of-pairs keeps symbol insertion order under sort_keys=True dumps.
@@ -374,19 +284,30 @@ def _binance_key_params(config: dict) -> dict:
 
 
 def generate_binance_data_key(config: dict) -> str:
-    """Hash ``_binance_key_params(config)`` to a short folder name."""
+    """Hash ``_binance_key_params(config)`` to a short id (8-hex)."""
     param_string = json.dumps(
         _binance_key_params(config), sort_keys=True, default=str
     )
-    return hashlib.md5(param_string.encode()).hexdigest()[:16]
+    return hashlib.md5(param_string.encode()).hexdigest()[:CACHE_KEY_HEX_LEN]
 
 
-def binance_cache_dir(config: dict, key: Optional[str] = None) -> Path:
-    """Return ``<data_dir>/binance/<key>/`` for the active config."""
-    data_dir = Path(config.get('data_dir', 'dataset_cache'))
+def binance_cache_root(config: dict) -> Path:
+    """Return ``<data_dir>/binance/`` (flat keyed files live here)."""
+    return Path(config.get('data_dir', 'dataset_cache')) / BINANCE_CACHE_SUBDIR
+
+
+def binance_candles_path(config: dict, key: Optional[str] = None) -> Path:
+    """``<data_dir>/binance/candles_<key>.npy``."""
     if key is None:
         key = generate_binance_data_key(config)
-    return data_dir / BINANCE_CACHE_SUBDIR / key
+    return binance_cache_root(config) / f'{BINANCE_CANDLES_PREFIX}{key}.npy'
+
+
+def binance_meta_path(config: dict, key: Optional[str] = None) -> Path:
+    """``<data_dir>/binance/candles_<key>_meta.json``."""
+    if key is None:
+        key = generate_binance_data_key(config)
+    return binance_cache_root(config) / f'{BINANCE_CANDLES_PREFIX}{key}_meta.json'
 
 
 def _format_binance_key_params(key_params: dict) -> str:
@@ -404,7 +325,8 @@ def _format_binance_key_params(key_params: dict) -> str:
 
 
 def _save_binance_cache(
-    cache_dir: Path,
+    candles_path: Path,
+    meta_path: Path,
     key: str,
     key_params: dict,
     features: List[np.ndarray],
@@ -413,12 +335,8 @@ def _save_binance_cache(
     target_feature_id: int,
     feature_names: List[str],
 ) -> Path:
-    """Persist stacked market features + load metadata under ``cache_dir``.
-
-    ``meta.json`` stores restore fields and the exact ``key_params`` used so
-    loads can reject folders that only match by hash accident / old schema.
-    """
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    """Persist stacked candles + sidecar meta next to ``candles_<key>.npy``."""
+    candles_path.parent.mkdir(parents=True, exist_ok=True)
     features_arr = np.stack(
         [np.asarray(f, dtype=np.float32) for f in features], axis=0
     )
@@ -427,14 +345,14 @@ def _save_binance_cache(
             f"Binance cache features shape {features_arr.shape} incompatible "
             f"with T={T}"
         )
-    features_path = cache_dir / BINANCE_FEATURES_FILENAME
-    meta_path = cache_dir / BINANCE_META_FILENAME
-    tmp_features = features_path.with_suffix('.tmp.npy')
+    tmp_candles = candles_path.with_suffix('.tmp.npy')
     tmp_meta = meta_path.with_suffix('.tmp.json')
 
-    np.save(tmp_features, features_arr)
-    os.replace(tmp_features, features_path)
+    np.save(tmp_candles, features_arr)
+    os.replace(tmp_candles, candles_path)
 
+    # Sidecar meta is required: npy alone lacks target_feature_id, names, and
+    # key_params for config-consistency checks on load.
     meta = {
         'binance_key': key,
         'cache_version': BINANCE_CACHE_VERSION,
@@ -444,24 +362,23 @@ def _save_binance_cache(
         'nForget': int(nForget) if nForget is not None else 0,
         'target_feature_id': int(target_feature_id),
         'feature_names': list(feature_names),
+        'payload': candles_path.name,
         'saved_at': time.time(),
     }
     with open(tmp_meta, 'w', encoding='utf-8') as f:
         json.dump(meta, f, indent=2, default=str)
     os.replace(tmp_meta, meta_path)
-    return cache_dir
+    return candles_path
 
 
-def _load_binance_cache(cache_dir: Path, key: str, key_params: dict):
+def _load_binance_cache(candles_path: Path, meta_path: Path, key: str, key_params: dict):
     """
-    Load cached Binance market data.
+    Load cached Binance market data from flat keyed files.
 
     Returns:
         (features_list, T, nForget, target_feature_id, feature_names) or None
     """
-    features_path = cache_dir / BINANCE_FEATURES_FILENAME
-    meta_path = cache_dir / BINANCE_META_FILENAME
-    if not features_path.exists() or not meta_path.exists():
+    if not meta_path.exists() or not candles_path.exists():
         return None
     try:
         with open(meta_path, 'r', encoding='utf-8') as f:
@@ -472,7 +389,6 @@ def _load_binance_cache(cache_dir: Path, key: str, key_params: dict):
                 f"(meta={meta.get('binance_key')}, expected={key}); ignoring cache."
             )
             return None
-        # Reject pre-v2 folders (no key_params) and any param drift.
         meta_params = meta.get('key_params')
         if not isinstance(meta_params, dict):
             print(
@@ -496,11 +412,11 @@ def _load_binance_cache(cache_dir: Path, key: str, key_params: dict):
                 f"  want: {_format_binance_key_params(key_params)}"
             )
             return None
-        features_arr = np.load(features_path)
+        features_arr = np.load(candles_path)
         if features_arr.ndim != 2:
             print(
-                f"⚠ Binance cache features.npy has shape {features_arr.shape}; "
-                f"expected 2-D (F, T)."
+                f"⚠ Binance cache {candles_path.name} has shape "
+                f"{features_arr.shape}; expected 2-D (F, T)."
             )
             return None
         T_meta = int(meta.get('T', features_arr.shape[1]))
@@ -522,18 +438,21 @@ def _load_binance_cache(cache_dir: Path, key: str, key_params: dict):
             feature_names = [f'feature_{i}' for i in range(features_arr.shape[0])]
         nForget = int(meta.get('nForget', 0))
         target_feature_id = int(meta.get('target_feature_id', 0))
-        features = [features_arr[i].astype(np.float32, copy=False) for i in range(features_arr.shape[0])]
+        features = [
+            features_arr[i].astype(np.float32, copy=False)
+            for i in range(features_arr.shape[0])
+        ]
         return features, T_meta, nForget, target_feature_id, feature_names
     except Exception as e:
-        print(f"⚠ Failed to load Binance cache from {cache_dir}: {e}")
+        print(f"⚠ Failed to load Binance cache {candles_path.name}: {e}")
         return None
 
 
 def get_binance_data(config):
     """Get data from Binance using the configured parameters.
 
-    Looks up ``<data_dir>/binance/<binance_key>/`` first. On a miss (or when
-    ``force_recompute`` is set), fetches from Binance and saves under that key.
+    Looks up ``<data_dir>/binance/candles_<key>.npy`` (+ ``_meta.json``).
+    On a miss, fetches from Binance and saves under those keyed filenames.
 
     Returns:
         features, T, nForget, target_feature_id, feature_names
@@ -541,45 +460,42 @@ def get_binance_data(config):
     """
     key_params = _binance_key_params(config)
     key = generate_binance_data_key(config)
-    cache_dir = binance_cache_dir(config, key)
-    force = bool(config.get('force_recompute', False))
+    candles_path = binance_candles_path(config, key)
+    meta_path = binance_meta_path(config, key)
 
     print(f"🔑 Binance data key: {key}")
-    print(f"📁 Binance cache dir: {cache_dir}")
+    print(f"📁 Binance cache file: {candles_path}")
     print(f"   {_format_binance_key_params(key_params)}")
 
-    if not force:
-        cached = _load_binance_cache(cache_dir, key, key_params)
-        if cached is not None:
-            features, T, nForget, target_feature_id, feature_names = cached
-            print(f"✓ Binance cache hit ({cache_dir.name})")
-            print(f"  Number of features: {len(features)}")
-            print(f"  Time points: {T}")
-            print(f"  Forgotten points: {nForget}")
-            print(f"  Target feature Id: {target_feature_id}")
-            return features, T, nForget, target_feature_id, feature_names
-        print("⚠ Binance cache miss — fetching from source.")
-    else:
-        print("⚠ force_recompute=True — refetching Binance data.")
+    cached = _load_binance_cache(candles_path, meta_path, key, key_params)
+    if cached is not None:
+        features, T, nForget, target_feature_id, feature_names = cached
+        print(f"✓ Binance cache hit ({candles_path.name})")
+        print(f"  Number of features: {len(features)}")
+        print(f"  Time points: {T}")
+        print(f"  Forgotten points: {nForget}")
+        print(f"  Target feature Id: {target_feature_id}")
+        return features, T, nForget, target_feature_id, feature_names
+    print("⚠ Binance cache miss — fetching from source.")
 
     if Binance is None:
         print("⚠ Binance not available.")
         return None, None, None, None, None
-    
+
     try:
         bn = Binance.instantiate(connect=False)
-        
+
         datatype = config['binance_datatype']
         interval = config['binance_interval']
         start_date = config['binance_start_date']
         end_date = config['binance_end_date']
         symbol_dict = config['binance_symbols']
         target = config['prediction_target']
-        
+
         # Config strings are UTC wall times (naive). Binance stamps them UTC.
         start = datetime.strptime(start_date, '%Y-%m-%d %H:%M:%S')
         end = datetime.strptime(end_date, '%Y-%m-%d %H:%M:%S')
-        
+
         print(f"Fetching Binance data:")
         print(f"  Datatype: {datatype}")
         print(f"  Interval: {interval}")
@@ -590,11 +506,11 @@ def get_binance_data(config):
         features, nForget, target_feature_id, feature_names = bn.get_combined_history_3(
             datatype, interval, start, end, symbol_dict, target
         )
-        
+
         T = features[0].shape[0] if len(features) > 0 else 0
         for feature in features:
             assert feature.shape[0] == T, "All features must have the same number of time points."
-        
+
         print(f"\nBinance data loaded:")
         print(f"  Number of features: {len(features)}")
         print(f"  Time points: {T}")
@@ -603,7 +519,8 @@ def get_binance_data(config):
 
         try:
             saved = _save_binance_cache(
-                cache_dir,
+                candles_path,
+                meta_path,
                 key,
                 key_params,
                 features,
@@ -617,7 +534,7 @@ def get_binance_data(config):
             print(f"⚠ Failed to save Binance cache: {e}")
 
         return features, T, nForget, target_feature_id, feature_names
-        
+
     except Exception as e:
         print(f"⚠ Error fetching Binance data: {e}")
         return None, None, None, None, None
@@ -639,229 +556,12 @@ def generate_synthetic_data(T: int, F: int, price_feature_idx: int = 0):
 
 
 # ═══════════════════════════════════════════════════════════
-# HORIZON LABELING FUNCTION - SUPPORTS ALL MODES
+# LABEL FIND WRAPPERS (canonical impl in labels.py)
 # ═══════════════════════════════════════════════════════════
 
-def _ols_fit_segment(
-    y: torch.Tensor,
-    t: Optional[torch.Tensor] = None,
-    eps: float = 1e-8,
-):
-    """
-    Free (unanchored) OLS fit of y on time coordinates t.
-
-    If t is None, uses t = 0..h-1. Prefer t measured relative to the
-    past/future boundary (past negative, future non-negative) so intercept
-    is the level at the decision time t=0.
-
-    Returns:
-        slope, intercept, residual_l1  where residual_l1 = sum(|y - ŷ|)
-        (caller may divide by a scale to make fitness dimensionless).
-    """
-    device = y.device
-    dtype = y.dtype
-    h = y.shape[0]
-    if t is None:
-        t = torch.arange(h, device=device, dtype=dtype)
-    else:
-        t = t.to(device=device, dtype=dtype)
-    t_mean = t.mean()
-    y_mean = y.mean()
-    dt = t - t_mean
-    denom = torch.sum(dt * dt)
-    if denom < eps:
-        slope = torch.zeros((), device=device, dtype=dtype)
-        intercept = y_mean
-    else:
-        slope = torch.sum(dt * (y - y_mean)) / denom
-        intercept = y_mean - slope * t_mean
-    residual_l1 = torch.sum(torch.abs(y - (slope * t + intercept)))
-    return slope, intercept, residual_l1
-
-
-def _regime_segment(history: torch.Tensor, future: torch.Tensor, h_past: int, h_fut: int):
-    """
-    Build (y, t) for a joint past+future window.
-
-    t is relative to the first future bar (t=0):
-      past  → t = -h_past, ..., -1
-      future → t = 0, ..., h_fut-1
-    """
-    device = future.device
-    dtype = future.dtype
-    parts_y = []
-    parts_t = []
-    if h_past > 0:
-        parts_y.append(history[-h_past:].to(device=device, dtype=dtype))
-        parts_t.append(
-            torch.arange(-h_past, 0, device=device, dtype=dtype)
-        )
-    if h_fut > 0:
-        parts_y.append(future[:h_fut].to(device=device, dtype=dtype))
-        parts_t.append(
-            torch.arange(0, h_fut, device=device, dtype=dtype)
-        )
-    y = torch.cat(parts_y, dim=0)
-    t = torch.cat(parts_t, dim=0)
-    return y, t
-
-
-def find_trend(
-    future,
-    history,
-    min_horizon=3,
-    max_horizon=30,
-    fitness_threshold=1.0,
-    mode=HORIZON_SEARCH_LONGEST_LINEAR,
-    max_past_horizon=None,
-    use_past=True,
-):
-    """
-    Free OLS linear-regime search spanning recent past and nearest future.
-
-    Time origin t=0 is the first future bar. The search window is
-        history[-h_past:]  ‖  future[:h_fut]
-    with times t ∈ {-h_past,...,-1, 0,...,h_fut-1}.
-
-    Recent past and nearest future **compete** to grow the regime:
-    at each step try +1 past and/or +1 future; pick the expansion that
-    best preserves linearity (lowest fitness) while respecting the mode.
-
-    Fitness is dimensionless cumulative L1 residual:
-        fitness = sum |y - ŷ| / history_sigma
-    history_sigma = std(history) (clamped).
-
-    Search modes (config key ``horizon_search``):
-        'longest_linear' (default)
-            Grow total span while fitness <= threshold.
-            Label horizon = h_fut at the last admissible window.
-        'shortest_to_threshold'
-            Grow until fitness >= threshold (budget exhausted).
-            Label horizon = h_fut at that window (or max if never reached).
-
-    Args:
-        future : Tensor (future_window,)
-        history : Tensor (history_window,)  — past prices (scale + optional past span)
-        min_horizon, max_horizon : int  — bounds on **future** extent h_fut
-        max_past_horizon : optional max bars of past (default = max_horizon)
-        use_past : if False, future-only search (legacy behavior)
-        fitness_threshold, mode : as above
-
-    Returns:
-        horizon : int   — future extent h_fut of the chosen regime
-        slope, intercept : Tensor (0-d)  — joint OLS on past+future window
-        h_past : int    — recent-past extent included in the joint fit
-    """
-    if mode not in VALID_HORIZON_SEARCH_MODES:
-        raise ValueError(
-            f"Unknown horizon search mode {mode!r}; "
-            f"expected one of {VALID_HORIZON_SEARCH_MODES}"
-        )
-
-    device = future.device
-    dtype = future.dtype
-    eps = 1e-8
-
-    history = history.to(device=device, dtype=dtype)
-    future = future.to(device=device, dtype=dtype)
-
-    max_horizon = min(int(max_horizon), int(future.shape[0]))
-    min_horizon = max(2, int(min_horizon))
-    if min_horizon > max_horizon:
-        min_horizon = max_horizon
-
-    if max_past_horizon is None:
-        max_past_horizon = max_horizon
-    max_past_horizon = min(int(max_past_horizon), int(history.shape[0]))
-    if not use_past:
-        max_past_horizon = 0
-
-    history_sigma = history.std().clamp(min=eps)
-
-    def _eval(h_past: int, h_fut: int):
-        y, t = _regime_segment(history, future, h_past, h_fut)
-        slope, intercept, residual_l1 = _ols_fit_segment(y, t=t, eps=eps)
-        fitness = residual_l1 / history_sigma
-        return slope, intercept, fitness
-
-    # Seed: min_horizon future bars at the boundary (past empty).
-    h_past, h_fut = 0, min_horizon
-    slope, intercept, fitness = _eval(h_past, h_fut)
-    best_h_fut = h_fut
-    best_h_past = h_past
-    best_slope, best_intercept = slope, intercept
-    best_total = h_past + h_fut
-
-    if mode == HORIZON_SEARCH_LONGEST_LINEAR:
-        # Accept seed even if slightly over threshold (fallback).
-        admissible = fitness <= fitness_threshold
-        if admissible:
-            best_h_fut, best_h_past = h_fut, h_past
-            best_slope, best_intercept = slope, intercept
-            best_total = h_past + h_fut
-
-        while True:
-            candidates = []
-            if h_fut < max_horizon:
-                candidates.append((h_past, h_fut + 1))
-            if h_past < max_past_horizon:
-                candidates.append((h_past + 1, h_fut))
-            if not candidates:
-                break
-
-            # Compete: only expansions that stay under threshold;
-            # prefer lower fitness, then larger total span.
-            valid = []
-            for hp, hf in candidates:
-                s, b, fit = _eval(hp, hf)
-                if fit <= fitness_threshold:
-                    valid.append((fit, -(hp + hf), hp, hf, s, b))
-
-            if not valid:
-                # No legal expansion — keep last good (or seed if never good).
-                if not admissible:
-                    best_h_fut, best_h_past = h_fut, h_past
-                    best_slope, best_intercept = slope, intercept
-                break
-
-            valid.sort()  # lowest fitness, then largest total (via -total)
-            fit, neg_tot, hp, hf, s, b = valid[0]
-            h_past, h_fut = hp, hf
-            slope, intercept, fitness = s, b, fit
-            admissible = True
-            total = h_past + h_fut
-            if total >= best_total:
-                best_total = total
-                best_h_fut, best_h_past = h_fut, h_past
-                best_slope, best_intercept = slope, intercept
-
-    else:
-        # shortest_to_threshold: grow until budget exhausted.
-        best_h_past = h_past
-        while fitness < fitness_threshold:
-            candidates = []
-            if h_fut < max_horizon:
-                candidates.append((h_past, h_fut + 1))
-            if h_past < max_past_horizon:
-                candidates.append((h_past + 1, h_fut))
-            if not candidates:
-                break
-
-            # Compete: pick expansion with lower fitness (stay linear longer).
-            scored = []
-            for hp, hf in candidates:
-                s, b, fit = _eval(hp, hf)
-                scored.append((fit, hp, hf, s, b))
-            scored.sort()
-            fit, hp, hf, s, b = scored[0]
-            h_past, h_fut = hp, hf
-            slope, intercept, fitness = s, b, fit
-            best_h_fut, best_h_past = h_fut, h_past
-            best_slope, best_intercept = slope, intercept
-            if fitness >= fitness_threshold:
-                break
-
-    return best_h_fut, best_slope, best_intercept, best_h_past
+def find_trend(*args, **kwargs):
+    """Delegate to Label_Trend.find (single implementation)."""
+    return Label_Trend.find(*args, **kwargs)
 
 
 def find_yield(
@@ -875,8 +575,6 @@ def find_yield(
     Yield label. Cache path should leave yield_target=None so the full
     (chance, near) pair is stored; model uses target_slice.
     """
-    # Local import: labels is free of data.py, so no cycle.
-    from labels import Label_Yield
     return Label_Yield.find(
         future,
         history,
@@ -884,6 +582,7 @@ def find_yield(
         max_hope_future_horizon=max_hope_future_horizon,
         yield_target=yield_target,
     )
+
 
 
 def find_power_regime(
@@ -1124,62 +823,52 @@ class TradingDataset(Dataset):
         n_macro_features: int,
         feature_names: List[str],
         price_feature_idx: int,
-        past_hours: float = 36,
+        past_window: Optional[int] = None,
         future_minutes: Optional[int] = None,
         step: int = 1,
         max_accum_deviation: float = 12.0,
         min_trend_horizon: int = 3,
-        max_trend_future_horizon: Optional[int] = None,
         device: str = 'cpu',
-        normalize: bool = True,
+        normalize_window: bool = True,
         data_dir: Optional[str] = None,
-        force_recompute: bool = False,
-        split_ratios: Optional[Tuple[float, float, float]] = None
+        split_ratios: Optional[Tuple[float, float, float]] = None,
+        runtime_config: Optional[dict] = None,
     ):
-        config = get_config()
+        # Prefer the caller's config (TRAIN / ensemble per-delay) over module defaults.
+        config = dict(runtime_config) if runtime_config is not None else get_config()
         self.feature_names = feature_names
         self.n_market_features = n_market_features
         self.n_macro_features = n_macro_features
-        self.past_hours = past_hours
         self.price_feature_idx = price_feature_idx
         self.step = step
         self.max_accum_deviation = max_accum_deviation
         self.device = device
-        self.normalize = normalize
-        self.force_recompute = force_recompute
+        self.normalize_window = normalize_window
         self.num_shapes = config['num_shapes']
 
         self.label_mode = _normalize_label_mode(config.get('label', LABEL_TREND))
         self.min_yield_percent = float(config.get('min_yield_percent', 0.0))
-        self.max_hope_future_horizon = int(
-            config.get('max_hope_future_horizon', 60)
-        )
 
-        # future_window from label-mode max future horizon
+        # TelePred delta1 / delta2
+        if past_window is None:
+            past_window = resolve_past_window(config)
+        self.past_window = int(past_window)
         if future_minutes is None:
             future_minutes = resolve_future_window(config)
         self.future_minutes = int(future_minutes)
+        self.future_window = self.future_minutes
 
         self.min_trend_horizon = int(
             config.get('min_trend_horizon', min_trend_horizon)
         )
-        mtf = config.get('max_trend_future_horizon', max_trend_future_horizon)
-        if mtf is None:
-            mtf = self.future_minutes
-        self.max_trend_future_horizon = int(mtf)
-        # Past extent for trend joint past+future search only
-        # (config key max_trend_future_horizon; formerly max_past_horizon / max_horizon).
-        self.max_past_horizon = self.max_trend_future_horizon
-        # Length of model conditioning vector p (recent past prices).
-        # Must match MarketTransformerWithHeads.n_max_past_horizon /
-        # labels.resolve_model_past_len(config). For both label modes this is
-        # the same as the mode's future_window (not always max_trend_*).
-        #   trend  → max_trend_future_horizon
-        #   yield → max_hope_future_horizon
-        self.model_past_len = int(self.future_minutes)
-        # Aliases used by older call sites / viz
+        # Trend search / p-vector caps use shared future_window.
+        self.max_past_horizon = self.future_window
+        self.model_past_len = int(self.future_window)
         self.min_horizon = self.min_trend_horizon
-        self.max_horizon = self.max_trend_future_horizon
+        self.max_horizon = self.future_window
+        # Compat aliases for older call sites / viz
+        self.max_trend_future_horizon = self.future_window
+        self.max_hope_future_horizon = self.future_window
 
         self.horizon_search = config.get(
             'horizon_search', HORIZON_SEARCH_LONGEST_LINEAR
@@ -1261,21 +950,28 @@ class TradingDataset(Dataset):
         self.Total = self._stack_features(features)
         self.T, self.F = self.Total.shape
         
-        self.past_window = int(60 * past_hours)
-        self.future_window = self.future_minutes
-        self.total_window = self.past_window + self.future_window
-        
-        if self.max_trend_future_horizon < self.min_trend_horizon:
-            self.max_trend_future_horizon = self.min_trend_horizon
-            self.max_horizon = self.max_trend_future_horizon
-            self.max_past_horizon = self.max_trend_future_horizon
+        self.telepred_delay = telepred_resolve_delay(config)
+        # Contiguous span only when delay=0; with delay, input and future are gapped.
+        self.total_window = (
+            self.past_window + self.telepred_delay + self.future_window
+        )
+
+        if self.future_window < self.min_trend_horizon:
+            self.future_window = self.min_trend_horizon
+            self.future_minutes = self.future_window
+            self.max_horizon = self.future_window
+            self.max_past_horizon = self.future_window
+            self.max_trend_future_horizon = self.future_window
+            self.max_hope_future_horizon = self.future_window
+            self.model_past_len = self.future_window
             print(
-                f"⚠ max_trend_future_horizon adjusted to min_trend_horizon "
+                f"⚠ future_window adjusted up to min_trend_horizon "
                 f"({self.min_trend_horizon})"
             )
-        
-        self.valid_starts = self._get_valid_starts()
-        
+
+        # Bot times t (TelePred); valid_starts = input-window starts (legacy alias).
+        self.valid_t, self.valid_starts = self._get_valid_bot_times_and_starts()
+
         self.cache_key = self._generate_cache_key(config)
         self.cache_file = self.data_dir / f"labels_{self.cache_key}.pkl"
         
@@ -1301,21 +997,21 @@ class TradingDataset(Dataset):
         self._shape_tensor = self.shape_tensor
         self._label_tensor = self.label_tensor
         self._h_past_tensor = self.h_past_tensor
+        self._valid_t = self.valid_t
         self._valid_starts = self.valid_starts
         self._Total = self.Total
         self._F = self.F
         self._past_window = self.past_window
-        self._normalize = self.normalize
+        self._future_window = self.future_window
+        self._telepred_delay = self.telepred_delay
+        self._normalize = self.normalize_window
         
         print(f"\nTradingDataset initialized:")
         print(f"  Features: {self.F}, Time steps: {self.T}")
-        print(f"  Past window: {self.past_window} minutes ({past_hours} hours)")
-        _fw_src = {
-            LABEL_YIELD: 'max_hope_future_horizon',
-            LABEL_LATENT: 'max_latent_future_horizon',
-            LABEL_TREND: 'max_trend_future_horizon',
-        }.get(self.label_mode, 'max_trend_future_horizon')
-        print(f"  Future window: {self.future_window} minutes (from {_fw_src})")
+        print(f"  Past window (delta1): {self.past_window} bars")
+        print(f"  Future window (delta2): {self.future_window} bars")
+        print(f"  TelePred delay d: {self.telepred_delay} "
+              f"(input ends at bot_time - d)")
         print(f"  Model p length (recent past): {self.model_past_len}")
         print(f"  Step: {step}")
         print(f"  Label mode: {self.label_mode}")
@@ -1323,10 +1019,10 @@ class TradingDataset(Dataset):
             print(f"  Horizon search: {self.horizon_search}")
             print(f"  Fitness threshold: {self.fitness_threshold}")
             print(f"  Regime use past: {self.regime_use_past} "
-                  f"(max past/future trend={self.max_trend_future_horizon})")
+                  f"(max past/future={self.future_window})")
             print(
                 f"  Min trend horizon: {self.min_trend_horizon}, "
-                f"Max trend future: {self.max_trend_future_horizon}"
+                f"Max trend future: {self.future_window}"
             )
         elif self.label_mode == LABEL_LATENT:
             print(
@@ -1337,7 +1033,6 @@ class TradingDataset(Dataset):
             print(f"  label cache dim (observation): {LABEL_FULL_DIM_LATENT}")
         else:
             print(f"  min_yield_percent: {self.min_yield_percent}")
-            print(f"  max_hope_future_horizon: {self.max_hope_future_horizon}")
             print(f"  yield_target: {self.yield_target}")
         _ldist = getattr(self, 'latent_distribution', None)
         _onames = label_target_names(
@@ -1351,7 +1046,7 @@ class TradingDataset(Dataset):
         if self.horizon_mode == 'weighted':
             print(f"  Weight type: {self.weight_type}, Decay: {self.weight_decay}")
         print(f"  Max accum deviation (legacy): {max_accum_deviation}")
-        print(f"  Normalize: {normalize}")
+        print(f"  Normalize window: {self.normalize_window}")
         print(f"  Total samples: {len(self)}")
         print(f"  Cache: {'Loaded' if self.cache_file.exists() else 'Computed'}")
         print(f"  Split ratios - Train: {self.split_ratios[0]:.2f}, "
@@ -1389,17 +1084,29 @@ class TradingDataset(Dataset):
         stacked = np.stack(features, axis=1)
         return torch.from_numpy(stacked).float()
     
-    def _get_valid_starts(self) -> List[int]:
-        max_start = self.T - self.total_window
-        if max_start < 0:
+    def _get_valid_bot_times_and_starts(self) -> Tuple[List[int], List[int]]:
+        """TelePred bot times t and corresponding model-input window starts."""
+        try:
+            times = valid_bot_times(
+                self.T,
+                self.past_window,
+                self.future_window,
+                delay=self.telepred_delay,
+                step=self.step,
+            )
+        except ValueError as e:
             raise ValueError(
                 f"Time series length {self.T} is too short for "
-                f"past {self.past_window} + future {self.future_window} = {self.total_window} minutes"
-            )
-        starts = list(range(0, max_start + 1, self.step))
-        if not starts:
-            raise ValueError(f"No valid starts with step {self.step}")
-        return starts
+                f"past={self.past_window}, delay={self.telepred_delay}, "
+                f"future={self.future_window} ({e})"
+            ) from e
+        starts = [
+            windows_for_sample(
+                t, self.telepred_delay, self.past_window, self.future_window
+            )["input"].start
+            for t in times
+        ]
+        return times, starts
     
     def _generate_cache_key(self, config) -> str:
         """
@@ -1444,37 +1151,36 @@ class TradingDataset(Dataset):
         h_past_list: List[float] = []
         
         for idx in tqdm(range(len(self)), desc="Computing labels and norm params"):
-            # It traverses all samples.
+            # TelePred: x delayed by d; Y(t) anchored at bot time t.
+            t = self.valid_t[idx]
+            win = windows_for_sample(
+                t, self.telepred_delay, self.past_window, self.future_window
+            )
+            x = self.Total[win["input"], :]
 
-            start = self.valid_starts[idx]
-            x = self.Total[start:start + self.past_window, :]
-            
-            if self.normalize:
+            if self.normalize_window:
                 _, mean, std, shape = self._normalize_window(x, compute_moments=True)
                 mean_list.append(mean)
                 std_list.append(std)
                 shape_list.append(shape)
             else:
-                # x_normalized = x
                 mean = torch.zeros(self.F)
                 std = torch.ones(self.F)
-                # Must match normalize_window: shape is (num_shapes, F)
                 shape = torch.zeros(self.num_shapes, self.F)
                 mean_list.append(mean)
                 std_list.append(std)
                 shape_list.append(shape)
 
-            y_start = start + self.past_window
-            y_end = y_start + self.future_window
-            future_prices = self.Total[y_start:y_end, self.price_feature_idx]
+            future_prices = self.Total[win["future"], self.price_feature_idx]
+            # Label history ends at p[t] (not at t-d). Yield uses history[-1] only.
             history_prices = self.Total[
-                start:start + self.past_window, self.price_feature_idx
+                win["label_history"], self.price_feature_idx
             ]
 
             if self.label_mode == LABEL_TREND:
                 # Trend labels: free OLS fitness needs a dimensionless price scale,
                 # so use the same window z-score as the model input.
-                if self.normalize:
+                if self.normalize_window:
                     price_mean = mean[self.price_feature_idx]
                     price_std = std[self.price_feature_idx]
                     if float(price_std) == 0.0:
@@ -1489,11 +1195,10 @@ class TradingDataset(Dataset):
                     future_for_label,
                     history_for_label,
                     min_horizon=self.min_trend_horizon,
-                    max_horizon=self.max_trend_future_horizon,
+                    max_horizon=self.future_window,
                     fitness_threshold=self.fitness_threshold,
                     mode=self.horizon_search,
-                    # Past max uses the same config as max_trend_future_horizon
-                    max_past_horizon=self.max_trend_future_horizon,
+                    max_past_horizon=self.future_window,
                     use_past=self.regime_use_past,
                 )
                 # Full cache vector; model may slice to (m,b) when output_dim=2.
@@ -1509,7 +1214,7 @@ class TradingDataset(Dataset):
                     future_prices,
                     history_prices,
                     min_yield_percent=self.min_yield_percent,
-                    max_hope_future_horizon=self.max_hope_future_horizon,
+                    max_hope_future_horizon=self.future_window,
                     # full cache always (chance, near); model uses yield_target slice
                 )
                 if len(result) == 1:
@@ -1524,7 +1229,7 @@ class TradingDataset(Dataset):
                 # observation scale-free across regimes; find() returns
                 # future[0] in that space.
                 from labels import Label_Latent
-                if self.normalize:
+                if self.normalize_window:
                     price_mean = mean[self.price_feature_idx]
                     price_std = std[self.price_feature_idx]
                     if float(price_std) == 0.0:
@@ -1593,7 +1298,7 @@ class TradingDataset(Dataset):
         )
     
     def _load_or_compute_labels(self):
-        if not self.force_recompute and self.cache_file.exists():
+        if self.cache_file.exists():
             print(f"Loading cached labels from: {self.cache_file}")
             try:
                 with open(self.cache_file, 'rb') as f:
@@ -1662,13 +1367,12 @@ class TradingDataset(Dataset):
                 'step': self.step,
                 'max_accum_deviation': self.max_accum_deviation,
                 'min_trend_horizon': self.min_trend_horizon,
-                'max_trend_future_horizon': self.max_trend_future_horizon,
-                'max_hope_future_horizon': self.max_hope_future_horizon,
+
                 'fitness_threshold': self.fitness_threshold,
                 'horizon_search': self.horizon_search,
                 'label': self.label_mode,
                 'min_yield_percent': self.min_yield_percent,
-                'normalize': self.normalize,
+                'normalize_window': self.normalize_window,
                 'price_feature_idx': self.price_feature_idx,
                 'cache_key': self.cache_key,
                 'label_algo_version': LABEL_CACHE_ALGO_VERSION,
@@ -1725,12 +1429,12 @@ class TradingDataset(Dataset):
             interactive=interactive,
             h_past_tensor=self.h_past_tensor,
             min_horizon=self.min_trend_horizon,
-            max_horizon=self.max_trend_future_horizon,
-            max_past_horizon=self.max_trend_future_horizon,
+            max_horizon=self.future_window,
+            max_past_horizon=self.future_window,
             fitness_threshold=self.fitness_threshold,
             horizon_search=self.horizon_search,
             regime_use_past=self.regime_use_past,
-            normalize_prices=self.normalize,
+            normalize_prices=self.normalize_window,
         )
 
     def visualize_feature(self, fid, feature, feature_name, time_interval_minutes=1):
@@ -1814,9 +1518,11 @@ class TradingDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Optimized __getitem__ with cached references and view() instead of unsqueeze()."""
-        
-        start = self._valid_starts[idx]
-        x = self._Total[start:start + self._past_window, :]     # assuming self._Total: (T, F)
+        t = self._valid_t[idx]
+        win = windows_for_sample(
+            t, self._telepred_delay, self._past_window, self._future_window
+        )
+        x = self._Total[win["input"], :]
         
         if self._normalize:
             mean = self._mean_tensor[idx]       # (F,)

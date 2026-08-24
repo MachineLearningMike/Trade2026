@@ -1,5 +1,5 @@
 """
-fsv_client_fred.py
+macro_client_fred.py
 
 Generic FRED API client.
 

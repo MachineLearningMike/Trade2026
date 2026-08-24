@@ -289,7 +289,7 @@ class MarketTransformerWithHeads(nn.Module):
         in_features: int,
         n_market_features: int,
         n_macro_features: int,
-        n_latent_macro_features: int,
+        n_latent_macros: int,
         n_max_past_horizon: int,
         patch_size: int,
         num_layers: int,
@@ -311,7 +311,7 @@ class MarketTransformerWithHeads(nn.Module):
         self.in_features = in_features
         self.n_market_features = n_market_features
         self.n_macro_features = n_macro_features
-        self.n_latent_macro_features = n_latent_macro_features
+        self.n_latent_macros = n_latent_macros
         self.causal = causal
         self.max_seq_len = max_seq_len
         self.use_reconstruction = use_reconstruction
@@ -323,7 +323,7 @@ class MarketTransformerWithHeads(nn.Module):
         self.n_stat_tokens = 1 + 1 + num_shapes
 
         F = n_market_features + n_macro_features
-        L = n_latent_macro_features
+        L = n_latent_macros
         self.F = F
 
         # ---- compress raw macro time series ----
@@ -619,10 +619,11 @@ if __name__ == "__main__":
     config = get_config()
     device = config['device']
 
-    past_window = int(60 * config['past_hours'])
+    from telepred import resolve_past_window
+    past_window = int(resolve_past_window(config))
     n_market = 4
     n_macro = 10
-    n_latent = config['n_latent_macro_features']
+    n_latent = config['n_latent_macros']
     F = n_market + n_macro
     num_shapes = config['num_shapes']
     max_seq_len = past_window // config['patch_size']
@@ -630,7 +631,7 @@ if __name__ == "__main__":
 
     print(f"Creating model with:")
     print(f"  in_features: {F} (market={n_market}, macro={n_macro})")
-    print(f"  n_latent_macro_features: {n_latent}")
+    print(f"  n_latent_macros: {n_latent}")
     print(f"  patch_size: {config['patch_size']}")
     print(f"  embed_dim: {embed_dim}")
     print(f"  max_seq_len: {max_seq_len}")
@@ -643,7 +644,7 @@ if __name__ == "__main__":
         in_features=F,
         n_market_features=n_market,
         n_macro_features=n_macro,
-        n_latent_macro_features=n_latent,
+        n_latent_macros=n_latent,
         n_max_past_horizon=n_max_past,
         patch_size=config['patch_size'],
         num_layers=config['num_layers'],

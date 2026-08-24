@@ -1,0 +1,6 @@
+# Macro raw download report
+# failed  = download error this run (or still absent after a prior fail)
+# missing = listed in macro_dictionary.FEATURES but not a column in macro_raw.csv
+# Updated 2026-08-24T20:11:03.024002Z
+# Count: 0
+# Format: feature_name<TAB>last_error_or_status

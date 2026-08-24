@@ -130,7 +130,7 @@ class Label_Trend:
 
     @classmethod
     def resolve_future_window(cls, config: dict) -> int:
-        return int(config.get('max_trend_future_horizon', 50))
+        return int(config.get('future_window', 50))
 
     @classmethod
     def resolve_model_past_len(cls, config: dict) -> int:
@@ -394,7 +394,7 @@ class Label_Yield:
 
     @classmethod
     def resolve_future_window(cls, config: dict) -> int:
-        return int(config.get('max_hope_future_horizon', 60))
+        return int(config.get('future_window', 50))
 
     @classmethod
     def resolve_model_past_len(cls, config: dict) -> int:
@@ -860,9 +860,7 @@ class Label_Latent:
     @classmethod
     def resolve_future_window(cls, config: dict) -> int:
         # Need at least 1 future bar so find() can return future[0].
-        if config.get('max_latent_future_horizon') is not None:
-            return max(1, int(config['max_latent_future_horizon']))
-        return max(1, int(config.get('max_trend_future_horizon', 50)))
+        return max(1, int(config.get('future_window', 50)))
 
     @classmethod
     def resolve_model_past_len(cls, config: dict) -> int:
@@ -1097,6 +1095,27 @@ def resolve_future_window(config: dict) -> int:
 def resolve_model_past_len(config: dict) -> int:
     mode = config.get('label', LABEL_TREND)
     return get_label_class(mode).resolve_model_past_len(config)
+
+
+def sync_output_dim(config: dict) -> int:
+    """
+    Force ``config['output_dim']`` from the active label family where required.
+
+    - yield   → from ``yield_target`` (always)
+    - latent  → from ``latent_distribution`` (always)
+    - trend   → leave ``config['output_dim']`` unchanged (2 or 3)
+
+    Returns the resulting ``output_dim``. Used so CLI modes and training
+    share one checkpoint-key / head-width path.
+    """
+    cls = get_label_class(config.get('label', LABEL_TREND))
+    if cls is Label_Yield:
+        config['output_dim'] = Label_Yield.resolve_output_dim(
+            yield_target=resolve_yield_target(config),
+        )
+    elif cls is Label_Latent:
+        config['output_dim'] = Label_Latent.resolve_output_dim(config)
+    return int(config.get('output_dim', LABEL_FULL_DIM_TREND))
 
 
 # Backward-compatible free functions (delegate to classes)
