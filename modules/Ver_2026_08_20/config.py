@@ -8,11 +8,41 @@
 # Deferred: max_accum_deviation (prefer fitness_threshold);
 #           scattered_hope / linear_regime (legacy label ids in labels.py).
 
+import os
+from pathlib import Path
+
+
+def project_root_dir() -> Path:
+    """Repo root ``Trade2026`` (this file lives in ``modules/Ver_…``)."""
+    return Path(__file__).resolve().parents[2]
+
+
+def resolve_data_dir(data_dir=None) -> str:
+    """
+    Absolute dataset cache directory.
+
+    Priority:
+      1. env MACRO_DATA_DIR (or legacy FSV_DATA_DIR)
+      2. absolute ``data_dir`` as given
+      3. relative ``data_dir`` → ``<project_root>/<data_dir>``
+         (default ``dataset_cache`` on the project root)
+    """
+    env = os.environ.get("MACRO_DATA_DIR") or os.environ.get("FSV_DATA_DIR")
+    if env:
+        return str(Path(env).expanduser().resolve())
+    raw = "dataset_cache" if data_dir is None else str(data_dir)
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = project_root_dir() / path
+    return str(path.resolve())
+
+
 config = {
 
     # ============================================================
     # DATA STORAGE CONFIGURATION
     # ============================================================
+    # Relative paths resolve to <project_root>/… (not the process cwd).
     'data_dir': 'dataset_cache',
 
     # ============================================================
@@ -247,14 +277,24 @@ config = {
 }
 
 
+# Pin data_dir to an absolute project-root path at import time so callers that
+# read ``config`` or ``get_config()`` never depend on process cwd.
+config['data_dir'] = resolve_data_dir(config.get('data_dir', 'dataset_cache'))
+
+
 def get_config():
-    """Return a copy of the config dictionary."""
-    return config.copy()
+    """Return a copy of the config dictionary (data_dir already absolute)."""
+    cfg = config.copy()
+    # Re-resolve in case env MACRO_DATA_DIR changed after import / update_config.
+    cfg['data_dir'] = resolve_data_dir(cfg.get('data_dir', 'dataset_cache'))
+    return cfg
 
 
 def update_config(new_config):
     """Update config with new values."""
     config.update(new_config)
+    if 'data_dir' in new_config:
+        config['data_dir'] = resolve_data_dir(config.get('data_dir', 'dataset_cache'))
 
 
 def print_config():

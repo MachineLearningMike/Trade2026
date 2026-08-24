@@ -472,16 +472,23 @@ class Label_Yield:
     def find(
         cls,
         future,
-        history,
+        current,
         min_yield_percent: float,
         max_hope_future_horizon: Optional[int] = None,
         yield_target: Optional[str] = None,
     ):
         """
-        Thresholded yield events vs the last raw price history[-1].
+        Thresholded yield events vs the known bot-time price ``current`` (= p[t]).
 
-        Single-series only (not batched). Inputs may be torch / numpy / list;
-        they are converted once to host float64, then computed in numpy
+        TelePred / ensemble_plan signature:
+            Y(t) = label( p[t+1 : t+1+delta2], p[t] )
+                 = find(future, current, ...)
+
+        ``future`` is the raw price path of length delta2; ``current`` is the
+        scalar anchor p[t] (not a history window).
+
+        Single-series only (not batched). Inputs may be torch / numpy / list /
+        scalar; they are converted once to host float64, then computed in numpy
         (no per-bar tensor casts or GPU syncs).
 
         Always computes both chance and near. Return shape:
@@ -491,7 +498,13 @@ class Label_Yield:
         Prefer always caching (chance, near) and slicing via target_slice.
         """
         fut = cls._as_1d_float64(future)
-        hist = cls._as_1d_float64(history)
+        # Accept scalar or length-1 array/tensor for p[t].
+        cur = cls._as_1d_float64(current)
+        if cur.size == 0:
+            current_px = float("nan")
+        else:
+            # Scalar / length-1 → that value; longer series → last bar (legacy).
+            current_px = float(cur[-1])
 
         n = int(fut.shape[0])
         if max_hope_future_horizon is not None:
@@ -499,18 +512,17 @@ class Label_Yield:
 
         chance, near = 0.0, 0.0
 
-        if n > 0 and hist.size > 0:
-            current = float(hist[-1])
+        if n > 0 and np.isfinite(current_px):
             eps = 1e-8
-            if abs(current) > eps:
-                denom = current
+            if abs(current_px) > eps:
+                denom = current_px
             else:
-                denom = current + eps if current >= 0.0 else current - eps
+                denom = current_px + eps if current_px >= 0.0 else current_px - eps
 
             # Note softplus is intuitively active over (-4, +infinity). It's almost linear over 4.0.
             # softplus(-4, 0, 4) = (0.0181, 0.6931, 4.0181)
             # Scale surplus yield so mild negatives land in the softplus ramp.
-            _yield = (fut[:n] - current) / denom * 100.0
+            _yield = (fut[:n] - current_px) / denom * 100.0
             # (-gentle, 0) yield maps to (-4, 0), inside the active softplus region.
             gentle = 0.3    # How gently to ignore negative yield.
             scaled_yield = _yield * 4.0 / gentle
@@ -1124,8 +1136,9 @@ def find_trend(*args, **kwargs):
     return Label_Trend.find(*args, **kwargs)
 
 
-def find_yield(*args, **kwargs):
-    return Label_Yield.find(*args, **kwargs)
+def find_yield(future, current, *args, **kwargs):
+    """Y(t) = label(p[t+1:t+1+delta2], p[t]) → find(future, current, ...)."""
+    return Label_Yield.find(future, current, *args, **kwargs)
 
 
 def find_latent(*args, **kwargs):

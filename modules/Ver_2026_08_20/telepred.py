@@ -137,9 +137,10 @@ def future_slice(t: int, delta2: int) -> slice:
 
 def label_history_slice(t: int, delta1: int) -> slice:
     """
-    History for label construction ending at p[t].
-    Default: p[t+1-delta1 : t+1] (same length as undelayed past).
-    Yield only needs history[-1] == p[t].
+    History window ending at p[t] for label families that need a past path
+    (trend / latent). Default: p[t+1-delta1 : t+1].
+
+    Yield uses the scalar anchor p[t] directly — see Label_Yield.find(future, current).
     """
     return slice(t + 1 - delta1, t + 1)
 

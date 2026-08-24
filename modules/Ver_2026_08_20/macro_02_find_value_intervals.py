@@ -1,11 +1,11 @@
 """
-macro_02_find_value_intervals.py
+fsv_02_find_value_intervals.py
 
 Financial State Vector Availability Engine.
 
 Input:
     macro_raw.csv
-    macro_dictionary.py
+    fsv_dictionary.py
 
 Output:
     macro_value_intervals.csv
@@ -21,7 +21,7 @@ so it remains valid after its release.
 
 Release timing:
     1. Prefer ALFRED first-publication column ``{feature}__first_release``
-       when present (from macro_01 when use_vintage_data=True).
+       when present (from fsv_01 when use_vintage_data=True).
     2. Else heuristic: observation date + release_lag_days + release_time,
        with business-day adjustment only for non-continuous markets.
 
@@ -328,7 +328,7 @@ if __name__ == "__main__":
     # Config-free artifact: path may come from env, but catalog is core FEATURES
     # only (no include/exclude, no macro_features_extra). TRAIN selects features
     # later when building the minute grid (fsv_03).
-    data_dir = os.environ.get("MACRO_DATA_DIR") or os.environ.get("FSV_DATA_DIR", "dataset_cache")
+    data_dir = os.environ.get("FSV_DATA_DIR", "dataset_cache")
 
     RAW_FILE = f"{data_dir}/macro_raw.csv"
     OUTPUT_FILE = f"{data_dir}/macro_value_intervals.csv"

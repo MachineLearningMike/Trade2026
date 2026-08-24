@@ -1,5 +1,5 @@
 """
-macro_03_query_value_age.py
+fsv_03_query_value_age.py
 
 Query FSV value intervals for a given datetime.
 
@@ -10,7 +10,7 @@ Returns: (value, decay)
 Interval model (half-open):
     release_datetime <= t < next_release_datetime
 
-The last interval uses a far-future next_release (from macro_02) so the
+The last interval uses a far-future next_release (from fsv_02) so the
 latest observation remains available after its release.
 
 One state structure for all features.
@@ -109,7 +109,7 @@ def generate_cache_filename(
     query_datetime_from: Union[str, datetime, pd.Timestamp],
     query_datetime_to: Union[str, datetime, pd.Timestamp],
     is_utc: bool,
-    features_to_exclude: Optional[List[str]] = None,
+    macros_to_exclude: Optional[List[str]] = None,
     intervals_fingerprint: str = "",
     prefix: str = "macro_value_decay",
 ) -> str:
@@ -128,7 +128,7 @@ def generate_cache_filename(
         dt_to_str = str(query_datetime_to)
 
     features_str = ",".join(features)  # preserve order (order matters for array layout)
-    excl = ",".join(sorted(features_to_exclude or []))
+    excl = ",".join(sorted(macros_to_exclude or []))
     # clock=UTC: release intervals are converted feature-local → UTC at index
     # build time so the minute grid matches Binance UTC bars.
     param_str = (
@@ -305,10 +305,10 @@ class FSVValueLookup:
     def __init__(
         self,
         csv_file: str = "dataset_cache/macro_value_intervals.csv",
-        features_to_exclude: Optional[List[str]] = None,
+        macros_to_exclude: Optional[List[str]] = None,
         cache_size: int = 10000,
         features_catalog: Optional[Dict[str, Any]] = None,
-        features_to_include: Optional[List[str]] = None,
+        macros_to_include: Optional[List[str]] = None,
     ):
         logger.info(f"Loading FSV value intervals from {csv_file}...")
         logger.info(f"  Cache size: {cache_size}")
@@ -343,15 +343,15 @@ class FSVValueLookup:
             ["feature", "release_datetime"]
         ).reset_index(drop=True)
 
-        if features_to_exclude is None:
-            features_to_exclude = []
-        self.features_to_exclude = list(features_to_exclude)
-        self.features_to_include = (
-            list(features_to_include) if features_to_include else None
+        if macros_to_exclude is None:
+            macros_to_exclude = []
+        self.macros_to_exclude = list(macros_to_exclude)
+        self.macros_to_include = (
+            list(macros_to_include) if macros_to_include else None
         )
 
         self._timezone_map = self._build_timezone_map()
-        self._index = self._build_interval_index(self.features_to_exclude)
+        self._index = self._build_interval_index(self.macros_to_exclude)
 
         # Stable order: catalog order, then any leftover CSV-only names
         self.features = self._stable_feature_order(list(self._index.keys()))
@@ -362,21 +362,21 @@ class FSVValueLookup:
         logger.info(
             f"Loaded {len(self.df):,} records for {len(self._index)} features"
         )
-        logger.info(f"Features to exclude: {len(self.features_to_exclude)}")
-        if self.features_to_exclude:
-            logger.info(f"  Excluded: {self.features_to_exclude}")
-        if self.features_to_include is not None:
-            logger.info(f"Features whitelist: {self.features_to_include}")
+        logger.info(f"Features to exclude: {len(self.macros_to_exclude)}")
+        if self.macros_to_exclude:
+            logger.info(f"  Excluded: {self.macros_to_exclude}")
+        if self.macros_to_include is not None:
+            logger.info(f"Features whitelist: {self.macros_to_include}")
 
     def _stable_feature_order(self, available: List[str]) -> List[str]:
         avail = set(available)
         catalog_names = list(self.features_catalog.keys())
         ordered = [f for f in catalog_names if f in avail]
-        if self.features_to_include is not None:
-            include = set(self.features_to_include)
+        if self.macros_to_include is not None:
+            include = set(self.macros_to_include)
             ordered = [f for f in ordered if f in include]
         # CSV-only names not in catalog: keep only if no whitelist, sorted
-        if self.features_to_include is None:
+        if self.macros_to_include is None:
             extras = sorted(f for f in available if f not in set(catalog_names))
             ordered = ordered + extras
         return ordered
@@ -389,12 +389,12 @@ class FSVValueLookup:
         return timezone_map
 
     def _build_interval_index(
-        self, features_to_exclude: List[str]
+        self, macros_to_exclude: List[str]
     ) -> Dict[str, Dict[str, np.ndarray]]:
-        exclude_set = set(features_to_exclude)
+        exclude_set = set(macros_to_exclude)
         include_set = (
-            set(self.features_to_include)
-            if self.features_to_include is not None
+            set(self.macros_to_include)
+            if self.macros_to_include is not None
             else None
         )
         index: Dict[str, Dict[str, np.ndarray]] = {}
@@ -410,7 +410,7 @@ class FSVValueLookup:
                 mask, ["release_datetime", "next_release_datetime", "value"]
             ].sort_values("release_datetime")
 
-            # CSV times are feature-local naive (US/Eastern etc from macro_02).
+            # CSV times are feature-local naive (US/Eastern etc from fsv_02).
             # Convert to UTC-naive so the minute grid matches Binance UTC bars.
             tz_str = self._timezone_map.get(feature, "America/New_York")
             release = local_naive_to_utc_naive_series(
@@ -599,7 +599,7 @@ class FSVValueLookup:
         return self.features
 
     def get_excluded_features(self) -> list:
-        return self.features_to_exclude
+        return self.macros_to_exclude
 
     def get_date_range(self) -> tuple:
         return (
@@ -635,16 +635,16 @@ def get_value_age_array(config):
     data_dir = config.get("data_dir", "dataset_cache")
     os.makedirs(data_dir, exist_ok=True)
 
-    features_to_exclude = config.get("features_to_exclude", [])
-    features_to_include = config.get("features_to_include")
+    macros_to_exclude = config.get("macros_to_exclude", [])
+    macros_to_include = config.get("macros_to_include")
     # Full meta for decay/tz (extras included); include/exclude filter at index time.
     catalog = get_features(config, apply_filters=False)
     intervals_csv = f"{data_dir}/macro_value_intervals.csv"
 
     lookup = FSVValueLookup(
         intervals_csv,
-        features_to_exclude=features_to_exclude,
-        features_to_include=features_to_include,
+        macros_to_exclude=macros_to_exclude,
+        macros_to_include=macros_to_include,
         features_catalog=catalog,
         cache_size=10000,
     )
@@ -670,7 +670,7 @@ def get_value_age_array(config):
         query_datetime_from=dt_from,
         query_datetime_to=dt_to,
         is_utc=is_utc,
-        features_to_exclude=features_to_exclude,
+        macros_to_exclude=macros_to_exclude,
         intervals_fingerprint=lookup.intervals_fingerprint,
     )
     cache_path = os.path.join(data_dir, cache_filename)
@@ -692,10 +692,25 @@ def get_value_age_array(config):
 
         metadata_path = cache_path.replace(".npy", "_meta.json")
         if os.path.exists(metadata_path):
-            with open(metadata_path, "r") as f:
-                metadata = json.load(f)
+            try:
+                with open(metadata_path, "r", encoding="utf-8-sig") as f:
+                    metadata = json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"⚠ Cache metadata unreadable ({e}) — recomputing...")
+                try:
+                    os.remove(cache_path)
+                except OSError:
+                    pass
+                try:
+                    os.remove(metadata_path)
+                except OSError:
+                    pass
+                arr = np.array([], dtype=np.float32)
+                metadata = None
             # Validate cache identity
-            if metadata.get("intervals_fingerprint") != lookup.intervals_fingerprint:
+            if metadata is None:
+                pass
+            elif metadata.get("intervals_fingerprint") != lookup.intervals_fingerprint:
                 print(
                     "⚠ Cache intervals fingerprint mismatch — recomputing..."
                 )
@@ -769,12 +784,12 @@ def get_value_age_array(config):
                 "is_utc": is_utc,
                 "intervals_clock": "UTC",
                 "shape": list(arr.shape),
-                "features_to_exclude": lookup.get_excluded_features(),
+                "macros_to_exclude": lookup.get_excluded_features(),
                 "intervals_fingerprint": lookup.intervals_fingerprint,
                 "intervals_csv": intervals_csv,
             }
             metadata_path = cache_path.replace(".npy", "_meta.json")
-            with open(metadata_path, "w") as f:
+            with open(metadata_path, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(metadata, f, indent=2)
             print(f"Saved metadata to: {metadata_path}")
 

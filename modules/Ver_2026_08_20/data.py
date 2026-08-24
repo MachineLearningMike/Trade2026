@@ -150,7 +150,7 @@ def resolve_feature_layout(config: dict) -> Dict[str, Any]:
         price_feature_idx = int(config.get('price_feature_idx', 0))
 
     # Macro base names: get_features(config) = core + extras, include/exclude filters
-    from modules.Ver_2026_08_20.macro_dictionary import get_features
+    from macro_dictionary import get_features
     macro_catalog = get_features(config, apply_filters=True)
     macro_base_names = list(macro_catalog.keys())
     macro_feature_names_full: List[str] = []
@@ -566,18 +566,19 @@ def find_trend(*args, **kwargs):
 
 def find_yield(
     future,
-    history,
+    current,
     min_yield_percent: float,
     max_hope_future_horizon: Optional[int] = None,
     yield_target: Optional[str] = None,
 ):
     """
-    Yield label. Cache path should leave yield_target=None so the full
-    (chance, near) pair is stored; model uses target_slice.
+    Yield label: find(p[t+1:t+1+delta2], p[t]).
+    Cache path should leave yield_target=None so the full (chance, near)
+    pair is stored; model uses target_slice.
     """
     return Label_Yield.find(
         future,
-        history,
+        current,
         min_yield_percent=min_yield_percent,
         max_hope_future_horizon=max_hope_future_horizon,
         yield_target=yield_target,
@@ -1172,10 +1173,12 @@ class TradingDataset(Dataset):
                 shape_list.append(shape)
 
             future_prices = self.Total[win["future"], self.price_feature_idx]
-            # Label history ends at p[t] (not at t-d). Yield uses history[-1] only.
+            # Label history ends at p[t] (not at t-d). Trend/latent use the window;
+            # yield uses only the scalar anchor p[t].
             history_prices = self.Total[
                 win["label_history"], self.price_feature_idx
             ]
+            current_price = self.Total[int(win["bot_time"]), self.price_feature_idx]
 
             if self.label_mode == LABEL_TREND:
                 # Trend labels: free OLS fitness needs a dimensionless price scale,
@@ -1208,11 +1211,11 @@ class TradingDataset(Dataset):
                 )
                 h_past_list.append(float(best_h_past))
             elif self.label_mode == LABEL_YIELD:
-                # Yield labels: percent return vs last raw price. MUST use raw
-                # prices — window z-score makes history[-1]≈0 and blows up chance.
+                # Y(t)=label(p[t+1:t+1+delta2], p[t]). MUST use raw prices —
+                # window z-score makes p[t]≈0 and blows up chance.
                 result = find_yield(
                     future_prices,
-                    history_prices,
+                    current_price,
                     min_yield_percent=self.min_yield_percent,
                     max_hope_future_horizon=self.future_window,
                     # full cache always (chance, near); model uses yield_target slice

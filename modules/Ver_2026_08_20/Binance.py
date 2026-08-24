@@ -57,13 +57,6 @@ def intervalToMilliseconds(interval):
 def get_timeslot(dataType):
     return 0 if dataType == 'klines' else None
 
-def from_dt_local_to_dt_utc(dt_local):
-    now_timestamp = tm.time()
-    offset = datetime.fromtimestamp(now_timestamp) - datetime.utcfromtimestamp(now_timestamp)
-    dt_utc = dt_local - offset
-    dt_utc = dt_utc.replace(tzinfo=pytz.utc)
-    return dt_utc
-
 def get_current_month_start(dt_any):
     return datetime(dt_any.year, dt_any.month, 1).replace(hour=0, minute=0, second=0, microsecond=0).replace(tzinfo=pytz.utc)
 

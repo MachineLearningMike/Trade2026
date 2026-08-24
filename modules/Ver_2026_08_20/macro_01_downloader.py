@@ -8,7 +8,7 @@ Currently supports:
     - TwelveData
 
 The downloader itself knows nothing about individual features.
-Everything is driven by fsv_dictionary.py.
+Everything is driven by macro_dictionary.py.
 
 For FRED series with use_vintage_data=True, also downloads ALFRED
 first-publication dates as ``{feature}__first_release`` columns so
@@ -20,9 +20,9 @@ from datetime import datetime
 
 import pandas as pd
 
-from modules.Ver_2026_08_20.macro_dictionary import FEATURES, get_features
-from modules.Ver_2026_08_20.macro_client_fred import FREDClient
-from modules.Ver_2026_08_20.macro_client_twelvedata import TwelveDataClient
+from macro_dictionary import FEATURES, get_features
+from macro_client_fred import FREDClient
+from macro_client_twelvedata import TwelveDataClient
 
 
 class FSVDownloader:
@@ -110,7 +110,7 @@ class FSVDownloader:
         """
         Download catalog features and outer-merge on ``date``.
 
-        If ``existing_df`` is provided (e.g. current ``fsv_raw.csv``) and
+        If ``existing_df`` is provided (e.g. current ``macro_raw.csv``) and
         ``skip_existing`` is True (default), features whose value column is
         already present are not re-fetched from the API.
         """
@@ -146,7 +146,7 @@ class FSVDownloader:
         for feature, meta in catalog.items():
             if skip_existing and self._feature_already_present(feature, existing_cols):
                 skipped_existing.append(feature)
-                print(f"  ↷ skip {feature} (already in fsv_raw)")
+                print(f"  ↷ skip {feature} (already in macro_raw)")
                 continue
             try:
                 df = self.download_feature(
@@ -197,7 +197,7 @@ class FSVDownloader:
         if len(dfs) == 0:
             # Nothing new — return existing as-is
             merged = existing.sort_values("date").reset_index(drop=True)
-            print("\nNo new downloads; keeping existing fsv_raw columns:")
+            print("\nNo new downloads; keeping existing macro_raw columns:")
             print(merged.columns.tolist())
             return merged
 
@@ -232,18 +232,16 @@ class FSVDownloader:
 ########################################################################
 
 def _resolve_data_dir(config=None):
-    """Same resolution as fsv_02: env FSV_DATA_DIR, then config data_dir."""
-    env = os.environ.get("FSV_DATA_DIR")
-    if env:
-        return env
-    if config is not None:
-        return config.get("data_dir", "dataset_cache")
-    return "dataset_cache"
+    """Absolute cache dir: env MACRO_DATA_DIR / FSV_DATA_DIR, else project-root data_dir."""
+    from config import resolve_data_dir
+    if config is not None and config.get("data_dir") is not None:
+        return resolve_data_dir(config.get("data_dir"))
+    return resolve_data_dir(None)
 
 
-def _load_fsv_raw_report(path: str) -> dict:
+def _load_macro_raw_report(path: str) -> dict:
     """
-    Load prior failed/missing map from ``fsv_raw_report.txt``.
+    Load prior failed/missing map from ``macro_raw_report.txt``.
 
     Lines are ``name<TAB>status_or_error`` (``#`` comments / blanks ignored).
     """
@@ -268,7 +266,7 @@ def _load_fsv_raw_report(path: str) -> dict:
     return out
 
 
-def _update_fsv_raw_report(
+def _update_macro_raw_report(
     report_path: str,
     dictionary_names,
     present_columns,
@@ -276,12 +274,12 @@ def _update_fsv_raw_report(
     this_run_downloaded=None,
 ):
     """
-    Maintain ``fsv_raw_report.txt``.
+    Maintain ``macro_raw_report.txt``.
 
     Entries are features that either:
       - **failed** to download this run (error text kept), or
-      - are **missing**: listed in ``fsv_dictionary.FEATURES`` but not present
-        as a column in ``fsv_raw.csv``.
+      - are **missing**: listed in ``macro_dictionary.FEATURES`` but not present
+        as a column in ``macro_raw.csv``.
 
     Features that appear in the CSV (or succeeded this run) are removed.
     """
@@ -291,7 +289,7 @@ def _update_fsv_raw_report(
     csv_columns = set(present_columns or [])
     # Treat a successful fetch this run as present even before the CSV rewrite.
     available = csv_columns | set(this_run_downloaded or [])
-    prior = _load_fsv_raw_report(report_path)
+    prior = _load_macro_raw_report(report_path)
 
     maintained = {}
 
@@ -321,8 +319,8 @@ def _update_fsv_raw_report(
         f.write("# FSV raw download report\n")
         f.write("# failed  = download error this run (or still absent after a prior fail)\n")
         f.write(
-            "# missing = listed in fsv_dictionary.FEATURES but not a column "
-            "in fsv_raw.csv\n"
+            "# missing = listed in macro_dictionary.FEATURES but not a column "
+            "in macro_raw.csv\n"
         )
         f.write(f"# Updated {datetime.utcnow().isoformat()}Z\n")
         f.write(f"# Count: {len(names_sorted)}\n")
@@ -332,7 +330,7 @@ def _update_fsv_raw_report(
 
     if names_sorted:
         print(
-            f"\nWARNING: fsv_raw_report.txt: "
+            f"\nWARNING: macro_raw_report.txt: "
             f"{len(names_sorted)} failed/missing feature(s)"
         )
         print(f"   -> {report_path}")
@@ -340,7 +338,7 @@ def _update_fsv_raw_report(
             print(f"  - {name}: {maintained[name]}")
     else:
         print(
-            f"\nOK: fsv_raw_report.txt: no failed/missing features "
+            f"\nOK: macro_raw_report.txt: no failed/missing features "
             f"-> {report_path}"
         )
 
@@ -392,8 +390,8 @@ if __name__ == "__main__":
 
     data_dir = _resolve_data_dir(config)
     os.makedirs(data_dir, exist_ok=True)
-    raw_path = f"{data_dir}/fsv_raw.csv"
-    report_path = f"{data_dir}/fsv_raw_report.txt"
+    raw_path = f"{data_dir}/macro_raw.csv"
+    report_path = f"{data_dir}/macro_raw_report.txt"
 
     existing = None
     if os.path.exists(raw_path):
@@ -414,7 +412,7 @@ if __name__ == "__main__":
         present_cols = set(fsv.columns) if fsv is not None else (
             set(existing.columns) if existing is not None else set()
         )
-        _update_fsv_raw_report(
+        _update_macro_raw_report(
             report_path=report_path,
             dictionary_names=list(FEATURES.keys()),
             present_columns=present_cols,
@@ -432,7 +430,7 @@ if __name__ == "__main__":
     print(f"Saved → {raw_path}")
 
     # Re-write after save so present columns match the on-disk CSV exactly.
-    _update_fsv_raw_report(
+    _update_macro_raw_report(
         report_path=report_path,
         dictionary_names=list(FEATURES.keys()),
         present_columns=set(fsv.columns),
