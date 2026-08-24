@@ -165,7 +165,7 @@ config = {
     #                 Reconstructs x; mean/std FiLM-condition encoder+decoder;
     #                 shape accepted but unused. Train loss is recon+KL only
     #                 (no yield/chance/near label loss).
-    'model_type': 'vae',
+    'model_type': 'transformer',
     'vae_latent_dim': 64,
     'vae_kl_weight': 0.1,
     

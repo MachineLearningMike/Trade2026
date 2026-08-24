@@ -1,5 +1,6 @@
 # vae_sweep.py
-# Sequential VAE hyperparameter scout: patch_size × num_layers, CSV logging.
+# Sequential hyperparameter scout: patch_size × num_layers, CSV logging.
+# Works for config model_type in {'transformer', 'vae'}.
 
 from __future__ import annotations
 
@@ -51,8 +52,10 @@ def project_root_dir() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def sweep_csv_path(run_name: str = 'vae_sweep') -> Path:
-    return project_root_dir() / '_save' / run_name / 'results.csv'
+def sweep_csv_path(model_type: str = 'vae') -> Path:
+    """CSV under ``_save/<model_type>_sweep/results.csv``."""
+    mt = str(model_type or 'transformer').lower().strip() or 'transformer'
+    return project_root_dir() / '_save' / f'{mt}_sweep' / 'results.csv'
 
 
 def _append_csv_row(csv_path: Path, row: Dict[str, Any]) -> None:
@@ -77,35 +80,43 @@ def _trial_grid(
     return [(int(p), int(L)) for p in patch_sizes for L in num_layers_list]
 
 
-def run_vae_hparam_sweep(
+def run_hparam_sweep(
     config: dict,
     dataset,
     total_features,
     *,
+    model_type: Optional[str] = None,
     patch_sizes: Sequence[int] = DEFAULT_PATCH_SIZES,
     num_layers_list: Sequence[int] = DEFAULT_NUM_LAYERS,
     epochs_per_trial: int = 1,
     extend_epochs: float = 1.0,
     csv_path: Optional[Path] = None,
-    run_name: str = 'vae_sweep',
 ) -> Path:
     """
-    Train / extend one VAE trial per (patch_size, num_layers); append CSV rows.
+    Train / extend one trial per (patch_size, num_layers) for ``model_type``.
 
     Dataset is shared across trials. Each architecture keeps its own checkpoint
-    key. With ``extend_epochs>0`` and existing finished trials, training
-    continues (e.g. +1 epoch) and a **new** row is appended to the same CSV.
+    key (hash includes model_type). With ``extend_epochs>0`` and existing
+    finished trials, training continues and a **new** CSV row is appended.
     """
     from data import ThreadedDataLoader
     from labels import resolve_model_past_len
 
     cfg = dict(config)
-    cfg['model_type'] = 'vae'
-    # Resume so finished 1-epoch trials can take --sweep-extend.
+    mt = str(
+        model_type
+        if model_type is not None
+        else cfg.get('model_type', 'transformer')
+    ).lower().strip()
+    if mt not in ('transformer', 'vae'):
+        raise ValueError(
+            f"model_type must be 'transformer' or 'vae', got {mt!r}"
+        )
+    cfg['model_type'] = mt
     cfg['resume'] = True
 
     if csv_path is None:
-        csv_path = sweep_csv_path(run_name)
+        csv_path = sweep_csv_path(mt)
 
     past_window = int(60 * cfg['past_hours'])
     F = (
@@ -125,17 +136,27 @@ def run_vae_hparam_sweep(
 
     grid = _trial_grid(patch_sizes, num_layers_list)
     print("\n" + "=" * 60)
-    print("VAE HYPERPARAMETER SWEEP")
+    print(f"{mt.upper()} HYPERPARAMETER SWEEP")
     print("=" * 60)
+    print(f"  model_type: {mt}")
     print(f"  Grid: patch_size={list(patch_sizes)} × num_layers={list(num_layers_list)}")
     print(f"  Trials: {len(grid)} (invalid embed_dim%%num_heads skipped)")
     print(f"  Base epochs / trial: {epochs_per_trial}")
     print(f"  Extend epochs:       {extend_epochs:g} (resume existing keys)")
     print(f"  CSV: {csv_path}")
     print(f"  Device: {cfg.get('device')}")
+    if mt == 'vae':
+        print(
+            f"  Loss: {cfg.get('reconstruction_loss_weight', 1.0):g}·MSE + "
+            f"{cfg.get('vae_kl_weight', 0.1):g}·KL (no yield label)"
+        )
+    else:
+        print(
+            f"  Loss: supervised label={cfg.get('label', 'trend')} "
+            f"(yield_target={cfg.get('yield_target', 'both')})"
+        )
     print("=" * 60 + "\n")
 
-    # Avoid interactive history popups between trials.
     _orig_show = ResumableTrainer._show_history_if_available
     ResumableTrainer._show_history_if_available = lambda self: False
 
@@ -148,15 +169,21 @@ def run_vae_hparam_sweep(
                 'trial_id': trial_id,
                 'timestamp': ts,
                 'status': 'ok',
-                'model_type': 'vae',
+                'model_type': mt,
                 'patch_size': patch_size,
                 'num_layers': num_layers,
                 'num_heads': n_heads,
                 'ff_dim_multiplier': cfg.get('ff_dim_multiplier'),
-                'vae_latent_dim': cfg.get('vae_latent_dim', 64),
+                'vae_latent_dim': (
+                    cfg.get('vae_latent_dim', 64) if mt == 'vae' else ''
+                ),
                 'n_latent_macro_features': n_latent,
-                'reconstruction_loss_weight': cfg.get('reconstruction_loss_weight', 1.0),
-                'vae_kl_weight': cfg.get('vae_kl_weight', 0.1),
+                'reconstruction_loss_weight': (
+                    cfg.get('reconstruction_loss_weight', 1.0) if mt == 'vae' else ''
+                ),
+                'vae_kl_weight': (
+                    cfg.get('vae_kl_weight', 0.1) if mt == 'vae' else ''
+                ),
                 'epochs_planned': epochs_per_trial,
                 'epochs_ran': 0,
                 'best_train_loss': '',
@@ -194,7 +221,7 @@ def run_vae_hparam_sweep(
             row['checkpoint_key'] = ckpt_key
 
             print(
-                f"\n▶ Trial {trial_id}/{len(grid)}: "
+                f"\n▶ Trial {trial_id}/{len(grid)} [{mt}]: "
                 f"patch_size={patch_size} num_layers={num_layers} "
                 f"embed_dim={embed_dim} max_seq_len={trial_cfg['max_seq_len']}"
             )
@@ -209,7 +236,11 @@ def run_vae_hparam_sweep(
                     n_max_past_horizon=_model_past_len,
                     max_seq_len=trial_cfg['max_seq_len'],
                 )
-                device = torch.device(trial_cfg['device']) if trial_cfg.get('device') else torch.device('cpu')
+                device = (
+                    torch.device(trial_cfg['device'])
+                    if trial_cfg.get('device')
+                    else torch.device('cpu')
+                )
                 model = model.to(device)
 
                 base_loss = bind_label_loss(
@@ -236,7 +267,9 @@ def run_vae_hparam_sweep(
                     batch_size=trial_cfg['validate_batch_size'],
                     shuffle=False,
                 )
-                optimizer = optim.Adam(model.parameters(), lr=trial_cfg['learning_rate'])
+                optimizer = optim.Adam(
+                    model.parameters(), lr=trial_cfg['learning_rate']
+                )
                 trainer = ResumableTrainer(
                     dataset_signature=dataset.cache_key,
                     model=model,
@@ -256,8 +289,6 @@ def run_vae_hparam_sweep(
                     ),
                 )
 
-                # If this architecture already has weights, resume and add
-                # extend_epochs (default +1). Fresh trials use base plan only.
                 key_dir = Path(trial_cfg['checkpoint_dir']) / ckpt_key
                 has_prior = key_dir.exists() and any(key_dir.glob('*.pt'))
                 do_extend = has_prior and abs(extend_epochs) > 1e-15
@@ -315,10 +346,41 @@ def run_vae_hparam_sweep(
 
     print("\n" + "=" * 60)
     print("SWEEP COMPLETE")
+    print(f"  model_type: {mt}")
     print(f"  Results: {csv_path}")
     _print_csv_leaderboard(csv_path)
     print("=" * 60)
     return csv_path
+
+
+def run_vae_hparam_sweep(
+    config: dict,
+    dataset,
+    total_features,
+    *,
+    patch_sizes: Sequence[int] = DEFAULT_PATCH_SIZES,
+    num_layers_list: Sequence[int] = DEFAULT_NUM_LAYERS,
+    epochs_per_trial: int = 1,
+    extend_epochs: float = 1.0,
+    csv_path: Optional[Path] = None,
+    run_name: str = 'vae_sweep',
+) -> Path:
+    """Backward-compatible alias: force model_type=vae. """
+    if csv_path is None and run_name == 'vae_sweep':
+        csv_path = None  # run_hparam_sweep picks vae_sweep path
+    elif csv_path is None:
+        csv_path = project_root_dir() / '_save' / run_name / 'results.csv'
+    return run_hparam_sweep(
+        config,
+        dataset,
+        total_features,
+        model_type='vae',
+        patch_sizes=patch_sizes,
+        num_layers_list=num_layers_list,
+        epochs_per_trial=epochs_per_trial,
+        extend_epochs=extend_epochs,
+        csv_path=csv_path,
+    )
 
 
 def _print_csv_leaderboard(csv_path: Path, top_k: int = 5) -> None:
@@ -342,7 +404,8 @@ def _print_csv_leaderboard(csv_path: Path, top_k: int = 5) -> None:
         return
     for i, r in enumerate(rows[:top_k], 1):
         print(
-            f"    {i}. patch={r['patch_size']} layers={r['num_layers']}  "
+            f"    {i}. [{r.get('model_type', '?')}] "
+            f"patch={r['patch_size']} layers={r['num_layers']}  "
             f"val={r['best_val_loss']}  train={r['final_train_loss']}  "
             f"key={r['checkpoint_key']}"
         )

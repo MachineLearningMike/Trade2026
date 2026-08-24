@@ -293,17 +293,22 @@ def main(config):
         help='Yield (transformer) checkpoint folder name for --vae-compare.',
     )
     parser.add_argument(
-        '--vae-sweep', action='store_true', default=False,
+        '--sweep', action='store_true', default=False,
         help=(
-            'Run a VAE hyperparameter scout over patch_size × num_layers '
-            '(default 5/10/20 × 2/4/6), append scores to '
-            '<project_root>/_save/vae_sweep/results.csv. Forces model_type=vae. '
+            'Hyperparameter scout over patch_size × num_layers '
+            '(default 5/10/20 × 2/4/6) for the designated model_type '
+            '(config or --model-type). Appends to '
+            '<project_root>/_save/<model_type>_sweep/results.csv. '
             'Resumes existing trial keys; use --sweep-extend to add epochs.'
         ),
     )
     parser.add_argument(
+        '--vae-sweep', action='store_true', default=False,
+        help='Alias for --sweep --model-type vae.',
+    )
+    parser.add_argument(
         '--sweep-epochs', type=int, default=1, metavar='N',
-        help='Base epoch plan per trial for --vae-sweep (default 1).',
+        help='Base epoch plan per trial for --sweep (default 1).',
     )
     parser.add_argument(
         '--sweep-extend', type=float, default=1.0, metavar='N',
@@ -1321,20 +1326,24 @@ def main(config):
     dataset, total_features = get_dataset(config)
 
     # ============================================================
-    # STEP 4b: VAE hyperparameter sweep (optional)
+    # STEP 4b: Hyperparameter sweep (optional)
     # ============================================================
-    if getattr(args, 'vae_sweep', False):
-        from vae_sweep import run_vae_hparam_sweep
+    if getattr(args, 'sweep', False) or getattr(args, 'vae_sweep', False):
+        from vae_sweep import run_hparam_sweep
 
-        config['model_type'] = 'vae'
-        csv_path = run_vae_hparam_sweep(
+        if getattr(args, 'vae_sweep', False):
+            config['model_type'] = 'vae'
+        # else: keep config / --model-type designation
+        mt = str(config.get('model_type', 'transformer')).lower()
+        csv_path = run_hparam_sweep(
             config,
             dataset,
             total_features,
+            model_type=mt,
             epochs_per_trial=max(1, int(getattr(args, 'sweep_epochs', 1))),
             extend_epochs=float(getattr(args, 'sweep_extend', 1.0)),
         )
-        print(f"\n✅ VAE sweep completed → {csv_path}")
+        print(f"\n✅ {mt} sweep completed → {csv_path}")
         return
 
     past_window = int(60 * config['past_hours'])
