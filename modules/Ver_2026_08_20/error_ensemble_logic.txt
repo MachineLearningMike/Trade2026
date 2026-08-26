@@ -1,0 +1,141 @@
+================================================================================
+ErrorEnsemble logic (canonical)
+Saved: 2026-08-26
+Source: user confirmation of residual / denorm chain for Yield (chance, near)
+================================================================================
+
+0. Label space
+--------------
+y comes from Yield (chance, near), already normalized with the dataset label
+affine (y_mean, y_std):
+
+  y = (y_raw - y_mean) / y_std
+
+All model inputs (x, mean, std, shape) are the usual normalized window tensors.
+
+
+1. Stage training (normalized residual chain in y-space)
+--------------------------------------------------------
+Notation:
+
+  mean_i, std_i for stage i = 0, 1, 2, ...
+      Empirical mean and std of residual e_i over the training set
+      (saved in that stage's error_stage_norm.json).
+      Used only for the (i -> i+1) residual link:
+        - to build model_{i+1}'s training target:  norm_i(e_i)
+        - to map model_{i+1}'s output back to e_i's space: denorm_i(y_{i+1})
+
+  denorm_i(z)
+      Undo residual-normalization for residual e_i:
+          denorm_i(z) := z * std_i + mean_i
+      Domain:  z is in the space where model_{i+1} predicts (norm_i-space).
+      Codomain: same space as e_i (y-normalized residual space).
+      Example:
+          denorm_1(y_2) = y_2 * std_1 + mean_1
+          which is the estimate of e_1 used in
+          e_2 = e_1 - denorm_1(y_2).
+
+  norm_i(z)
+      Apply residual-normalization for residual e_i:
+          norm_i(z) := (z - mean_i) / std_i
+      Inverse of denorm_i.
+
+  denormalize_y(z)   (different from denorm_i)
+      Undo the Yield label affine (chance, near):
+          denormalize_y(z) := z * y_std + y_mean
+      Used once at the end on y_hat_norm (or on en_k), never as denorm_i.
+
+model_0:
+  inputs:  normalized x, mean, std, shape
+  output:  y_0   toward y
+  residual:
+    e_0 = y - y_0                         # still in y-normalized space
+
+model_1:
+  inputs:  normalized x, mean, std, shape
+  target:  norm_0(e_0)                    # e_0 re-normalized with mean_0/std_0
+  output:  y_1   toward norm_0(e_0)
+  contribution back to y-space:
+    e0_hat = denorm_0(y_1)                # ≈ e_0
+  residual:
+    e_1 = e_0 - e0_hat                    # = e_0 - denorm_0(y_1)
+                                          # (must subtract the denormalized y_1)
+
+model_2:
+  target:  norm_1(e_1)
+  output:  y_2
+  e1_hat = denorm_1(y_2)
+  e_2 = e_1 - e1_hat                      # = e_1 - denorm_1(y_2)
+
+model_3:
+  target:  norm_2(e_2)
+  output:  y_3
+  e2_hat = denorm_2(y_3)
+  e_3 = e_2 - e2_hat                      # = e_2 - denorm_2(y_3)
+
+In general:
+  e_0 = y - y_0
+  e_i = e_{i-1} - denorm_{i-1}(y_i)       # i >= 1
+  model_i (i >= 1) fits norm_{i-1}(e_{i-1})
+
+
+2. Ensemble prediction
+----------------------
+Sum contributions in **y-normalized** space, then denormalize once with y's
+affine:
+
+  y_hat_norm =
+      y_0
+    + denorm_0(y_1)                       # ≈ e_0
+    + denorm_1(y_2)                       # ≈ e_1
+    + denorm_2(y_3)                       # ≈ e_2
+    + ...
+
+  y_hat_raw = y_hat_norm * y_std + y_mean
+
+Equivalently (same meaning as above):
+
+  y_hat_norm = y_0 + e0_hat + e1_hat + e2_hat + ...
+  y_hat_raw  = denormalize_y(y_hat_norm)
+
+
+3. Clarifications / common typos
+--------------------------------
+- Write e_i = e_{i-1} - denorm_{i-1}(y_i), not e_{i-1} - y_i.
+  y_i lives in the re-normalized residual space; only after denorm_{i-1}
+  does it live in the same space as e_{i-1}.
+
+- Indexing of mean_i/std_i: they are the stats of e_i, and they denormalize
+  model_{i+1}'s output (not model_i's).
+
+- Do **not** label-denormalize each stage and then add those raw pieces if the
+  additive structure is defined in y-normalized space. Because
+  denorm_y(a+b) != denorm_y(a) + denorm_y(b) when mean_y != 0
+  (the mean would be counted more than once). Denormalize with (y_mean, y_std)
+  **once** on the summed y_hat_norm.
+
+- Nested ensembles for the report:
+    en_0 = denormalize_y( y_0 )
+    en_1 = denormalize_y( y_0 + denorm_0(y_1) )
+    en_k = denormalize_y( y_0 + sum_{i=1..k} denorm_{i-1}(y_i) )
+
+- Report / eval summing is **wholesale** over dataset D:
+      en_k = model_0(D) + model_1(D) + ... + model_k(D)
+    For each i: load model_i only → full pass over D → add contribution →
+    free model_i → load model_{i+1}.
+    Do not keep several models resident, and do not sum inside one shared
+    per-batch loop as model_0(batch)+model_1(batch)+....
+
+
+4. Status vs code
+-----------------
+This file is the agreed product logic.
+
+Implementation in error_ensemble.py must follow this document. If training /
+report summing currently accumulates fully label-denormalized stage outputs in
+raw space instead of summing in y-norm then denorm_y once, align the code to
+sections 1–3 above.
+
+================================================================================
+END OF error_ensemble_logic.txt
+================================================================================

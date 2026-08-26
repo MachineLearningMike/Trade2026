@@ -604,128 +604,270 @@ def _load_stage_weights(
     return model
 
 
+def _iter_loader_batches(loader, max_batches: Optional[int] = None):
+    """Yield batches from ThreadedDataLoader or a plain iterable."""
+    n_batches = 0
+    if hasattr(loader, 'start_epoch') and hasattr(loader, 'get_next_batch'):
+        loader.start_epoch(0)
+        while True:
+            if max_batches is not None and n_batches >= int(max_batches):
+                break
+            batch, _wait, _load = loader.get_next_batch()
+            if batch is None:
+                break
+            yield batch
+            n_batches += 1
+        return
+    for batch in loader:
+        if max_batches is not None and n_batches >= int(max_batches):
+            break
+        yield batch
+        n_batches += 1
+
+
+def _release_model(model: Optional[nn.Module]) -> None:
+    """Drop a stage module and free CUDA cache when possible."""
+    if model is None:
+        return
+    try:
+        model.to('cpu')
+    except Exception:
+        pass
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def load_one_error_stage(
+    config: dict,
+    dataset,
+    *,
+    stage: int,
+    key: Optional[str] = None,
+    device: Optional[torch.device] = None,
+) -> Tuple[nn.Module, str, Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Load a **single** ErrorEnsemble stage (weights + target affine).
+
+    Returns ``(model, checkpoint_key, (target_mean, target_std))``.
+    Caller must release the model when finished (see ``_release_model``).
+    """
+    from config import project_root_dir
+    from labels import resolve_model_past_len, sync_output_dim
+    from model_vae import build_market_model, resolve_max_seq_len
+    from telepred import resolve_past_window
+    from INFER import find_checkpoint_by_key
+
+    cfg = dict(config)
+    sync_output_dim(cfg)
+    if device is None:
+        device = torch.device(cfg['device'] if cfg.get('device') else 'cpu')
+    else:
+        device = torch.device(device)
+
+    if key is None:
+        key = stage_checkpoint_key(cfg, dataset.cache_key, int(stage))
+
+    ckpt_root = Path(cfg.get('checkpoint_dir', 'trading_checkpoints'))
+    if not ckpt_root.is_absolute():
+        ckpt_root = project_root_dir() / ckpt_root
+    key_dir = ckpt_root / key
+    if not key_dir.exists():
+        raise FileNotFoundError(f"stage {stage}: missing checkpoint dir {key_dir}")
+
+    found = find_checkpoint_by_key(str(ckpt_root), key=key)
+    if found is None:
+        raise FileNotFoundError(f"stage {stage}: no weights under key {key}")
+    path, _ = found
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+
+    past_window = int(resolve_past_window(cfg))
+    F = int(getattr(dataset, 'F', dataset.n_market_features + dataset.n_macro_features))
+    n_features_after_latent = dataset.n_market_features + cfg['n_latent_macros']
+    cfg['embed_dim'] = n_features_after_latent * cfg['patch_size']
+    cfg['max_seq_len'] = int(ckpt.get('max_seq_len') or resolve_max_seq_len(cfg, past_window))
+    cfg['output_dim'] = int(getattr(dataset, 'output_dim', cfg.get('output_dim', 2)))
+    model_past_len = int(
+        getattr(dataset, 'model_past_len', resolve_model_past_len(cfg))
+    )
+
+    model = build_market_model(
+        cfg,
+        in_features=F,
+        n_market_features=dataset.n_market_features,
+        n_macro_features=dataset.n_macro_features,
+        n_max_past_horizon=model_past_len,
+        max_seq_len=cfg['max_seq_len'],
+    )
+    state = ckpt.get('model_state_dict', ckpt.get('model', ckpt))
+    model.load_state_dict(state)
+    model.to(device)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+
+    label_norm = label_norm_from_dataset(dataset)
+    stage_norm = load_stage_norm(
+        key_dir,
+        fallback_mean=label_norm[0],
+        fallback_std=label_norm[1],
+    )
+    return model, key, stage_norm
+
+
 @torch.no_grad()
 def evaluate_ensemble_over_stages(
-    models: Sequence[nn.Module],
     loss_fn: LossFn,
     loader,
     *,
-    stage_norms: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+    config: dict,
+    dataset,
+    stage_keys: Sequence[str],
     label_norm: Tuple[torch.Tensor, torch.Tensor],
     device: Optional[torch.device] = None,
     max_batches: Optional[int] = None,
+    require_finished: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    Compare nested ensembles in **raw / denormalized** label space.
+    Wholesale ensemble eval over dataset ``D`` (the loader):
 
-    Given ``model_0 .. model_m``:
+        en_k = model_0(D) + model_1(D) + ... + model_k(D)
 
-      en_k = sum_{i=0..k} denormalize_i(model_i(x))
+    For each stage ``i``:
+      1. load **only** ``model_i``
+      2. run a full pass over ``D`` → contribution tensor on CPU
+      3. ``running += contribution``
+      4. free ``model_i`` before loading ``model_{i+1}``
 
-    ``loader`` yields ``(x, p, mean, std, shape, y_norm)`` where ``y_norm``
-    uses the dataset label affine ``label_norm``. Metrics compare ``en_k`` to
-    ``y_raw = denormalize_label(y_norm)``.
+    Never keeps several models resident, and never does
+    ``model_0(batch)+model_1(batch)+...`` inside one batch loop.
     """
-    stage_models = list(models)
-    if not stage_models:
-        return []
-    if len(stage_norms) != len(stage_models):
-        raise ValueError(
-            f"stage_norms length {len(stage_norms)} != models {len(stage_models)}"
-        )
+    from config import project_root_dir
 
     if device is None:
-        device = next(stage_models[0].parameters()).device
-
-    for m in stage_models:
-        m.eval()
-        m.to(device)
+        device = torch.device(config.get('device') or 'cpu')
+    else:
+        device = torch.device(device)
 
     label_mean, label_std = label_norm
-    n = len(stage_models)  # models 0..n-1 → ensembles en_0..en_{n-1}
-    sum_loss = [0.0] * n
-    sum_mse = [0.0] * n
-    sum_l1 = [0.0] * n
-    n_examples = 0
-    n_batches = 0
+    ckpt_root = Path(config.get('checkpoint_dir', 'trading_checkpoints'))
+    if not ckpt_root.is_absolute():
+        ckpt_root = project_root_dir() / ckpt_root
 
-    def _iter_batches():
-        # ThreadedDataLoader: start_epoch + get_next_batch (no __iter__).
-        if hasattr(loader, 'start_epoch') and hasattr(loader, 'get_next_batch'):
-            loader.start_epoch(0)
-            while True:
-                batch, _wait, _load = loader.get_next_batch()
-                if batch is None:
-                    break
-                yield batch
-            return
-        # Plain iterable of batches.
-        for batch in loader:
-            yield batch
-
-    for batch in _iter_batches():
-        if max_batches is not None and n_batches >= int(max_batches):
+    # Which stages are available (dirs / finished flag) — no weight load yet.
+    available: List[Tuple[int, str]] = []
+    for stage, key in enumerate(stage_keys):
+        key_dir = ckpt_root / key
+        if not key_dir.exists():
             break
+        if require_finished:
+            state_file = key_dir / 'training_state.json'
+            finished = False
+            if state_file.exists():
+                try:
+                    with open(state_file, 'r', encoding='utf-8') as f:
+                        finished = bool(json.load(f).get('training_finished'))
+                except Exception:
+                    finished = False
+            if not finished:
+                break
+        available.append((stage, key))
+
+    if not available:
+        return []
+
+    # Pass over D once with no model: collect y_raw on CPU.
+    y_chunks: List[torch.Tensor] = []
+    n_batches = 0
+    for batch in _iter_loader_batches(loader, max_batches=max_batches):
         if not isinstance(batch, (tuple, list)) or len(batch) < 6:
             raise ValueError(
                 "evaluate_ensemble_over_stages expects batches "
                 "(x, p, mean, std, shape, y)"
             )
-        x, p, mean, std, shape, y_norm = batch[:6]
-        x = x.to(device)
-        p = p.to(device)
-        mean = mean.to(device)
-        std = std.to(device)
-        shape = shape.to(device)
-        y_norm = y_norm.to(device)
-        y_raw = apply_denormalize(y_norm, label_mean, label_std)
-
-        # Denormalize each stage, then form en_k = sum_{i<=k} raw_i
-        preds_raw: List[torch.Tensor] = []
-        for i, m in enumerate(stage_models):
-            pred_norm = head_prediction(m(x, p, mean, std, shape))
-            s_mean, s_std = stage_norms[i]
-            preds_raw.append(apply_denormalize(pred_norm, s_mean, s_std))
-
-        total_raw = None
-        bsz = int(y_raw.shape[0])
-        for k, pred_raw in enumerate(preds_raw):
-            total_raw = pred_raw if total_raw is None else total_raw + pred_raw
-            loss_k = loss_fn(x, total_raw, y_raw)
-            resid = y_raw - total_raw
-            sum_loss[k] += float(loss_k.item()) * bsz
-            sum_mse[k] += float(resid.pow(2).mean().item()) * bsz
-            sum_l1[k] += float(resid.abs().mean().item()) * bsz
-
-        n_examples += bsz
+        y_norm = batch[5]
+        y_raw = apply_denormalize(y_norm, label_mean, label_std).detach().cpu()
+        y_chunks.append(y_raw)
         n_batches += 1
-
-    if n_examples <= 0:
+    if not y_chunks:
         return []
+    y_all = torch.cat(y_chunks, dim=0)
+    n_examples = int(y_all.shape[0])
 
+    running: Optional[torch.Tensor] = None  # CPU, same layout as y_all
     out: List[Dict[str, Any]] = []
-    for k in range(n):
-        members = [f'model_{i}' for i in range(k + 1)]
+
+    for stage, key in available:
+        # Wholesale: model_i(D) as a whole pass, then add into en.
+        print(f"  wholesale model_{stage}(D)  key={key}")
+        model = None
+        try:
+            model, _key, stage_norm = load_one_error_stage(
+                config, dataset, stage=stage, key=key, device=device
+            )
+            s_mean, s_std = stage_norm
+            contrib_chunks: List[torch.Tensor] = []
+            for batch in _iter_loader_batches(loader, max_batches=max_batches):
+                x, p, mean, std, shape, _y = batch[:6]
+                x = x.to(device)
+                p = p.to(device)
+                mean = mean.to(device)
+                std = std.to(device)
+                shape = shape.to(device)
+                pred_norm = head_prediction(model(x, p, mean, std, shape))
+                pred_raw = apply_denormalize(pred_norm, s_mean, s_std)
+                contrib_chunks.append(pred_raw.detach().cpu())
+            # Full-dataset contribution model_i(D), then free model_i.
+            contrib = torch.cat(contrib_chunks, dim=0)
+            if contrib.shape != y_all.shape:
+                raise RuntimeError(
+                    f"model_{stage}(D) shape {tuple(contrib.shape)} "
+                    f"!= y(D) shape {tuple(y_all.shape)} "
+                    f"(loader order must be stable; use shuffle=False)"
+                )
+            running = contrib if running is None else running + contrib
+        finally:
+            _release_model(model)
+
+        assert running is not None
+        # Metrics for en_k = model_0(D) + ... + model_k(D)
+        resid = y_all - running
+        loss = _ensemble_loss_cpu(loss_fn, running, y_all)
+        k = len(out)
+        members = [f'model_{available[j][0]}' for j in range(k + 1)]
         out.append(
             {
-                'k': k,
-                'ensemble': f'en_{k}',
+                'k': available[k][0],
+                'ensemble': f'en_{available[k][0]}',
                 'definition': ' + '.join(
-                    f'denorm_{i}({m})' for i, m in enumerate(members)
+                    f'model_{available[j][0]}(D)' for j in range(k + 1)
                 ),
                 'members': members,
                 'n_models': k + 1,
                 'n_stages': k + 1,
-                'last_model': f'model_{k}',
+                'last_model': f'model_{available[k][0]}',
                 'space': 'denormalized',
-                'loss': sum_loss[k] / n_examples,
-                'residual_mse': sum_mse[k] / n_examples,
-                'residual_l1': sum_l1[k] / n_examples,
+                'load_mode': 'wholesale_one_model_over_D',
+                'loss': loss,
+                'residual_mse': float(resid.pow(2).mean().item()),
+                'residual_l1': float(resid.abs().mean().item()),
                 'n_examples': n_examples,
                 'n_batches': n_batches,
             }
         )
+
     return out
+
+
+def _ensemble_loss_cpu(
+    loss_fn: LossFn,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> float:
+    """Run label loss on CPU tensors; ``x`` is unused by yield/trend MSE."""
+    dummy_x = pred  # shape-compatible placeholder
+    val = loss_fn(dummy_x, pred, target)
+    return float(val.item())
 
 
 @torch.no_grad()

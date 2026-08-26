@@ -217,7 +217,7 @@ def _plot_ensemble_vs_stage(
             markersize=8,
             label="Val loss(en_k, y)",
         )
-    ax.set_xlabel("Ensemble en_k = sum denorm_i(model_i), i=0..k")
+    ax.set_xlabel("Ensemble en_k = model_0(D)+...+model_k(D)")
     ax.set_ylabel("Label loss (raw / denormalized space)")
     ax.set_title("Compare ensembles en_0 .. en_m")
     ax.grid(True, alpha=0.3)
@@ -265,7 +265,7 @@ def _plot_ensemble_vs_stage(
             alpha=0.85,
             label="Val residual L1",
         )
-    ax.set_xlabel("Ensemble en_k = sum denorm_i(model_i), i=0..k")
+    ax.set_xlabel("Ensemble en_k = model_0(D)+...+model_k(D)")
     ax.set_ylabel("Remaining residual y_raw - en_k")
     ax.set_title("Residual after each ensemble en_k")
     ax.grid(True, alpha=0.3)
@@ -289,34 +289,20 @@ def _evaluate_loaded_ensemble(
     max_batches: Optional[int] = None,
     require_finished: bool = False,
 ) -> Dict:
-    """Load stage prefix and score cumulative ensemble on train + val."""
+    """
+    Score en_k = model_0(D)+...+model_k(D) on train + val.
+
+    Loads **one stage at a time** (never keeps several models resident).
+    """
     import torch
     from data import ThreadedDataLoader
     from error_ensemble import (
         evaluate_ensemble_over_stages,
-        load_error_ensemble_stages,
+        label_norm_from_dataset,
     )
 
     device = torch.device(cfg["device"] if cfg.get("device") else "cpu")
-    models, keys_loaded, stages_loaded, stage_norms, label_norm = (
-        load_error_ensemble_stages(
-            cfg,
-            dataset,
-            n=len(stage_keys),
-            stage_keys=stage_keys,
-            device=device,
-            require_finished=require_finished,
-        )
-    )
-    if not models:
-        return {
-            "n_loaded": 0,
-            "keys_loaded": [],
-            "stages_loaded": [],
-            "train": [],
-            "val": [],
-            "error": "no stage checkpoints with loadable weights",
-        }
+    label_norm = label_norm_from_dataset(dataset)
 
     loss_fn = bind_label_loss(
         getattr(dataset, "label_mode", cfg.get("label", "yield")),
@@ -333,8 +319,8 @@ def _evaluate_loaded_ensemble(
     bs_val = int(cfg.get("validate_batch_size", bs_train))
 
     print(
-        f"Evaluating en_k = sum denorm_i(model_i) on {len(models)} stage(s): "
-        f"{', '.join(f'model_{s}' for s in stages_loaded)}"
+        "Wholesale eval: en_k = model_0(D) + model_1(D) + ... "
+        "(one full pass per model, one model resident at a time)"
     )
 
     train_loader = ThreadedDataLoader(
@@ -346,29 +332,38 @@ def _evaluate_loaded_ensemble(
 
     print("  train split...")
     train_metrics = evaluate_ensemble_over_stages(
-        models,
         loss_fn,
         train_loader,
-        stage_norms=stage_norms,
+        config=cfg,
+        dataset=dataset,
+        stage_keys=stage_keys,
         label_norm=label_norm,
         device=device,
         max_batches=max_batches,
+        require_finished=require_finished,
     )
     print("  val split...")
     val_metrics = evaluate_ensemble_over_stages(
-        models,
         loss_fn,
         val_loader,
-        stage_norms=stage_norms,
+        config=cfg,
+        dataset=dataset,
+        stage_keys=stage_keys,
         label_norm=label_norm,
         device=device,
         max_batches=max_batches,
+        require_finished=require_finished,
     )
 
+    stages_loaded = [int(r["k"]) for r in (val_metrics or train_metrics or [])]
+    keys_loaded = [
+        stage_keys[s] for s in stages_loaded if 0 <= s < len(stage_keys)
+    ]
     return {
-        "n_loaded": len(models),
+        "n_loaded": len(stages_loaded),
         "keys_loaded": keys_loaded,
         "stages_loaded": stages_loaded,
+        "load_mode": "sequential_one_model_at_a_time",
         "train": train_metrics,
         "val": val_metrics,
     }
@@ -588,9 +583,11 @@ def build_report(
         "After training `model_0 .. model_m`, the report scores these ensembles",
         "in **denormalized** label space (each stage uses its saved mean/std):",
         "",
-        "- `en_0 = denorm_0(model_0)`",
-        "- `en_1 = denorm_0(model_0) + denorm_1(model_1)`",
-        "- `en_k = sum_{i=0..k} denorm_i(model_i)`",
+        "- Wholesale over dataset D: `en_k = model_0(D) + ... + model_k(D)`",
+        "  (each stage denormalized with its saved mean/std, then added)",
+        "",
+        "For each i: load only model_i → full pass over D → add → free → next.",
+        "Never loads several models at once; never sums inside one shared batch loop.",
         "",
         "This compares **ensemble** predictions against raw `y`, not each",
         "stage's residual-training loss.",

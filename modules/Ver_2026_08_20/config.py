@@ -253,7 +253,7 @@ config = {
     # ============================================================
     # TRAINING CONFIGURATION
     # ============================================================
-    'epochs': 2,
+    'epochs': 1,
     'batch_size': 20,
     'learning_rate': 0.000_1, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
     'save_every_n_minutes': 5,

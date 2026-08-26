@@ -68,3 +68,8 @@ stage's residual-training loss.
 - `model_i/latest_epoch_loss.png` - partial/interrupted epoch curve
 - `model_i/validation_eXXX.png` - full val batch curves (`--report`)
 - `model_i/validation_eXXX_p0_30.png` - [0%, 30%] slice (`--report`)
+
+## Git
+
+- Commit: `63286d8`
+- Message: `20260826_210911`
