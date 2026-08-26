@@ -218,7 +218,7 @@ def _plot_ensemble_vs_stage(
             label="Val loss(en_k, y)",
         )
     ax.set_xlabel("Ensemble en_k = model_0(D)+...+model_k(D)")
-    ax.set_ylabel("Label loss (raw / denormalized space)")
+    ax.set_ylabel("Label loss (y-normalized space)")
     ax.set_title("Compare ensembles en_0 .. en_m")
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -266,7 +266,7 @@ def _plot_ensemble_vs_stage(
             label="Val residual L1",
         )
     ax.set_xlabel("Ensemble en_k = model_0(D)+...+model_k(D)")
-    ax.set_ylabel("Remaining residual y_raw - en_k")
+    ax.set_ylabel("Remaining residual y - en_k (y-normalized)")
     ax.set_title("Residual after each ensemble en_k")
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -581,16 +581,16 @@ def build_report(
         "## Compare ensembles en_0 .. en_m",
         "",
         "After training `model_0 .. model_m`, the report scores these ensembles",
-        "in **denormalized** label space (each stage uses its saved mean/std):",
+        "in **y-normalized** space (same space as dataloader `y`):",
         "",
-        "- Wholesale over dataset D: `en_k = model_0(D) + ... + model_k(D)`",
-        "  (each stage denormalized with its saved mean/std, then added)",
+        "- Wholesale over dataset D:",
+        "  `en_0 = model_0(D)`",
+        "  `en_k = model_0(D) + denorm_0(model_1(D)) + ... + denorm_{k-1}(model_k(D))`",
         "",
-        "For each i: load only model_i → full pass over D → add → free → next.",
+        "For each i: load only model_i → full pass over D → add in y-space → free → next.",
         "Never loads several models at once; never sums inside one shared batch loop.",
         "",
-        "This compares **ensemble** predictions against raw `y`, not each",
-        "stage's residual-training loss.",
+        "Metrics compare `en_k` to `y` (normalized), not `y_raw`.",
         "",
     ]
     ens = summary.get("ensemble_over_stages") or {}

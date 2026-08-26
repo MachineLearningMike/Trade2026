@@ -729,13 +729,16 @@ def evaluate_ensemble_over_stages(
     require_finished: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    Wholesale ensemble eval over dataset ``D`` (the loader):
+    Wholesale ensemble eval over dataset ``D`` (the loader), compared in
+    **y-normalized** label space (not raw):
 
-        en_k = model_0(D) + model_1(D) + ... + model_k(D)
+        en_0 = model_0(D)                         # already in y-space
+        en_k = en_{k-1} + denorm_{k-1}(model_k(D))  # k >= 1
+        score loss(en_k, y)                       # both in y-space
 
     For each stage ``i``:
       1. load **only** ``model_i``
-      2. run a full pass over ``D`` → contribution tensor on CPU
+      2. full pass over ``D`` → contribution in y-space on CPU
       3. ``running += contribution``
       4. free ``model_i`` before loading ``model_{i+1}``
 
@@ -749,7 +752,9 @@ def evaluate_ensemble_over_stages(
     else:
         device = torch.device(device)
 
-    label_mean, label_std = label_norm
+    # label_norm is used by load_one_error_stage fallbacks; metrics use y itself.
+    _ = label_norm
+
     ckpt_root = Path(config.get('checkpoint_dir', 'trading_checkpoints'))
     if not ckpt_root.is_absolute():
         ckpt_root = project_root_dir() / ckpt_root
@@ -776,7 +781,7 @@ def evaluate_ensemble_over_stages(
     if not available:
         return []
 
-    # Pass over D once with no model: collect y_raw on CPU.
+    # Pass over D once with no model: collect y (normalized) on CPU.
     y_chunks: List[torch.Tensor] = []
     n_batches = 0
     for batch in _iter_loader_batches(loader, max_batches=max_batches):
@@ -785,20 +790,19 @@ def evaluate_ensemble_over_stages(
                 "evaluate_ensemble_over_stages expects batches "
                 "(x, p, mean, std, shape, y)"
             )
-        y_norm = batch[5]
-        y_raw = apply_denormalize(y_norm, label_mean, label_std).detach().cpu()
-        y_chunks.append(y_raw)
+        y_norm = batch[5].detach().cpu()
+        y_chunks.append(y_norm)
         n_batches += 1
     if not y_chunks:
         return []
     y_all = torch.cat(y_chunks, dim=0)
     n_examples = int(y_all.shape[0])
 
-    running: Optional[torch.Tensor] = None  # CPU, same layout as y_all
+    running: Optional[torch.Tensor] = None  # CPU, y-normalized space
     out: List[Dict[str, Any]] = []
 
     for stage, key in available:
-        # Wholesale: model_i(D) as a whole pass, then add into en.
+        # Wholesale: model_i(D) as a whole pass, then add into en (y-space).
         print(f"  wholesale model_{stage}(D)  key={key}")
         model = None
         try:
@@ -814,9 +818,15 @@ def evaluate_ensemble_over_stages(
                 mean = mean.to(device)
                 std = std.to(device)
                 shape = shape.to(device)
-                pred_norm = head_prediction(model(x, p, mean, std, shape))
-                pred_raw = apply_denormalize(pred_norm, s_mean, s_std)
-                contrib_chunks.append(pred_raw.detach().cpu())
+                pred = head_prediction(model(x, p, mean, std, shape))
+                # Stage 0 predicts in y-space already.
+                # Stage i>0 predicts in residual-norm space; denorm_i maps
+                # back to y-space (see error_ensemble_logic.txt).
+                if stage == 0:
+                    contrib_b = pred
+                else:
+                    contrib_b = apply_denormalize(pred, s_mean, s_std)
+                contrib_chunks.append(contrib_b.detach().cpu())
             # Full-dataset contribution model_i(D), then free model_i.
             contrib = torch.cat(contrib_chunks, dim=0)
             if contrib.shape != y_all.shape:
@@ -830,7 +840,7 @@ def evaluate_ensemble_over_stages(
             _release_model(model)
 
         assert running is not None
-        # Metrics for en_k = model_0(D) + ... + model_k(D)
+        # Metrics for en_k vs y in normalized label space.
         resid = y_all - running
         loss = _ensemble_loss_cpu(loss_fn, running, y_all)
         k = len(out)
@@ -840,13 +850,18 @@ def evaluate_ensemble_over_stages(
                 'k': available[k][0],
                 'ensemble': f'en_{available[k][0]}',
                 'definition': ' + '.join(
-                    f'model_{available[j][0]}(D)' for j in range(k + 1)
+                    (
+                        f'model_{available[j][0]}(D)'
+                        if available[j][0] == 0
+                        else f'denorm(model_{available[j][0]}(D))'
+                    )
+                    for j in range(k + 1)
                 ),
                 'members': members,
                 'n_models': k + 1,
                 'n_stages': k + 1,
                 'last_model': f'model_{available[k][0]}',
-                'space': 'denormalized',
+                'space': 'y_normalized',
                 'load_mode': 'wholesale_one_model_over_D',
                 'loss': loss,
                 'residual_mse': float(resid.pow(2).mean().item()),

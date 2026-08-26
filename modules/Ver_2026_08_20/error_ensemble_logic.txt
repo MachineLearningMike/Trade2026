@@ -114,13 +114,16 @@ Equivalently (same meaning as above):
   (the mean would be counted more than once). Denormalize with (y_mean, y_std)
   **once** on the summed y_hat_norm.
 
-- Nested ensembles for the report:
-    en_0 = denormalize_y( y_0 )
-    en_1 = denormalize_y( y_0 + denorm_0(y_1) )
-    en_k = denormalize_y( y_0 + sum_{i=1..k} denorm_{i-1}(y_i) )
+- Nested ensembles for the report are compared in **y-normalized** space
+  (not raw):
+    en_0 = y_0
+    en_1 = y_0 + denorm_0(y_1)
+    en_k = y_0 + sum_{i=1..k} denorm_{i-1}(y_i)
+    score against y (same normalized Yield space).
+  Use denormalize_y(en_k) only when raw chance/near is needed elsewhere.
 
 - Report / eval summing is **wholesale** over dataset D:
-      en_k = model_0(D) + model_1(D) + ... + model_k(D)
+      en_k = model_0(D) + denorm(model_1(D)) + ...   (in y-space)
     For each i: load model_i only → full pass over D → add contribution →
     free model_i → load model_{i+1}.
     Do not keep several models resident, and do not sum inside one shared
