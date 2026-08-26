@@ -591,6 +591,7 @@ def build_report(
         "Never loads several models at once; never sums inside one shared batch loop.",
         "",
         "Metrics compare `en_k` to `y` (normalized), not `y_raw`.",
+        "Invariant: loss(en_i, y) must not grow with i (retrain with --clean if it does).",
         "",
     ]
     ens = summary.get("ensemble_over_stages") or {}

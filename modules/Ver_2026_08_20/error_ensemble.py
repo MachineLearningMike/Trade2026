@@ -1,13 +1,14 @@
 # error_ensemble.py
-# Residual / error-boosting ensemble: model_i fits the leftover error of model_0..i-1.
+# Residual / error-boosting ensemble.
 #
-# Each stage trains in its own normalized target space (saved mean/std):
-#   stage 0: target = normalize_0(y_raw)
-#   stage i: e_raw = y_raw - sum_{j<i} denormalize_j(y_j)
-#            target = normalize_i(e_raw)
+# SOURCE OF TRUTH: error_ensemble_logic.txt — keep this module aligned with it.
 #
-# Nested ensembles are formed in **raw / denormalized** label space:
-#   en_k = sum_{i=0..k} denormalize_i(model_i(x))
+# All additive structure is in **y-normalized** Yield space:
+#   e_0 = y - y_0
+#   model_{i+1} fits norm_i(e_i);  e_i_hat = denorm_i(y_{i+1})
+#   e_{i+1} = e_i - e_i_hat
+#   en_k = y_0 + denorm_0(y_1) + ... + denorm_{k-1}(y_k)
+#   score en_k against y (not y_raw)
 #
 # Training is sequential: freeze earlier stages, fit the next on the residual.
 
@@ -29,6 +30,8 @@ LossFn = Callable[[torch.Tensor, Any, torch.Tensor], torch.Tensor]
 
 # Sidecar next to each stage checkpoint key (mean/std of that stage's target).
 STAGE_NORM_FILENAME = 'error_stage_norm.json'
+# v2: residual stats / summing in y-normalized space (error_ensemble_logic.txt).
+STAGE_NORM_VERSION = 2
 
 
 def head_prediction(output: Any) -> torch.Tensor:
@@ -82,11 +85,13 @@ def save_stage_norm(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     path = checkpoint_dir / STAGE_NORM_FILENAME
     payload = {
+        'version': int(STAGE_NORM_VERSION),
         'stage': int(stage),
         'target_mean': torch.as_tensor(target_mean).detach().cpu().tolist(),
         'target_std': torch.as_tensor(target_std).detach().cpu().tolist(),
         'label_mean': torch.as_tensor(label_mean).detach().cpu().tolist(),
         'label_std': torch.as_tensor(label_std).detach().cpu().tolist(),
+        'space': 'y_normalized',
     }
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2)
@@ -98,28 +103,46 @@ def load_stage_norm(
     *,
     fallback_mean: Optional[torch.Tensor] = None,
     fallback_std: Optional[torch.Tensor] = None,
+    require_current_version: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Load ``(target_mean, target_std)`` for a stage.
 
-    Falls back to label stats when the sidecar is missing (legacy runs).
+    If the sidecar is missing or from an older residual-space scheme, falls
+    back to ``fallback_mean/std`` unless ``require_current_version`` is set.
     """
     path = Path(checkpoint_dir) / STAGE_NORM_FILENAME
     if path.exists():
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        mean = torch.tensor(data['target_mean'], dtype=torch.float32)
-        std = torch.tensor(data['target_std'], dtype=torch.float32)
-        return mean, std
+        ver = int(data.get('version', 1) or 1)
+        if ver >= STAGE_NORM_VERSION:
+            mean = torch.tensor(data['target_mean'], dtype=torch.float32)
+            std = torch.tensor(data['target_std'], dtype=torch.float32)
+            return mean, std
+        if require_current_version:
+            raise FileNotFoundError(
+                f"{path} has version={ver}; need >={STAGE_NORM_VERSION} "
+                f"(y-space residual norms). Re-run with --clean."
+            )
+        print(
+            f"⚠ {path.name} in {checkpoint_dir.name} is version={ver} "
+            f"(need {STAGE_NORM_VERSION} y-space norms); using fallback"
+        )
+    elif require_current_version:
+        raise FileNotFoundError(
+            f"Missing {STAGE_NORM_FILENAME} in {checkpoint_dir}"
+        )
     if fallback_mean is None or fallback_std is None:
         raise FileNotFoundError(
-            f"Missing {STAGE_NORM_FILENAME} in {checkpoint_dir} "
-            f"and no fallback label mean/std provided"
+            f"Missing usable {STAGE_NORM_FILENAME} in {checkpoint_dir} "
+            f"and no fallback mean/std provided"
         )
-    print(
-        f"⚠ {path.name} missing in {checkpoint_dir.name}; "
-        f"falling back to dataset label mean/std"
-    )
+    if not path.exists():
+        print(
+            f"⚠ {path.name} missing in {checkpoint_dir.name}; "
+            f"falling back to provided mean/std"
+        )
     return (
         torch.as_tensor(fallback_mean, dtype=torch.float32).reshape(-1),
         torch.as_tensor(fallback_std, dtype=torch.float32).reshape(-1),
@@ -145,25 +168,43 @@ def compute_residuals(
     return residuals
 
 
-def sum_denormalized_stages(
-    stage_preds_norm: Sequence[torch.Tensor],
+def contribution_in_y_space(
+    stage: int,
+    pred: torch.Tensor,
+    stage_norm: Tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """
+    Map ``model_stage`` output into y-normalized space for additive ensembling.
+
+    Per error_ensemble_logic.txt:
+      - model_0: ``y_0`` already in y-space → return ``pred``
+      - model_i (i>=1): ``pred`` is in norm_{i-1}-space; ``stage_norm`` is
+        ``(mean_{i-1}, std_{i-1})`` stored in model_i's sidecar
+        → return ``denorm_{i-1}(pred)``
+    """
+    if int(stage) == 0:
+        return pred
+    mean, std = stage_norm
+    return apply_denormalize(pred, mean, std)
+
+
+def sum_stages_in_y_space(
+    stage_preds: Sequence[torch.Tensor],
     stage_norms: Sequence[Tuple[torch.Tensor, torch.Tensor]],
 ) -> torch.Tensor:
     """
-    en_k in raw label space: sum_i denormalize_i(pred_i).
-
-    ``stage_norms[i] = (mean_i, std_i)`` saved for that stage's target space.
+    ``en = y_0 + denorm(y_1) + denorm(y_2) + ...`` in y-normalized space.
     """
-    if len(stage_preds_norm) != len(stage_norms):
+    if len(stage_preds) != len(stage_norms):
         raise ValueError(
-            f"pred/norm length mismatch: {len(stage_preds_norm)} vs {len(stage_norms)}"
+            f"pred/norm length mismatch: {len(stage_preds)} vs {len(stage_norms)}"
         )
     total = None
-    for pred, (mean, std) in zip(stage_preds_norm, stage_norms):
-        raw = apply_denormalize(pred, mean, std)
-        total = raw if total is None else total + raw
+    for i, (pred, norm) in enumerate(zip(stage_preds, stage_norms)):
+        contrib = contribution_in_y_space(i, pred, norm)
+        total = contrib if total is None else total + contrib
     if total is None:
-        raise ValueError("sum_denormalized_stages requires at least one stage")
+        raise ValueError("sum_stages_in_y_space requires at least one stage")
     return total
 
 
@@ -201,9 +242,11 @@ class ResidualStageWrapper(nn.Module):
     """
     Train one error stage while earlier models are frozen.
 
-    ``forward`` returns the *active* stage output (same tuple layout as the
-    base market model). Previous stages are denormalized with their saved
-    mean/std and summed in raw space into ``last_prev_sum_raw``.
+    ``forward`` returns the active stage output. Previous stages are mapped
+    into y-normalized space and summed into ``last_prev_sum_y``:
+
+      stage 0 contrib = y_0
+      stage j>0 contrib = denorm_{j-1}(y_j)  # sidecar of model_j holds (mean_{j-1}, std_{j-1})
     """
 
     def __init__(
@@ -242,13 +285,12 @@ class ResidualStageWrapper(nn.Module):
         self.register_buffer('active_std', a_std.detach().float().reshape(-1))
 
         if label_norm is None:
-            # Stage-0 / dataloader y affine defaults to active_norm.
             label_norm = active_norm
         l_mean, l_std = label_norm
         self.register_buffer('label_mean', l_mean.detach().float().reshape(-1))
         self.register_buffer('label_std', l_std.detach().float().reshape(-1))
 
-        self.last_prev_sum_raw: Optional[torch.Tensor] = None
+        self.last_prev_sum_y: Optional[torch.Tensor] = None
         # Mirror common attrs used by diagnostics / INFER helpers.
         for attr in (
             'output_dim',
@@ -274,18 +316,17 @@ class ResidualStageWrapper(nn.Module):
 
     def forward(self, x, p, mean, std, shape):
         if len(self.prev) == 0:
-            self.last_prev_sum_raw = None
+            self.last_prev_sum_y = None
         else:
             with torch.no_grad():
-                total_raw = None
+                total_y = None
                 for i, m in enumerate(self.prev):
-                    pred_norm = head_prediction(m(x, p, mean, std, shape))
-                    p_mean, p_std = self._prev_norm_pair(i)
-                    pred_raw = apply_denormalize(pred_norm, p_mean, p_std)
-                    total_raw = (
-                        pred_raw if total_raw is None else total_raw + pred_raw
+                    pred = head_prediction(m(x, p, mean, std, shape))
+                    contrib = contribution_in_y_space(
+                        i, pred, self._prev_norm_pair(i)
                     )
-                self.last_prev_sum_raw = total_raw
+                    total_y = contrib if total_y is None else total_y + contrib
+                self.last_prev_sum_y = total_y
         return self.active(x, p, mean, std, shape)
 
     # Persist / resume only the active stage weights (prev stages have their
@@ -303,25 +344,21 @@ def bind_residual_stage_loss(
     stage_model: ResidualStageWrapper,
 ) -> LossFn:
     """
-    Stage loss against a **re-normalized** residual target:
+    Stage loss in y-normalized space (error_ensemble_logic.txt):
 
-      y_raw = denormalize_label(y_dataloader)
-      e_raw = y_raw - sum_{j<i} denormalize_j(y_j)   (0 if i==0)
-      target = normalize_i(e_raw)   # active stage mean/std
+      e = y - sum_{j<i} contrib_y(model_j)     # e_{-1} path: e = y
+      target = normalize_i(e)                  # active stage mean/std
     """
 
     def loss_fn(x, y_pred, y_truth):
-        # y_truth from the dataloader is label-normalized (stage-0 affine).
-        y_raw = apply_denormalize(
-            y_truth, stage_model.label_mean, stage_model.label_std
-        )
-        prev_raw = stage_model.last_prev_sum_raw
-        if prev_raw is None:
-            e_raw = y_raw
+        # y_truth is already y-normalized from the dataloader.
+        prev_y = stage_model.last_prev_sum_y
+        if prev_y is None:
+            e = y_truth
         else:
-            e_raw = y_raw - prev_raw
+            e = y_truth - prev_y
         target = apply_normalize(
-            e_raw, stage_model.active_mean, stage_model.active_std
+            e, stage_model.active_mean, stage_model.active_std
         )
         return base_loss_fn(x, y_pred, target)
 
@@ -336,11 +373,9 @@ class ErrorEnsemble(nn.Module):
     """
     Ensemble of residual error models ``{model_0, ..., model_{n-1}}``.
 
-    Nested ensembles are formed in raw label space:
+    Flat ensembles in y-normalized space (error_ensemble_logic.txt):
 
-      en_k = sum_{i=0..k} denormalize_i(model_i(x))
-
-    using each stage's saved target mean/std.
+      en_k = y_0 + denorm_0(y_1) + ... + denorm_{k-1}(y_k)
     """
 
     def __init__(
@@ -412,7 +447,7 @@ class ErrorEnsemble(nn.Module):
             self.loss_fn = None
 
         self.last_stage_preds_norm: List[torch.Tensor] = []
-        self.last_stage_preds_raw: List[torch.Tensor] = []
+        self.last_stage_preds_y: List[torch.Tensor] = []
         # Back-compat alias used by older helpers.
         self.last_stage_preds: List[torch.Tensor] = []
 
@@ -437,71 +472,67 @@ class ErrorEnsemble(nn.Module):
         std,
         shape,
     ) -> List[torch.Tensor]:
-        """Normalized head outputs (each stage's own target space)."""
+        """Head outputs in each stage's own target space."""
         preds: List[torch.Tensor] = []
         for m in self.models:
             preds.append(head_prediction(m(x, p, mean, std, shape)))
         self.last_stage_preds_norm = preds
         self.last_stage_preds = preds
-        self.last_stage_preds_raw = [
-            apply_denormalize(pred, *self.stage_norm_pair(i))
+        self.last_stage_preds_y = [
+            contribution_in_y_space(i, pred, self.stage_norm_pair(i))
             for i, pred in enumerate(preds)
         ]
         return preds
 
     def forward(self, x, p, mean, std, shape):
         """
-        Return ``(en_m, patch_map, recon)`` in **raw** label space:
+        Return ``(en_m, patch_map, recon)`` in **y-normalized** space:
 
-          en_m = sum_i denormalize_i(model_i(x))
-
-        ``patch_map`` / ``recon`` come from the last stage (API compatibility).
+          en_m = y_0 + denorm(y_1) + ... + denorm(y_m)
         """
         last_full = None
         preds_norm: List[torch.Tensor] = []
-        preds_raw: List[torch.Tensor] = []
-        total_raw = None
+        preds_y: List[torch.Tensor] = []
+        total_y = None
         for i, m in enumerate(self.models):
             out = m(x, p, mean, std, shape)
             last_full = out
             pred_norm = head_prediction(out)
-            pred_raw = apply_denormalize(pred_norm, *self.stage_norm_pair(i))
+            pred_y = contribution_in_y_space(i, pred_norm, self.stage_norm_pair(i))
             preds_norm.append(pred_norm)
-            preds_raw.append(pred_raw)
-            total_raw = pred_raw if total_raw is None else total_raw + pred_raw
+            preds_y.append(pred_y)
+            total_y = pred_y if total_y is None else total_y + pred_y
         self.last_stage_preds_norm = preds_norm
-        self.last_stage_preds_raw = preds_raw
+        self.last_stage_preds_y = preds_y
         self.last_stage_preds = preds_norm
         if isinstance(last_full, (tuple, list)):
             patch_map = last_full[1] if len(last_full) > 1 else None
             recon = last_full[2] if len(last_full) > 2 else None
-            return total_raw, patch_map, recon
-        return total_raw, None, None
+            return total_y, patch_map, recon
+        return total_y, None, None
 
-    def residuals(self, y_raw: torch.Tensor) -> List[torch.Tensor]:
-        """Raw-space residuals from the most recent forward."""
-        return compute_residuals(y_raw, self.last_stage_preds_raw)
+    def residuals(self, y: torch.Tensor) -> List[torch.Tensor]:
+        """Y-space residuals from the most recent forward."""
+        return compute_residuals(y, self.last_stage_preds_y)
 
     def ensemble_prediction(self, k: Optional[int] = None) -> torch.Tensor:
-        """
-        ``en_k`` from cached raw stage preds. ``k=None`` → full ensemble.
-        """
-        if not self.last_stage_preds_raw:
+        """``en_k`` from cached y-space stage contribs. ``k=None`` → full."""
+        if not self.last_stage_preds_y:
             raise RuntimeError("No stage predictions; call forward() first")
         if k is None:
-            k = len(self.last_stage_preds_raw) - 1
-        if k < 0 or k >= len(self.last_stage_preds_raw):
+            k = len(self.last_stage_preds_y) - 1
+        if k < 0 or k >= len(self.last_stage_preds_y):
             raise IndexError(f"en_k index {k} out of range")
-        total = self.last_stage_preds_raw[0]
-        for pred in self.last_stage_preds_raw[1 : k + 1]:
+        total = self.last_stage_preds_y[0]
+        for pred in self.last_stage_preds_y[1 : k + 1]:
             total = total + pred
         return total
 
-    def ensemble_loss(self, x: torch.Tensor, y_raw: torch.Tensor) -> torch.Tensor:
-        """Loss of full ``en_m`` against raw ``y``."""
+    def ensemble_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Loss of full ``en_m`` against y-normalized ``y``."""
         if self.loss_fn is None:
             raise RuntimeError("ErrorEnsemble has no loss_fn; pass loss=... at init")
-        return self.loss_fn(x, self.ensemble_prediction(), y_raw)
+        return self.loss_fn(x, self.ensemble_prediction(), y)
 
 
 def stage_checkpoint_key(config: dict, dataset_signature: str, stage: int) -> str:
@@ -645,12 +676,16 @@ def load_one_error_stage(
     stage: int,
     key: Optional[str] = None,
     device: Optional[torch.device] = None,
+    require_current_norm_version: bool = True,
 ) -> Tuple[nn.Module, str, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Load a **single** ErrorEnsemble stage (weights + target affine).
 
     Returns ``(model, checkpoint_key, (target_mean, target_std))``.
     Caller must release the model when finished (see ``_release_model``).
+
+    By default requires STAGE_NORM_VERSION y-space sidecars. Old (v1) norms
+    mix raw/label affines into y-space sums and make loss(en_i, y) rise with i.
     """
     from config import project_root_dir
     from labels import resolve_model_past_len, sync_output_dim
@@ -706,12 +741,30 @@ def load_one_error_stage(
     for p in model.parameters():
         p.requires_grad = False
 
-    label_norm = label_norm_from_dataset(dataset)
-    stage_norm = load_stage_norm(
-        key_dir,
-        fallback_mean=label_norm[0],
-        fallback_std=label_norm[1],
+    out_dim = int(getattr(dataset, 'output_dim', 2))
+    identity = (
+        torch.zeros(out_dim, dtype=torch.float32),
+        torch.ones(out_dim, dtype=torch.float32),
     )
+    # Stage 0 may use identity; stage>0 must have current y-space residual norms.
+    if require_current_norm_version:
+        stage_norm = load_stage_norm(
+            key_dir,
+            fallback_mean=identity[0] if int(stage) == 0 else None,
+            fallback_std=identity[1] if int(stage) == 0 else None,
+            require_current_version=(int(stage) > 0),
+        )
+        if int(stage) == 0:
+            # Even if an old sidecar stored label mean/std, stage-0 contrib is y_0.
+            stage_norm = identity
+    else:
+        label_norm = label_norm_from_dataset(dataset)
+        stage_norm = load_stage_norm(
+            key_dir,
+            fallback_mean=label_norm[0],
+            fallback_std=label_norm[1],
+            require_current_version=False,
+        )
     return model, key, stage_norm
 
 
@@ -819,13 +872,7 @@ def evaluate_ensemble_over_stages(
                 std = std.to(device)
                 shape = shape.to(device)
                 pred = head_prediction(model(x, p, mean, std, shape))
-                # Stage 0 predicts in y-space already.
-                # Stage i>0 predicts in residual-norm space; denorm_i maps
-                # back to y-space (see error_ensemble_logic.txt).
-                if stage == 0:
-                    contrib_b = pred
-                else:
-                    contrib_b = apply_denormalize(pred, s_mean, s_std)
+                contrib_b = contribution_in_y_space(stage, pred, (s_mean, s_std))
                 contrib_chunks.append(contrib_b.detach().cpu())
             # Full-dataset contribution model_i(D), then free model_i.
             contrib = torch.cat(contrib_chunks, dim=0)
@@ -845,31 +892,40 @@ def evaluate_ensemble_over_stages(
         loss = _ensemble_loss_cpu(loss_fn, running, y_all)
         k = len(out)
         members = [f'model_{available[j][0]}' for j in range(k + 1)]
-        out.append(
-            {
-                'k': available[k][0],
-                'ensemble': f'en_{available[k][0]}',
-                'definition': ' + '.join(
-                    (
-                        f'model_{available[j][0]}(D)'
-                        if available[j][0] == 0
-                        else f'denorm(model_{available[j][0]}(D))'
-                    )
-                    for j in range(k + 1)
-                ),
-                'members': members,
-                'n_models': k + 1,
-                'n_stages': k + 1,
-                'last_model': f'model_{available[k][0]}',
-                'space': 'y_normalized',
-                'load_mode': 'wholesale_one_model_over_D',
-                'loss': loss,
-                'residual_mse': float(resid.pow(2).mean().item()),
-                'residual_l1': float(resid.abs().mean().item()),
-                'n_examples': n_examples,
-                'n_batches': n_batches,
-            }
-        )
+        row = {
+            'k': available[k][0],
+            'ensemble': f'en_{available[k][0]}',
+            'definition': ' + '.join(
+                (
+                    f'model_{available[j][0]}(D)'
+                    if available[j][0] == 0
+                    else f'denorm_{available[j][0]-1}(model_{available[j][0]}(D))'
+                )
+                for j in range(k + 1)
+            ),
+            'members': members,
+            'n_models': k + 1,
+            'n_stages': k + 1,
+            'last_model': f'model_{available[k][0]}',
+            'space': 'y_normalized',
+            'load_mode': 'wholesale_one_model_over_D',
+            'loss': loss,
+            'residual_mse': float(resid.pow(2).mean().item()),
+            'residual_l1': float(resid.abs().mean().item()),
+            'n_examples': n_examples,
+            'n_batches': n_batches,
+        }
+        if out and loss > float(out[-1]['loss']) + 1e-8:
+            prev = float(out[-1]['loss'])
+            print(
+                f"⚠ loss(en_{row['k']}, y)={loss:.6f} > loss(en_{out[-1]['k']}, y)"
+                f"={prev:.6f}. Residual boosting expects non-increasing ensembl"
+                f"e loss when stages fit y-space residuals. Usually means old "
+                f"raw-space checkpoints/norms — retrain with "
+                f"--error-ensemble --clean."
+            )
+            row['loss_increased_vs_prev'] = True
+        out.append(row)
 
     return out
 
@@ -898,13 +954,18 @@ def compute_stage_target_stats(
     max_batches: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Mean/std of the raw residual target for ``stage`` over the train split.
+    Mean/std of the **y-space** residual target for ``stage``.
 
-    Stage 0 → dataset label mean/std.
-    Stage i>0 → stats of ``y_raw - sum_{j<i} denorm_j(model_j(x))``.
+    Stage 0 → identity (0, 1): ``y`` is already label-normalized; no extra affine.
+    Stage i>0 → stats of ``e = y - sum_{j<i} contrib_y(model_j)``.
     """
+    out_dim = int(torch.as_tensor(label_norm[0]).numel())
     if stage == 0:
-        return label_norm_from_dataset(dataset)
+        # Identity affine so loss target stays y (already normalized).
+        return (
+            torch.zeros(out_dim, dtype=torch.float32),
+            torch.ones(out_dim, dtype=torch.float32),
+        )
 
     if len(prev_models) != stage or len(prev_norms) != stage:
         raise ValueError(
@@ -918,15 +979,12 @@ def compute_stage_target_stats(
         m.eval()
         m.to(device)
 
-    label_mean, label_std = label_norm
     bs = int(config.get('batch_size', 32))
     loader = ThreadedDataLoader(
         dataset.train_dataset, batch_size=bs, shuffle=False
     )
     loader.start_epoch(0)
 
-    # Welford-friendly accumulators in float64.
-    out_dim = int(label_mean.numel())
     total_sum = torch.zeros(out_dim, dtype=torch.float64)
     total_sq = torch.zeros(out_dim, dtype=torch.float64)
     n_examples = 0
@@ -945,18 +1003,15 @@ def compute_stage_target_stats(
         std = std.to(device)
         shape = shape.to(device)
         y_norm = y_norm.to(device)
-        y_raw = apply_denormalize(y_norm, label_mean, label_std)
 
-        prev_raw = None
+        prev_y = None
         for i, m in enumerate(prev_models):
-            pred_norm = head_prediction(m(x, p, mean, std, shape))
-            p_mean, p_std = prev_norms[i]
-            pred_raw = apply_denormalize(pred_norm, p_mean, p_std)
-            prev_raw = pred_raw if prev_raw is None else prev_raw + pred_raw
-        e_raw = y_raw - prev_raw  # type: ignore[operator]
+            pred = head_prediction(m(x, p, mean, std, shape))
+            contrib = contribution_in_y_space(i, pred, prev_norms[i])
+            prev_y = contrib if prev_y is None else prev_y + contrib
+        e = y_norm - prev_y  # type: ignore[operator]
 
-        e_cpu = e_raw.detach().to(dtype=torch.float64, device='cpu')
-        # Sum over batch
+        e_cpu = e.detach().to(dtype=torch.float64, device='cpu')
         total_sum += e_cpu.sum(dim=0)
         total_sq += e_cpu.pow(2).sum(dim=0)
         n_examples += int(e_cpu.shape[0])
@@ -971,7 +1026,7 @@ def compute_stage_target_stats(
     std = torch.sqrt(var).to(dtype=torch.float32)
     std = torch.where(std < 1e-8, torch.ones_like(std), std)
     print(
-        f"  stage {stage} residual target stats "
+        f"  stage {stage} y-space residual stats "
         f"(n={n_examples}): mean={mean.tolist()} std={std.tolist()}"
     )
     return mean, std
@@ -1075,11 +1130,18 @@ def load_error_ensemble_stages(
         for p in model.parameters():
             p.requires_grad = False
 
-        s_mean, s_std = load_stage_norm(
-            key_dir,
-            fallback_mean=label_norm[0],
-            fallback_std=label_norm[1],
+        out_dim = int(cfg['output_dim'])
+        identity_norm = (
+            torch.zeros(out_dim, dtype=torch.float32),
+            torch.ones(out_dim, dtype=torch.float32),
         )
+        if stage == 0:
+            s_mean, s_std = identity_norm
+        else:
+            s_mean, s_std = load_stage_norm(
+                key_dir,
+                require_current_version=True,
+            )
         models.append(model)
         keys_loaded.append(key)
         stages_loaded.append(stage)
@@ -1192,6 +1254,11 @@ def run_error_ensemble_train(
             from config import project_root_dir
 
             label_norm = label_norm_from_dataset(dataset)
+            out_dim = int(stage_cfg['output_dim'])
+            identity_norm = (
+                torch.zeros(out_dim, dtype=torch.float32),
+                torch.ones(out_dim, dtype=torch.float32),
+            )
             ckpt_root = Path(stage_cfg.get('checkpoint_dir', 'trading_checkpoints'))
             if not ckpt_root.is_absolute():
                 ckpt_root = project_root_dir() / ckpt_root
@@ -1201,6 +1268,8 @@ def run_error_ensemble_train(
             stage_dir = ckpt_root / stage_key
             stage_dir.mkdir(parents=True, exist_ok=True)
 
+            # Prev models + their sidecars per logic txt:
+            #   model_0 → identity; model_j (j>=1) → (mean_{j-1}, std_{j-1}) of e_{j-1}
             prev_models: List[nn.Module] = []
             prev_norms: List[Tuple[torch.Tensor, torch.Tensor]] = []
             for prev_stage in range(stage):
@@ -1220,36 +1289,25 @@ def run_error_ensemble_train(
                     device,
                 )
                 prev_models.append(prev)
-                prev_key = stage_checkpoint_key(
-                    stage_cfg, dataset.cache_key, prev_stage
-                )
-                prev_norms.append(
-                    load_stage_norm(
-                        ckpt_root / prev_key,
-                        fallback_mean=label_norm[0],
-                        fallback_std=label_norm[1],
+                if prev_stage == 0:
+                    prev_norms.append(identity_norm)
+                else:
+                    prev_key = stage_checkpoint_key(
+                        stage_cfg, dataset.cache_key, prev_stage
                     )
-                )
+                    prev_norms.append(
+                        load_stage_norm(
+                            ckpt_root / prev_key,
+                            require_current_version=True,
+                        )
+                    )
 
-            # Per-stage residual target affine (saved for denorm-at-sum).
-            # Reuse sidecar if present so resume/skip keeps training-time stats.
-            norm_path = stage_dir / STAGE_NORM_FILENAME
-            if norm_path.exists():
-                active_norm = load_stage_norm(stage_dir)
-                print(
-                    f"  loaded stage norm from {norm_path.name}: "
-                    f"mean={active_norm[0].tolist()} std={active_norm[1].tolist()}"
-                )
-            else:
-                active_norm = compute_stage_target_stats(
-                    stage=stage,
-                    dataset=dataset,
-                    prev_models=prev_models,
-                    prev_norms=prev_norms,
-                    label_norm=label_norm,
-                    config=stage_cfg,
-                    device=device,
-                )
+            # Active target affine (logic txt):
+            #   model_0 → identity (fits y as-is)
+            #   model_i (i>=1) → (mean_{i-1}, std_{i-1}) = stats of e_{i-1}
+            # Reuse current-version sidecar; else recompute + save under model_i/.
+            if stage == 0:
+                active_norm = identity_norm
                 save_stage_norm(
                     stage_dir,
                     stage=stage,
@@ -1258,6 +1316,50 @@ def run_error_ensemble_train(
                     label_mean=label_norm[0],
                     label_std=label_norm[1],
                 )
+            else:
+                reuse_norm = False
+                norm_path = stage_dir / STAGE_NORM_FILENAME
+                if norm_path.exists():
+                    try:
+                        with open(norm_path, 'r', encoding='utf-8') as f:
+                            _meta = json.load(f)
+                        reuse_norm = (
+                            int(_meta.get('version', 1) or 1) >= STAGE_NORM_VERSION
+                        )
+                    except Exception:
+                        reuse_norm = False
+                if reuse_norm:
+                    active_norm = load_stage_norm(
+                        stage_dir, require_current_version=True
+                    )
+                    print(
+                        f"  loaded stage norm from {norm_path.name}: "
+                        f"mean={active_norm[0].tolist()} "
+                        f"std={active_norm[1].tolist()}"
+                    )
+                else:
+                    if norm_path.exists():
+                        print(
+                            f"  recomputing stage norm "
+                            f"(need v{STAGE_NORM_VERSION} y-space sidecar)"
+                        )
+                    active_norm = compute_stage_target_stats(
+                        stage=stage,
+                        dataset=dataset,
+                        prev_models=prev_models,
+                        prev_norms=prev_norms,
+                        label_norm=label_norm,
+                        config=stage_cfg,
+                        device=device,
+                    )
+                    save_stage_norm(
+                        stage_dir,
+                        stage=stage,
+                        target_mean=active_norm[0],
+                        target_std=active_norm[1],
+                        label_mean=label_norm[0],
+                        label_std=label_norm[1],
+                    )
 
             wrapper = ResidualStageWrapper(
                 active,
