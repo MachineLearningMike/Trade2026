@@ -17,7 +17,7 @@ import json
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional
 
 import matplotlib
 
@@ -36,17 +36,6 @@ from trainer import (
 )
 
 
-# Source paths committed together with a report (message == report-name).
-_COMMIT_PATHS: Sequence[str] = (
-    "modules/Ver_2026_08_20/error_ensemble.py",
-    "modules/Ver_2026_08_20/error_ensemble_report.py",
-    "modules/Ver_2026_08_20/TRAIN.py",
-    "modules/Ver_2026_08_20/train_run.py",
-    "modules/Ver_2026_08_20/trainer.py",
-    "modules/Ver_2026_08_20/config.py",
-)
-
-
 def _run_git(args: List[str], *, cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", *args],
@@ -58,17 +47,13 @@ def _run_git(args: List[str], *, cwd: Path) -> subprocess.CompletedProcess:
     )
 
 
-def commit_code_with_report_name(
-    report_name: str,
-    *,
-    paths: Optional[Sequence[str]] = None,
-) -> Optional[str]:
+def commit_code_with_report_name(report_name: str) -> Optional[str]:
     """
-    ``git commit`` current ErrorEnsemble-related sources with message
-    identical to ``report_name`` (the ``_save/<report_name>/`` folder).
+    ``git commit`` **all** current working-tree changes with message identical
+    to ``report_name`` (the ``_save/<report_name>/`` folder).
 
-    Returns the short commit hash, or None if there was nothing to commit.
-    Does not push. Skips if the working tree has no changes in ``paths``.
+    Uses ``git add -A`` (honors ``.gitignore``). Returns the short commit hash,
+    or None if there was nothing to commit. Does not push.
     """
     root = project_root_dir()
     name = str(report_name).strip()
@@ -77,17 +62,12 @@ def commit_code_with_report_name(
     if any(c in name for c in ("\n", "\r", '"')):
         raise ValueError(f"refusing unsafe commit message: {name!r}")
 
-    rel_paths = list(paths) if paths is not None else list(_COMMIT_PATHS)
-    existing = [p for p in rel_paths if (root / p).exists()]
-    if not existing:
-        print("⚠ No source paths found to commit.")
-        return None
-
-    # Stage only the listed sources (report artifacts under _save/ stay out).
-    add = _run_git(["add", "--", *existing], cwd=root)
+    # Stage every change in the repo (tracked mods/deletes + untracked),
+    # excluding paths ignored by .gitignore.
+    add = _run_git(["add", "-A"], cwd=root)
     if add.returncode != 0:
         raise RuntimeError(
-            f"git add failed: {(add.stderr or add.stdout).strip()}"
+            f"git add -A failed: {(add.stderr or add.stdout).strip()}"
         )
 
     staged = _run_git(["diff", "--cached", "--name-only"], cwd=root)
@@ -100,7 +80,7 @@ def commit_code_with_report_name(
         print(f"✓ Git: nothing to commit for report-name {name!r}")
         return None
 
-    # Match prior repo style: plain -m message (report-name == commit text).
+    # Commit text == report-name.
     commit = _run_git(["commit", "-m", name], cwd=root)
     if commit.returncode != 0:
         raise RuntimeError(
@@ -109,7 +89,7 @@ def commit_code_with_report_name(
 
     head = _run_git(["rev-parse", "--short", "HEAD"], cwd=root)
     sha = (head.stdout or "").strip() or None
-    print(f"✓ Git commit {sha}: {name}")
+    print(f"✓ Git commit {sha}: {name}  ({len(staged_files)} path(s))")
     for p in staged_files:
         print(f"    {p}")
     return sha
@@ -237,8 +217,8 @@ def _plot_ensemble_vs_stage(
             markersize=8,
             label="Val loss(en_k, y)",
         )
-    ax.set_xlabel("Ensemble en_k = model_0 + ... + model_k")
-    ax.set_ylabel("Label loss")
+    ax.set_xlabel("Ensemble en_k = sum denorm_i(model_i), i=0..k")
+    ax.set_ylabel("Label loss (raw / denormalized space)")
     ax.set_title("Compare ensembles en_0 .. en_m")
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -285,8 +265,8 @@ def _plot_ensemble_vs_stage(
             alpha=0.85,
             label="Val residual L1",
         )
-    ax.set_xlabel("Ensemble en_k = model_0 + ... + model_k")
-    ax.set_ylabel("Remaining residual y - en_k")
+    ax.set_xlabel("Ensemble en_k = sum denorm_i(model_i), i=0..k")
+    ax.set_ylabel("Remaining residual y_raw - en_k")
     ax.set_title("Residual after each ensemble en_k")
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -318,13 +298,15 @@ def _evaluate_loaded_ensemble(
     )
 
     device = torch.device(cfg["device"] if cfg.get("device") else "cpu")
-    models, keys_loaded, stages_loaded = load_error_ensemble_stages(
-        cfg,
-        dataset,
-        n=len(stage_keys),
-        stage_keys=stage_keys,
-        device=device,
-        require_finished=require_finished,
+    models, keys_loaded, stages_loaded, stage_norms, label_norm = (
+        load_error_ensemble_stages(
+            cfg,
+            dataset,
+            n=len(stage_keys),
+            stage_keys=stage_keys,
+            device=device,
+            require_finished=require_finished,
+        )
     )
     if not models:
         return {
@@ -351,7 +333,7 @@ def _evaluate_loaded_ensemble(
     bs_val = int(cfg.get("validate_batch_size", bs_train))
 
     print(
-        f"Evaluating cumulative ensemble on {len(models)} stage(s): "
+        f"Evaluating en_k = sum denorm_i(model_i) on {len(models)} stage(s): "
         f"{', '.join(f'model_{s}' for s in stages_loaded)}"
     )
 
@@ -364,11 +346,23 @@ def _evaluate_loaded_ensemble(
 
     print("  train split...")
     train_metrics = evaluate_ensemble_over_stages(
-        models, loss_fn, train_loader, device=device, max_batches=max_batches
+        models,
+        loss_fn,
+        train_loader,
+        stage_norms=stage_norms,
+        label_norm=label_norm,
+        device=device,
+        max_batches=max_batches,
     )
     print("  val split...")
     val_metrics = evaluate_ensemble_over_stages(
-        models, loss_fn, val_loader, device=device, max_batches=max_batches
+        models,
+        loss_fn,
+        val_loader,
+        stage_norms=stage_norms,
+        label_norm=label_norm,
+        device=device,
+        max_batches=max_batches,
     )
 
     return {
@@ -592,14 +586,14 @@ def build_report(
         "## Compare ensembles en_0 .. en_m",
         "",
         "After training `model_0 .. model_m`, the report scores these ensembles",
-        "on train/val with the label loss:",
+        "in **denormalized** label space (each stage uses its saved mean/std):",
         "",
-        "- `en_0 = model_0`",
-        "- `en_1 = model_0 + model_1`",
-        "- `en_k = sum_{i=0..k} model_i`",
+        "- `en_0 = denorm_0(model_0)`",
+        "- `en_1 = denorm_0(model_0) + denorm_1(model_1)`",
+        "- `en_k = sum_{i=0..k} denorm_i(model_i)`",
         "",
-        "This compares **ensemble** predictions against `y`, not each stage's",
-        "residual-training loss.",
+        "This compares **ensemble** predictions against raw `y`, not each",
+        "stage's residual-training loss.",
         "",
     ]
     ens = summary.get("ensemble_over_stages") or {}
@@ -723,16 +717,22 @@ def build_report(
     return report_dir
 
 
+def default_report_name(now: Optional[datetime] = None) -> str:
+    """Timestamp used when ``--report-name`` is omitted: ``YYYYMMDD_HHMMSS``."""
+    when = now if now is not None else datetime.now()
+    return when.strftime("%Y%m%d_%H%M%S")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Build ErrorEnsemble training + ensemble-over-stages report"
     )
     parser.add_argument(
         "--report-name",
-        required=True,
+        default=None,
         help=(
-            "Folder name under <project_root>/_save/. "
-            "Also used as the git commit message (unless --no-commit)."
+            "Folder name under <project_root>/_save/, and git commit message "
+            "(unless --no-commit). If omitted, uses local time YYYYMMDD_HHMMSS."
         ),
     )
     parser.add_argument(
@@ -761,11 +761,17 @@ def main():
     parser.add_argument(
         "--no-commit",
         action="store_true",
-        help="Do not git-commit sources (default commits with message=report-name)",
+        help=(
+            "Do not git-commit (default: git add -A and commit all current "
+            "changes with message=report-name)"
+        ),
     )
     args = parser.parse_args()
+    report_name = args.report_name or default_report_name()
+    if args.report_name is None:
+        print(f"report-name omitted → using {report_name}")
     build_report(
-        args.report_name,
+        report_name,
         stage_keys=args.stage_keys,
         eval_ensemble=not args.skip_eval,
         max_eval_batches=args.max_eval_batches,
