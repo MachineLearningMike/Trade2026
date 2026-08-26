@@ -123,8 +123,12 @@ def main(config):
     )
     parser.add_argument(
         '--clean', action='store_true',
-        help='Delete checkpoints for the current checkpoint key only '
-             '(other key folders under checkpoint_dir are preserved)',
+        help=(
+            'Delete checkpoints for the current run identity, then train fresh. '
+            'Single-model: one checkpoint key. '
+            'With --error-ensemble: all stage keys model_0..model_{n-1}. '
+            'Other key folders under checkpoint_dir are preserved.'
+        ),
     )
     parser.add_argument(
         '--extend', type=float, default=None,
@@ -274,7 +278,8 @@ def main(config):
             'Train ErrorEnsemble residual stages sequentially: '
             'model_0 fits y; model_i fits e_{i-1}=e_{i-2}-y_{i-1} '
             '(e_{-1}:=y). One checkpoint key per stage. '
-            'Uses current telepred_delay / label / model_type=regression.'
+            'Uses current telepred_delay / label / model_type=regression. '
+            'Pair with --clean to wipe all stage keys and start over.'
         ),
     )
     parser.add_argument(
@@ -1098,19 +1103,30 @@ def main(config):
     # ============================================================
     # STEP 3: Handle --clean flag
     # ============================================================
-    # Only remove this config's key folder. Sibling checkpoint keys stay intact.
+    # Only remove this config's key folder(s). Sibling checkpoint keys stay intact.
     checkpoint_dir = Path(config['checkpoint_dir'])
     if config['clean']:
-        # Match ResumableTrainer key (signature + synced output_dim).
-        dataset_signature, current_key, key_dir = resolve_checkpoint_identity(config)
-        if key_dir.exists():
-            shutil.rmtree(key_dir)
-            print(f"✓ Cleaned checkpoints for key: {current_key}")
-            print(f"  Removed: {key_dir}")
-            print(f"  Other keys under {checkpoint_dir}/ were left untouched.\n")
+        if getattr(args, 'error_ensemble', False):
+            # Stage keys include error_ensemble_stage; the bare (non-stage) key
+            # from resolve_checkpoint_identity does NOT match those folders.
+            from error_ensemble import clean_error_ensemble_checkpoints
+            clean_error_ensemble_checkpoints(
+                config, n=int(config.get('error_ensemble_n', 3))
+            )
+            # Force a fresh start even if a stub dir is recreated later.
+            config['resume'] = False
         else:
-            print(f"✓ No checkpoints to clean for key: {current_key}")
-            print(f"  Looked in: {key_dir}\n")
+            # Match ResumableTrainer key (signature + synced output_dim).
+            dataset_signature, current_key, key_dir = resolve_checkpoint_identity(config)
+            if key_dir.exists():
+                shutil.rmtree(key_dir)
+                print(f"✓ Cleaned checkpoints for key: {current_key}")
+                print(f"  Removed: {key_dir}")
+                print(f"  Other keys under {checkpoint_dir}/ were left untouched.\n")
+            else:
+                print(f"✓ No checkpoints to clean for key: {current_key}")
+                print(f"  Looked in: {key_dir}\n")
+            config['resume'] = False
 
     # ============================================================
     # STEP : Handle --features flag (visualize total_features only, no training)
@@ -1323,13 +1339,14 @@ def main(config):
 
     if getattr(args, 'error_ensemble', False):
         from error_ensemble import run_error_ensemble_train
+        # --clean already wiped stage folders and set resume=False.
         outcome = run_error_ensemble_train(
             config,
             dataset,
             total_features,
             n=int(config.get('error_ensemble_n', 3)),
             num_epochs=float(config['epochs']),
-            resume=config.get('resume', True),
+            resume=False if config.get('clean') else config.get('resume', True),
             extend=(args.extend is not None and args.extend != 0),
             extend_epochs=args.extend if args.extend is not None else 0.0,
             probe_weights=True,

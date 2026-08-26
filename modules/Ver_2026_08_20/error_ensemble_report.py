@@ -1,20 +1,23 @@
 # error_ensemble_report.py
-# Build a training report for a finished ErrorEnsemble run.
+# Build a training report for a finished (or partial) ErrorEnsemble run.
 # Usage:
 #   python error_ensemble_report.py --report-name TIME_STRING
 # Writes <project_root>/_save/<TIME_STRING>/ with:
 #   - summary.json / summary.md
 #   - training_history.png (all stages overlay) + per-stage history
 #   - model_i/validation_eXXX.png (+ _p0_30.png)  [same as TRAIN --report]
+#   - ensemble_performance_vs_stage.png  (compare en_0..en_m on train/val)
+#   - ensemble_residual_vs_stage.png
+# where en_k = model_0 + ... + model_k
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
+import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import matplotlib
 
@@ -22,7 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from config import get_config, project_root_dir
-from labels import sync_output_dim
+from labels import bind_label_loss, sync_output_dim
 from data import generate_dataset_signature
 from trainer import (
     LatestEpochLoss,
@@ -31,6 +34,85 @@ from trainer import (
     generate_checkpoint_key,
     list_validation_loss_epochs,
 )
+
+
+# Source paths committed together with a report (message == report-name).
+_COMMIT_PATHS: Sequence[str] = (
+    "modules/Ver_2026_08_20/error_ensemble.py",
+    "modules/Ver_2026_08_20/error_ensemble_report.py",
+    "modules/Ver_2026_08_20/TRAIN.py",
+    "modules/Ver_2026_08_20/train_run.py",
+    "modules/Ver_2026_08_20/trainer.py",
+    "modules/Ver_2026_08_20/config.py",
+)
+
+
+def _run_git(args: List[str], *, cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def commit_code_with_report_name(
+    report_name: str,
+    *,
+    paths: Optional[Sequence[str]] = None,
+) -> Optional[str]:
+    """
+    ``git commit`` current ErrorEnsemble-related sources with message
+    identical to ``report_name`` (the ``_save/<report_name>/`` folder).
+
+    Returns the short commit hash, or None if there was nothing to commit.
+    Does not push. Skips if the working tree has no changes in ``paths``.
+    """
+    root = project_root_dir()
+    name = str(report_name).strip()
+    if not name:
+        raise ValueError("report_name must be non-empty for git commit message")
+    if any(c in name for c in ("\n", "\r", '"')):
+        raise ValueError(f"refusing unsafe commit message: {name!r}")
+
+    rel_paths = list(paths) if paths is not None else list(_COMMIT_PATHS)
+    existing = [p for p in rel_paths if (root / p).exists()]
+    if not existing:
+        print("⚠ No source paths found to commit.")
+        return None
+
+    # Stage only the listed sources (report artifacts under _save/ stay out).
+    add = _run_git(["add", "--", *existing], cwd=root)
+    if add.returncode != 0:
+        raise RuntimeError(
+            f"git add failed: {(add.stderr or add.stdout).strip()}"
+        )
+
+    staged = _run_git(["diff", "--cached", "--name-only"], cwd=root)
+    staged_files = [
+        line.strip()
+        for line in (staged.stdout or "").splitlines()
+        if line.strip()
+    ]
+    if not staged_files:
+        print(f"✓ Git: nothing to commit for report-name {name!r}")
+        return None
+
+    # Match prior repo style: plain -m message (report-name == commit text).
+    commit = _run_git(["commit", "-m", name], cwd=root)
+    if commit.returncode != 0:
+        raise RuntimeError(
+            f"git commit failed: {(commit.stderr or commit.stdout).strip()}"
+        )
+
+    head = _run_git(["rev-parse", "--short", "HEAD"], cwd=root)
+    sha = (head.stdout or "").strip() or None
+    print(f"✓ Git commit {sha}: {name}")
+    for p in staged_files:
+        print(f"    {p}")
+    return sha
 
 
 def _export_validation_epoch_plots(source_dir: Path, report_dir: Path) -> dict:
@@ -102,7 +184,213 @@ def _load_history(ckpt_dir: Path) -> Optional[TrainingHistory]:
     return th
 
 
-def build_report(report_name: str, stage_keys: Optional[List[str]] = None) -> Path:
+def _plot_ensemble_vs_stage(
+    train_metrics: Optional[List[dict]],
+    val_metrics: Optional[List[dict]],
+    report_dir: Path,
+) -> Dict[str, Optional[str]]:
+    """
+    Write plots that compare en_0, en_1, ..., en_m.
+
+    en_k = model_0 + ... + model_k
+    """
+    artifacts: Dict[str, Optional[str]] = {
+        "ensemble_performance_vs_stage": None,
+        "ensemble_residual_vs_stage": None,
+    }
+    if not train_metrics and not val_metrics:
+        return artifacts
+
+    def _ks(rows):
+        return [int(r.get("k", int(r["n_stages"]) - 1)) for r in rows]
+
+    def _ys(rows, key):
+        return [float(r[key]) for r in rows]
+
+    def _tick_labels(ks):
+        return [f"en_{k}" for k in ks]
+
+    ks_all = []
+    if train_metrics:
+        ks_all.extend(_ks(train_metrics))
+    if val_metrics:
+        ks_all.extend(_ks(val_metrics))
+    ks_sorted = sorted(set(ks_all))
+
+    # Loss: compare en_0 .. en_m
+    fig, ax = plt.subplots(figsize=(10, 6))
+    if train_metrics:
+        ax.plot(
+            _ks(train_metrics),
+            _ys(train_metrics, "loss"),
+            "o-",
+            linewidth=2,
+            markersize=8,
+            label="Train loss(en_k, y)",
+        )
+    if val_metrics:
+        ax.plot(
+            _ks(val_metrics),
+            _ys(val_metrics, "loss"),
+            "s--",
+            linewidth=2,
+            markersize=8,
+            label="Val loss(en_k, y)",
+        )
+    ax.set_xlabel("Ensemble en_k = model_0 + ... + model_k")
+    ax.set_ylabel("Label loss")
+    ax.set_title("Compare ensembles en_0 .. en_m")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    if ks_sorted:
+        ax.set_xticks(ks_sorted)
+        ax.set_xticklabels(_tick_labels(ks_sorted))
+    fig.tight_layout()
+    loss_path = report_dir / "ensemble_performance_vs_stage.png"
+    fig.savefig(loss_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    artifacts["ensemble_performance_vs_stage"] = loss_path.name
+
+    # Residual after each en_k
+    fig, ax = plt.subplots(figsize=(10, 6))
+    if train_metrics:
+        ax.plot(
+            _ks(train_metrics),
+            _ys(train_metrics, "residual_mse"),
+            "o-",
+            linewidth=2,
+            label="Train residual MSE",
+        )
+        ax.plot(
+            _ks(train_metrics),
+            _ys(train_metrics, "residual_l1"),
+            "o:",
+            linewidth=1.5,
+            alpha=0.85,
+            label="Train residual L1",
+        )
+    if val_metrics:
+        ax.plot(
+            _ks(val_metrics),
+            _ys(val_metrics, "residual_mse"),
+            "s--",
+            linewidth=2,
+            label="Val residual MSE",
+        )
+        ax.plot(
+            _ks(val_metrics),
+            _ys(val_metrics, "residual_l1"),
+            "s:",
+            linewidth=1.5,
+            alpha=0.85,
+            label="Val residual L1",
+        )
+    ax.set_xlabel("Ensemble en_k = model_0 + ... + model_k")
+    ax.set_ylabel("Remaining residual y - en_k")
+    ax.set_title("Residual after each ensemble en_k")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    if ks_sorted:
+        ax.set_xticks(ks_sorted)
+        ax.set_xticklabels(_tick_labels(ks_sorted))
+    fig.tight_layout()
+    resid_path = report_dir / "ensemble_residual_vs_stage.png"
+    fig.savefig(resid_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    artifacts["ensemble_residual_vs_stage"] = resid_path.name
+    return artifacts
+
+
+def _evaluate_loaded_ensemble(
+    cfg: dict,
+    dataset,
+    stage_keys: List[str],
+    *,
+    max_batches: Optional[int] = None,
+    require_finished: bool = False,
+) -> Dict:
+    """Load stage prefix and score cumulative ensemble on train + val."""
+    import torch
+    from data import ThreadedDataLoader
+    from error_ensemble import (
+        evaluate_ensemble_over_stages,
+        load_error_ensemble_stages,
+    )
+
+    device = torch.device(cfg["device"] if cfg.get("device") else "cpu")
+    models, keys_loaded, stages_loaded = load_error_ensemble_stages(
+        cfg,
+        dataset,
+        n=len(stage_keys),
+        stage_keys=stage_keys,
+        device=device,
+        require_finished=require_finished,
+    )
+    if not models:
+        return {
+            "n_loaded": 0,
+            "keys_loaded": [],
+            "stages_loaded": [],
+            "train": [],
+            "val": [],
+            "error": "no stage checkpoints with loadable weights",
+        }
+
+    loss_fn = bind_label_loss(
+        getattr(dataset, "label_mode", cfg.get("label", "yield")),
+        cfg,
+        yield_target=getattr(dataset, "yield_target", cfg.get("yield_target", "both")),
+        latent_distribution=getattr(
+            dataset,
+            "latent_distribution",
+            cfg.get("latent_distribution", "normal"),
+        ),
+    )
+
+    bs_train = int(cfg.get("batch_size", 32))
+    bs_val = int(cfg.get("validate_batch_size", bs_train))
+
+    print(
+        f"Evaluating cumulative ensemble on {len(models)} stage(s): "
+        f"{', '.join(f'model_{s}' for s in stages_loaded)}"
+    )
+
+    train_loader = ThreadedDataLoader(
+        dataset.train_dataset, batch_size=bs_train, shuffle=False
+    )
+    val_loader = ThreadedDataLoader(
+        dataset.val_dataset, batch_size=bs_val, shuffle=False
+    )
+
+    print("  train split...")
+    train_metrics = evaluate_ensemble_over_stages(
+        models, loss_fn, train_loader, device=device, max_batches=max_batches
+    )
+    print("  val split...")
+    val_metrics = evaluate_ensemble_over_stages(
+        models, loss_fn, val_loader, device=device, max_batches=max_batches
+    )
+
+    return {
+        "n_loaded": len(models),
+        "keys_loaded": keys_loaded,
+        "stages_loaded": stages_loaded,
+        "train": train_metrics,
+        "val": val_metrics,
+    }
+
+
+def build_report(
+    report_name: str,
+    stage_keys: Optional[List[str]] = None,
+    *,
+    eval_ensemble: bool = True,
+    max_eval_batches: Optional[int] = None,
+    require_finished: bool = False,
+    dataset=None,
+    total_features=None,
+    git_commit: bool = True,
+) -> Path:
     cfg = get_config()
     sync_output_dim(cfg)
     n = int(cfg.get("error_ensemble_n", 3) or 3)
@@ -131,9 +419,10 @@ def build_report(report_name: str, stage_keys: Optional[List[str]] = None) -> Pa
         "telepred_delay": cfg.get("telepred_delay"),
         "epochs_planned": cfg.get("epochs"),
         "stages": [],
+        "ensemble_over_stages": None,
     }
 
-    # Combined train/val history overlay
+    # Combined train/val history overlay (per-stage training curves)
     fig, ax = plt.subplots(figsize=(12, 6))
     any_hist = False
 
@@ -177,7 +466,6 @@ def build_report(report_name: str, stage_keys: Optional[List[str]] = None) -> Pa
             vals = [v for v in th.val_losses if v is not None]
             stage_info["final_val_loss"] = vals[-1] if vals else None
             hist_path = stage_dir / "training_history.png"
-            # TrainingHistory.plot always calls plt.show(); Agg makes it a no-op.
             th.plot(save_path=str(hist_path))
             plt.close("all")
             ax.plot(
@@ -200,7 +488,6 @@ def build_report(report_name: str, stage_keys: Optional[List[str]] = None) -> Pa
                     label=f"model_{stage} val",
                 )
 
-        # Partial / interrupted runs: save latest-epoch minibatch curve.
         le = LatestEpochLoss.load(ckpt_dir)
         if le is not None and le.batch_losses:
             stage_info["latest_epoch"] = {
@@ -216,19 +503,19 @@ def build_report(report_name: str, stage_keys: Optional[List[str]] = None) -> Pa
             else:
                 plt.close("all")
 
-        # Same artifacts as TRAIN --report
         stats = _export_validation_epoch_plots(ckpt_dir, stage_dir)
         stage_info["validation_export"] = stats
         summary["stages"].append(stage_info)
         print(
             f"model_{stage} key={key}: history_epochs={stage_info['history_epochs']} "
-            f"val_plots={stats['n_full']}+{stats['n_slice']} finished={stage_info['training_finished']}"
+            f"val_plots={stats['n_full']}+{stats['n_slice']} "
+            f"finished={stage_info['training_finished']}"
         )
 
     if any_hist:
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Loss")
-        ax.set_title("ErrorEnsemble — Training vs Validation Loss")
+        ax.set_title("Per-stage training history (each model fits its residual target)")
         ax.grid(True, alpha=0.3)
         ax.legend()
         fig.tight_layout()
@@ -238,15 +525,62 @@ def build_report(report_name: str, stage_keys: Optional[List[str]] = None) -> Pa
     else:
         plt.close(fig)
 
+    # ------------------------------------------------------------------
+    # Cumulative ensemble performance vs number of stages
+    # ------------------------------------------------------------------
+    ensemble_artifacts = {
+        "ensemble_performance_vs_stage": None,
+        "ensemble_residual_vs_stage": None,
+    }
+    if eval_ensemble:
+        try:
+            if dataset is None:
+                from dataset_build import get_dataset
+
+                print("Loading dataset for ensemble-over-stages evaluation...")
+                dataset, total_features = get_dataset(cfg)
+            ens = _evaluate_loaded_ensemble(
+                cfg,
+                dataset,
+                stage_keys,
+                max_batches=max_eval_batches,
+                require_finished=require_finished,
+            )
+            summary["ensemble_over_stages"] = ens
+            ensemble_artifacts = _plot_ensemble_vs_stage(
+                ens.get("train") or [],
+                ens.get("val") or [],
+                report_dir,
+            )
+            if ens.get("train") or ens.get("val"):
+                print("Compare ensembles en_k = sum_{i=0..k} model_i:")
+                for split in ("train", "val"):
+                    rows = ens.get(split) or []
+                    for r in rows:
+                        name = r.get("ensemble", f"en_{r.get('k', '?')}")
+                        print(
+                            f"  {split} {name}: "
+                            f"loss={r['loss']:.6f}  "
+                            f"resid_mse={r['residual_mse']:.6f}  "
+                            f"resid_l1={r['residual_l1']:.6f}  "
+                            f"[{r.get('definition', '')}]"
+                        )
+        except Exception as exc:
+            summary["ensemble_over_stages"] = {
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            print(f"⚠ Ensemble-over-stages eval failed: {exc}")
+
     # summary.json
     with open(report_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, default=str)
 
     # summary.md
     n_finished = sum(1 for s in summary["stages"] if s.get("training_finished"))
+    summary["stages_finished"] = n_finished
     lines = [
-        f"# ErrorEnsemble training report",
-        f"",
+        "# ErrorEnsemble training report",
+        "",
         f"- Report: `{report_name}`",
         f"- Created: {summary['created_at']}",
         f"- Dataset signature: `{sig}`",
@@ -254,11 +588,83 @@ def build_report(report_name: str, stage_keys: Optional[List[str]] = None) -> Pa
         f"- TelePred delay: {summary['telepred_delay']}",
         f"- Stages: {n} (finished: {n_finished}/{n})",
         f"- Planned epochs/stage: {summary['epochs_planned']}",
-        f"",
-        f"## Stages",
-        f"",
+        "",
+        "## Compare ensembles en_0 .. en_m",
+        "",
+        "After training `model_0 .. model_m`, the report scores these ensembles",
+        "on train/val with the label loss:",
+        "",
+        "- `en_0 = model_0`",
+        "- `en_1 = model_0 + model_1`",
+        "- `en_k = sum_{i=0..k} model_i`",
+        "",
+        "This compares **ensemble** predictions against `y`, not each stage's",
+        "residual-training loss.",
+        "",
     ]
-    summary["stages_finished"] = n_finished
+    ens = summary.get("ensemble_over_stages") or {}
+    if ens.get("error") and not ens.get("train") and not ens.get("val"):
+        lines.append(f"- Eval error: {ens['error']}")
+        lines.append("")
+    elif ens.get("train") or ens.get("val"):
+        lines.append(
+            f"- Loaded models: {ens.get('stages_loaded')} "
+            f"(keys: {ens.get('keys_loaded')})"
+        )
+        lines.append("")
+        lines.append(
+            "| ensemble | definition | train loss | val loss | "
+            "train resid MSE | val resid MSE |"
+        )
+        lines.append(
+            "|----------|------------|------------|----------|"
+            "-----------------|---------------|"
+        )
+
+        def _row_key(r: dict) -> int:
+            if "k" in r:
+                return int(r["k"])
+            return int(r["n_stages"]) - 1
+
+        train_by_k = {_row_key(r): r for r in (ens.get("train") or [])}
+        val_by_k = {_row_key(r): r for r in (ens.get("val") or [])}
+        ks = sorted(set(train_by_k) | set(val_by_k))
+        for k in ks:
+            tr = train_by_k.get(k) or {}
+            va = val_by_k.get(k) or {}
+            name = tr.get("ensemble") or va.get("ensemble") or f"en_{k}"
+            definition = (
+                tr.get("definition")
+                or va.get("definition")
+                or " + ".join(f"model_{i}" for i in range(k + 1))
+            )
+            lines.append(
+                f"| `{name}` | `{definition}` | "
+                f"{tr.get('loss', float('nan')):.6f} | "
+                f"{va.get('loss', float('nan')):.6f} | "
+                f"{tr.get('residual_mse', float('nan')):.6f} | "
+                f"{va.get('residual_mse', float('nan')):.6f} |"
+            )
+        lines.append("")
+        if ensemble_artifacts.get("ensemble_performance_vs_stage"):
+            lines.append(
+                f"- Plot: `{ensemble_artifacts['ensemble_performance_vs_stage']}`"
+            )
+        if ensemble_artifacts.get("ensemble_residual_vs_stage"):
+            lines.append(
+                f"- Residual plot: `{ensemble_artifacts['ensemble_residual_vs_stage']}`"
+            )
+        lines.append("")
+    else:
+        lines.append("- No ensemble comparison (no loadable models, or eval skipped).")
+        lines.append("")
+
+    lines.extend(
+        [
+            "## Per-stage training",
+            "",
+        ]
+    )
     for s in summary["stages"]:
         lines.append(f"### model_{s['stage']} (`{s['checkpoint_key']}`)")
         lines.append(f"- Finished: {s.get('training_finished')}")
@@ -281,25 +687,53 @@ def build_report(report_name: str, stage_keys: Optional[List[str]] = None) -> Pa
         if s.get("error"):
             lines.append(f"- Error: {s['error']}")
         lines.append("")
-    lines.append("## Artifacts")
-    lines.append("- `training_history.png` — overlay of all stages (if any epoch finished)")
-    lines.append("- `model_i/training_history.png` — per-stage train vs val")
-    lines.append("- `model_i/latest_epoch_loss.png` — partial/interrupted epoch minibatch curve")
-    lines.append("- `model_i/validation_eXXX.png` — full val batch curves (`--report`)")
-    lines.append("- `model_i/validation_eXXX_p0_30.png` — [0%, 30%] slice (`--report`)")
+
+    lines.extend(
+        [
+            "## Artifacts",
+            "- `ensemble_performance_vs_stage.png` - compare loss(en_k, y) for en_0..en_m",
+            "- `ensemble_residual_vs_stage.png` - residual y-en_k for en_0..en_m",
+            "- `training_history.png` - overlay of per-stage train/val curves",
+            "- `model_i/training_history.png` - per-stage train vs val",
+            "- `model_i/latest_epoch_loss.png` - partial/interrupted epoch curve",
+            "- `model_i/validation_eXXX.png` - full val batch curves (`--report`)",
+            "- `model_i/validation_eXXX_p0_30.png` - [0%, 30%] slice (`--report`)",
+        ]
+    )
     with open(report_dir / "summary.md", "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
     print(f"Report written → {report_dir}")
+
+    # Commit message is identical to the report folder name.
+    if git_commit:
+        try:
+            sha = commit_code_with_report_name(report_name)
+            summary["git_commit"] = sha
+            summary["git_commit_message"] = report_name if sha else None
+            with open(report_dir / "summary.json", "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2, default=str)
+            if sha:
+                # Append commit line to summary.md for traceability.
+                with open(report_dir / "summary.md", "a", encoding="utf-8") as f:
+                    f.write(f"\n## Git\n\n- Commit: `{sha}`\n- Message: `{report_name}`\n")
+        except Exception as exc:
+            print(f"⚠ Git commit skipped/failed: {exc}")
+
     return report_dir
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Build ErrorEnsemble training + ensemble-over-stages report"
+    )
     parser.add_argument(
         "--report-name",
         required=True,
-        help="Folder name under <project_root>/_save/",
+        help=(
+            "Folder name under <project_root>/_save/. "
+            "Also used as the git commit message (unless --no-commit)."
+        ),
     )
     parser.add_argument(
         "--stage-keys",
@@ -307,8 +741,37 @@ def main():
         default=None,
         help="Optional explicit checkpoint keys (model_0 .. model_n-1)",
     )
+    parser.add_argument(
+        "--skip-eval",
+        action="store_true",
+        help="Skip cumulative ensemble train/val evaluation (plots/checkpoints only)",
+    )
+    parser.add_argument(
+        "--max-eval-batches",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Optional cap on train/val batches for a quicker ensemble eval",
+    )
+    parser.add_argument(
+        "--require-finished",
+        action="store_true",
+        help="Only include stages with training_finished=true in ensemble eval",
+    )
+    parser.add_argument(
+        "--no-commit",
+        action="store_true",
+        help="Do not git-commit sources (default commits with message=report-name)",
+    )
     args = parser.parse_args()
-    build_report(args.report_name, stage_keys=args.stage_keys)
+    build_report(
+        args.report_name,
+        stage_keys=args.stage_keys,
+        eval_ensemble=not args.skip_eval,
+        max_eval_batches=args.max_eval_batches,
+        require_finished=args.require_finished,
+        git_commit=not args.no_commit,
+    )
 
 
 if __name__ == "__main__":

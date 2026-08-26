@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -319,6 +319,70 @@ def stage_checkpoint_key(config: dict, dataset_signature: str, stage: int) -> st
     return generate_checkpoint_key(cfg, dataset_signature)
 
 
+def error_ensemble_stage_keys(
+    config: dict,
+    *,
+    n: Optional[int] = None,
+    dataset_signature: Optional[str] = None,
+) -> List[str]:
+    """Checkpoint keys for ``model_0 .. model_{n-1}`` under the current config."""
+    from data import generate_dataset_signature
+    from labels import sync_output_dim
+
+    cfg = dict(config)
+    sync_output_dim(cfg)
+    n_models = int(n if n is not None else cfg.get('error_ensemble_n', 3) or 3)
+    if n_models < 1:
+        raise ValueError(f"error_ensemble_n must be >= 1, got {n_models}")
+    sig = (
+        dataset_signature
+        if dataset_signature is not None
+        else generate_dataset_signature(cfg)
+    )
+    return [stage_checkpoint_key(cfg, sig, stage) for stage in range(n_models)]
+
+
+def clean_error_ensemble_checkpoints(
+    config: dict,
+    *,
+    n: Optional[int] = None,
+) -> List[str]:
+    """
+    Delete all ErrorEnsemble stage checkpoint folders for this config.
+
+    Returns the list of removed checkpoint keys.
+    """
+    import shutil
+    from pathlib import Path
+
+    from config import project_root_dir
+
+    cfg = dict(config)
+    n_models = int(n if n is not None else cfg.get('error_ensemble_n', 3) or 3)
+    keys = error_ensemble_stage_keys(cfg, n=n_models)
+    ckpt_root = Path(cfg.get('checkpoint_dir', 'trading_checkpoints'))
+    if not ckpt_root.is_absolute():
+        ckpt_root = project_root_dir() / ckpt_root
+
+    removed: List[str] = []
+    print("\n" + "=" * 60)
+    print("ERROR ENSEMBLE CLEAN")
+    print("=" * 60)
+    print(f"  stages: {n_models}")
+    print(f"  checkpoint_dir: {ckpt_root}")
+    for stage, key in enumerate(keys):
+        key_dir = ckpt_root / key
+        if key_dir.exists():
+            shutil.rmtree(key_dir)
+            removed.append(key)
+            print(f"  ✓ removed model_{stage} key={key}")
+            print(f"      {key_dir}")
+        else:
+            print(f"  · no folder for model_{stage} key={key}")
+    print("=" * 60 + "\n")
+    return removed
+
+
 def _load_stage_weights(
     model: nn.Module,
     config: dict,
@@ -344,6 +408,217 @@ def _load_stage_weights(
     for p in model.parameters():
         p.requires_grad = False
     return model
+
+
+@torch.no_grad()
+def evaluate_ensemble_over_stages(
+    models: Sequence[nn.Module],
+    loss_fn: LossFn,
+    loader,
+    *,
+    device: Optional[torch.device] = None,
+    max_batches: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Compare the nested ensembles built from trained error-models.
+
+    Given ``model_0 .. model_m`` (m+1 models), form m+1 ensembles:
+
+      en_0 = model_0
+      en_1 = model_0 + model_1
+      en_k = sum_{i=0..k} model_i
+
+    For each ``en_k``, report mean ``loss_fn(x, en_k(x), y)``, residual MSE,
+    and residual L1 over ``loader`` batches ``(x, p, mean, std, shape, y)``.
+    """
+    stage_models = list(models)
+    if not stage_models:
+        return []
+
+    if device is None:
+        device = next(stage_models[0].parameters()).device
+
+    for m in stage_models:
+        m.eval()
+        m.to(device)
+
+    n = len(stage_models)  # models 0..n-1 → ensembles en_0..en_{n-1}
+    sum_loss = [0.0] * n
+    sum_mse = [0.0] * n
+    sum_l1 = [0.0] * n
+    n_examples = 0
+    n_batches = 0
+
+    def _iter_batches():
+        # ThreadedDataLoader: start_epoch + get_next_batch (no __iter__).
+        if hasattr(loader, 'start_epoch') and hasattr(loader, 'get_next_batch'):
+            loader.start_epoch(0)
+            while True:
+                batch, _wait, _load = loader.get_next_batch()
+                if batch is None:
+                    break
+                yield batch
+            return
+        # Plain iterable of batches.
+        for batch in loader:
+            yield batch
+
+    for batch in _iter_batches():
+        if max_batches is not None and n_batches >= int(max_batches):
+            break
+        if not isinstance(batch, (tuple, list)) or len(batch) < 6:
+            raise ValueError(
+                "evaluate_ensemble_over_stages expects batches "
+                "(x, p, mean, std, shape, y)"
+            )
+        x, p, mean, std, shape, y = batch[:6]
+        x = x.to(device)
+        p = p.to(device)
+        mean = mean.to(device)
+        std = std.to(device)
+        shape = shape.to(device)
+        y = y.to(device)
+
+        stage_preds: List[torch.Tensor] = []
+        for m in stage_models:
+            stage_preds.append(head_prediction(m(x, p, mean, std, shape)))
+
+        # en_k = sum_{i=0..k} model_i
+        total = None
+        bsz = int(y.shape[0])
+        for k, pred in enumerate(stage_preds):
+            total = pred if total is None else total + pred
+            loss_k = loss_fn(x, total, y)
+            resid = y - total
+            sum_loss[k] += float(loss_k.item()) * bsz
+            sum_mse[k] += float(resid.pow(2).mean().item()) * bsz
+            sum_l1[k] += float(resid.abs().mean().item()) * bsz
+
+        n_examples += bsz
+        n_batches += 1
+
+    if n_examples <= 0:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for k in range(n):
+        members = [f'model_{i}' for i in range(k + 1)]
+        out.append(
+            {
+                'k': k,
+                'ensemble': f'en_{k}',
+                'definition': ' + '.join(members),
+                'members': members,
+                'n_models': k + 1,
+                # Aliases kept for older report readers.
+                'n_stages': k + 1,
+                'last_model': f'model_{k}',
+                'loss': sum_loss[k] / n_examples,
+                'residual_mse': sum_mse[k] / n_examples,
+                'residual_l1': sum_l1[k] / n_examples,
+                'n_examples': n_examples,
+                'n_batches': n_batches,
+            }
+        )
+    return out
+
+
+def load_error_ensemble_stages(
+    config: dict,
+    dataset,
+    *,
+    n: Optional[int] = None,
+    stage_keys: Optional[Sequence[str]] = None,
+    device: Optional[torch.device] = None,
+    require_finished: bool = False,
+) -> Tuple[List[nn.Module], List[str], List[int]]:
+    """
+    Load consecutive ErrorEnsemble stage weights starting from model_0.
+
+    Stops at the first missing checkpoint (cumulative prefix only).
+    Returns ``(models, keys_loaded, stage_indices)``.
+    """
+    import json
+    from pathlib import Path
+
+    from config import project_root_dir
+    from labels import resolve_model_past_len, sync_output_dim
+    from model_vae import build_market_model, resolve_max_seq_len
+    from telepred import resolve_past_window
+    from INFER import find_checkpoint_by_key
+
+    cfg = dict(config)
+    sync_output_dim(cfg)
+    n_models = int(n if n is not None else cfg.get('error_ensemble_n', 3) or 3)
+    if stage_keys is None:
+        keys = error_ensemble_stage_keys(cfg, n=n_models)
+    else:
+        keys = list(stage_keys)
+
+    if device is None:
+        device = torch.device(cfg['device'] if cfg.get('device') else 'cpu')
+    else:
+        device = torch.device(device)
+
+    past_window = int(resolve_past_window(cfg))
+    F = int(getattr(dataset, 'F', dataset.n_market_features + dataset.n_macro_features))
+    n_features_after_latent = dataset.n_market_features + cfg['n_latent_macros']
+    cfg['embed_dim'] = n_features_after_latent * cfg['patch_size']
+    cfg['max_seq_len'] = resolve_max_seq_len(cfg, past_window)
+    cfg['output_dim'] = int(getattr(dataset, 'output_dim', cfg.get('output_dim', 2)))
+    model_past_len = int(
+        getattr(dataset, 'model_past_len', resolve_model_past_len(cfg))
+    )
+
+    ckpt_root = Path(cfg.get('checkpoint_dir', 'trading_checkpoints'))
+    if not ckpt_root.is_absolute():
+        ckpt_root = project_root_dir() / ckpt_root
+
+    models: List[nn.Module] = []
+    keys_loaded: List[str] = []
+    stages_loaded: List[int] = []
+
+    for stage, key in enumerate(keys[:n_models]):
+        key_dir = ckpt_root / key
+        if not key_dir.exists():
+            break
+        if require_finished:
+            state_file = key_dir / 'training_state.json'
+            finished = False
+            if state_file.exists():
+                try:
+                    with open(state_file, 'r', encoding='utf-8') as f:
+                        finished = bool(json.load(f).get('training_finished'))
+                except Exception:
+                    finished = False
+            if not finished:
+                break
+
+        found = find_checkpoint_by_key(str(ckpt_root), key=key)
+        if found is None:
+            break
+        path, _ = found
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        max_seq_len = ckpt.get('max_seq_len', cfg['max_seq_len'])
+        model = build_market_model(
+            cfg,
+            in_features=F,
+            n_market_features=dataset.n_market_features,
+            n_macro_features=dataset.n_macro_features,
+            n_max_past_horizon=model_past_len,
+            max_seq_len=int(max_seq_len),
+        )
+        state = ckpt.get('model_state_dict', ckpt.get('model', ckpt))
+        model.load_state_dict(state)
+        model.to(device)
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad = False
+        models.append(model)
+        keys_loaded.append(key)
+        stages_loaded.append(stage)
+
+    return models, keys_loaded, stages_loaded
 
 
 def run_error_ensemble_train(
