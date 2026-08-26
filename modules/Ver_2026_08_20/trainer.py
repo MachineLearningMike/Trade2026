@@ -54,6 +54,11 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
     if model_type == 'vae':
         key_params['vae_latent_dim'] = config.get('vae_latent_dim', 64)
 
+    # Residual ErrorEnsemble stage (0-based). Omit when unset so ordinary
+    # single-model runs keep stable keys.
+    if config.get('error_ensemble_stage') is not None:
+        key_params['error_ensemble_stage'] = int(config['error_ensemble_stage'])
+
     param_string = json.dumps(key_params, sort_keys=True, default=str)
     # Uniform 8-hex ids across data caches and checkpoints.
     return hashlib.md5(param_string.encode()).hexdigest()[:8]

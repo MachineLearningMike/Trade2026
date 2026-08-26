@@ -29,12 +29,17 @@ def train_one_run(
     probe_weights: bool = True,
     show_banner: bool = True,
     suppress_history_plot: bool = False,
+    model=None,
+    loss_fn=None,
 ) -> Dict[str, Any]:
     """
     Build model + trainer and run ResumableTrainer.train for one config.
 
     ``config['telepred_delay']`` must already match ``dataset`` construction.
     Returns metrics and checkpoint_key for logging / ensemble orchestration.
+
+    Optional ``model`` / ``loss_fn`` let callers (e.g. ErrorEnsemble stages)
+    inject a wrapped module and residual loss without rebuilding.
     """
     cfg = config
     from telepred import resolve_past_window
@@ -59,11 +64,17 @@ def train_one_run(
 
     _model_type = str(cfg.get('model_type', 'regression')).lower()
     delay = int(cfg.get('telepred_delay', 0) or 0)
+    _err_stage = cfg.get('error_ensemble_stage', None)
 
     if show_banner:
         print(f"\nData shapes:")
         print(f"  Input x: (F={F}, past_window={past_window})")
         print(f"  TelePred delay d: {delay}")
+        if _err_stage is not None:
+            print(
+                f"  ErrorEnsemble stage: {int(_err_stage)} / "
+                f"n={int(cfg.get('error_ensemble_n', 0) or 0)}"
+            )
         print(f"  Label mode: {getattr(dataset, 'label_mode', cfg.get('label'))}")
         print(f"  Model type: {_model_type}")
         _od = cfg['output_dim']
@@ -85,14 +96,15 @@ def train_one_run(
     _model_past_len = int(
         getattr(dataset, 'model_past_len', resolve_model_past_len(cfg))
     )
-    model = build_market_model(
-        cfg,
-        in_features=F,
-        n_market_features=dataset.n_market_features,
-        n_macro_features=dataset.n_macro_features,
-        n_max_past_horizon=_model_past_len,
-        max_seq_len=cfg['max_seq_len'],
-    )
+    if model is None:
+        model = build_market_model(
+            cfg,
+            in_features=F,
+            n_market_features=dataset.n_market_features,
+            n_macro_features=dataset.n_macro_features,
+            n_max_past_horizon=_model_past_len,
+            max_seq_len=cfg['max_seq_len'],
+        )
     _model_name = type(model).__name__
     if show_banner:
         report_model_size(model, name=_model_name)
@@ -102,15 +114,20 @@ def train_one_run(
     )
     model = model.to(_probe_device)
 
-    base_loss_fn = bind_label_loss(
-        dataset.label_mode,
-        cfg,
-        yield_target=getattr(dataset, 'yield_target', cfg.get('yield_target', 'both')),
-        latent_distribution=getattr(
-            dataset, 'latent_distribution', cfg.get('latent_distribution', 'normal')
-        ),
-    )
-    loss_fn = wrap_model_loss(model, base_loss_fn, cfg)
+    if loss_fn is None:
+        base_loss_fn = bind_label_loss(
+            dataset.label_mode,
+            cfg,
+            yield_target=getattr(
+                dataset, 'yield_target', cfg.get('yield_target', 'both')
+            ),
+            latent_distribution=getattr(
+                dataset,
+                'latent_distribution',
+                cfg.get('latent_distribution', 'normal'),
+            ),
+        )
+        loss_fn = wrap_model_loss(model, base_loss_fn, cfg)
 
     if probe_weights:
         _probe_T = (past_window // cfg['patch_size']) * cfg['patch_size']
@@ -135,7 +152,11 @@ def train_one_run(
     val_loader = ThreadedDataLoader(
         dataset.val_dataset, batch_size=cfg['validate_batch_size'], shuffle=False
     )
-    optimizer = optim.Adam(model.parameters(), lr=cfg['learning_rate'])
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.Adam(
+        trainable if trainable else model.parameters(),
+        lr=cfg['learning_rate'],
+    )
 
     ckpt_key = generate_checkpoint_key(cfg, dataset.cache_key)
     trainer = ResumableTrainer(

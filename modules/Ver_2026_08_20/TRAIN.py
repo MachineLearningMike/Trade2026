@@ -19,6 +19,95 @@ from train_run import train_one_run
 __all__ = ['main', 'get_dataset', 'project_root_dir']
 
 
+def _resolve_report_dir(report_name: str, *, flag: str = '--report'):
+    """
+    Validate a folder *name* and return ``<project_root>/_save/<name>``.
+
+    Returns ``(report_dir, error_message)``. On success ``error_message`` is None.
+    """
+    name = str(report_name).strip()
+    if not name:
+        return None, (
+            f"⚠ {flag} requires a non-empty directory name, "
+            f"e.g. {flag} 'my run'."
+        )
+    if name in ('.', '..') or '/' in name or '\\' in name:
+        return None, (
+            f"⚠ {flag} takes a directory name only (no path separators). "
+            f"Example: {flag} 'dir name'  →  <project_root>/_save/dir name/"
+        )
+    project_root = project_root_dir()
+    report_dir = (project_root / '_save' / name).resolve()
+    save_root = (project_root / '_save').resolve()
+    if save_root not in report_dir.parents and report_dir != save_root:
+        return None, f"⚠ Refusing to write outside {save_root}: {report_dir}"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    return report_dir, None
+
+
+def _export_validation_epoch_plots(source_dir: Path, report_dir: Path) -> dict:
+    """
+    Write full + p0_30 validation curves for every epoch under ``source_dir``.
+
+    Same artifacts as ``--report`` / ``--ensemble-report`` member folders.
+    """
+    from trainer import ValidationEpochLoss, list_validation_loss_epochs
+
+    report_dir = Path(report_dir)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    epochs = list_validation_loss_epochs(source_dir)
+    if not epochs:
+        return {
+            'epochs': [],
+            'n_full': 0,
+            'n_slice': 0,
+            'n_missing': 0,
+            'max_epoch': 0,
+        }
+
+    max_epoch = max(epochs)
+    epoch_width = max(3, len(str(max_epoch)))
+    n_full = 0
+    n_slice = 0
+    n_missing = 0
+    for e in range(1, max_epoch + 1):
+        ve = ValidationEpochLoss.load(source_dir, e)
+        if ve is None or not ve.batch_losses:
+            print(f"⚠ Skipping epoch {e}: no validation loss curve")
+            n_missing += 1
+            continue
+
+        e_tag = f'{e:0{epoch_width}d}'
+        full_path = report_dir / f'validation_e{e_tag}.png'
+        fig = ve.plot(
+            save_path=str(full_path),
+            percent_lo=0.0,
+            percent_hi=100.0,
+            show=False,
+        )
+        if fig is not None:
+            n_full += 1
+
+        slice_path = report_dir / f'validation_e{e_tag}_p0_30.png'
+        fig30 = ve.plot(
+            save_path=str(slice_path),
+            percent_lo=0.0,
+            percent_hi=30.0,
+            show=False,
+        )
+        if fig30 is not None:
+            n_slice += 1
+
+    return {
+        'epochs': epochs,
+        'n_full': n_full,
+        'n_slice': n_slice,
+        'n_missing': n_missing,
+        'max_epoch': max_epoch,
+        'epoch_width': epoch_width,
+    }
+
+
 def main(config):
     """Main training function."""
     
@@ -86,6 +175,16 @@ def main(config):
             "validation_e001.png (= --validation e) and "
             "validation_e001_p0_30.png (= --validation e 30), "
             "with zero-padded epoch ids for alphabetical order. "
+            "No interactive plots."
+        ),
+    )
+    parser.add_argument(
+        '--ensemble-report', type=str, default=None, metavar='DIR_NAME',
+        help=(
+            "Like --report, but for every TelePred delay trained by --ensemble. "
+            "Canonical form: --ensemble-report 'folder name'. "
+            "Writes <project_root>/_save/<folder name>/d<delay>/validation_eXXX.png "
+            "(and _p0_30.png) for each delay in config/--telepred-delays. "
             "No interactive plots."
         ),
     )
@@ -167,6 +266,23 @@ def main(config):
         help=(
             'Hyperparameter scout: outer patch_size×num_layers; '
             'each trial trains the full TelePred delay bank'
+        ),
+    )
+    parser.add_argument(
+        '--error-ensemble', action='store_true', default=False,
+        help=(
+            'Train ErrorEnsemble residual stages sequentially: '
+            'model_0 fits y; model_i fits e_{i-1}=e_{i-2}-y_{i-1} '
+            '(e_{-1}:=y). One checkpoint key per stage. '
+            'Uses current telepred_delay / label / model_type=regression.'
+        ),
+    )
+    parser.add_argument(
+        '--error-ensemble-n', type=int, default=None, metavar='N',
+        help=(
+            'Number of ErrorEnsemble stages/models (model_0..model_{N-1}). '
+            f"Default: config error_ensemble_n "
+            f"({int(config.get('error_ensemble_n', 3))})."
         ),
     )
     parser.add_argument(
@@ -356,6 +472,12 @@ def main(config):
     else:
         config['telepred_delays'] = parse_delay_list(
             config.get('telepred_delays', [config['telepred_delay']])
+        )
+    if getattr(args, 'error_ensemble_n', None) is not None:
+        config['error_ensemble_n'] = max(1, int(args.error_ensemble_n))
+    else:
+        config['error_ensemble_n'] = max(
+            1, int(config.get('error_ensemble_n', 3) or 3)
         )
 
     if args.no_normalize_window:
@@ -814,42 +936,22 @@ def main(config):
         print("📑 VALIDATION REPORT EXPORT MODE")
         print("=" * 60)
 
-        # Canonical: --report 'dir name'  (a folder *name*, not a path)
-        report_name = str(args.report).strip()
-        if not report_name:
-            print("⚠ --report requires a non-empty directory name, e.g. --report 'my run'.")
+        report_dir, err = _resolve_report_dir(args.report, flag='--report')
+        if err:
+            print(err)
             return
-        if report_name in ('.', '..') or '/' in report_name or '\\' in report_name:
-            print(
-                "⚠ --report takes a directory name only (no path separators). "
-                "Example: --report 'dir name'  →  <project_root>/_save/dir name/"
-            )
-            return
-
-        project_root = project_root_dir()
-        report_dir = (project_root / '_save' / report_name).resolve()
-        # Stay inside <project_root>/_save even if report_name is odd.
-        save_root = (project_root / '_save').resolve()
-        if save_root not in report_dir.parents and report_dir != save_root:
-            print(f"⚠ Refusing to write outside {save_root}: {report_dir}")
-            return
-        report_dir.mkdir(parents=True, exist_ok=True)
 
         checkpoint_dir = Path(config['checkpoint_dir'])
         if not checkpoint_dir.exists():
             print(f"⚠ Checkpoint directory not found: {checkpoint_dir}")
             return
 
-        from trainer import (
-            ValidationEpochLoss,
-            list_validation_loss_epochs,
-            validation_loss_path,
-        )
+        from trainer import list_validation_loss_epochs, validation_loss_path
 
         dataset_signature, current_key, current_dir = resolve_checkpoint_identity(config)
         print(f"🔑 Dataset signature: {dataset_signature}")
         print(f"🔑 Checkpoint key:    {current_key}")
-        print(f"📁 Project root:      {project_root}")
+        print(f"📁 Project root:      {project_root_dir()}")
         print(f"📁 Report dir:        {report_dir}")
 
         def _list_report_runs():
@@ -868,7 +970,6 @@ def main(config):
         # Prefer exact config match; else newest run that has validation curves
         # (same fallback policy as --validation).
         source_dir = None
-        epochs = []
         source_label = ''
         if current_dir.exists():
             epochs = list_validation_loss_epochs(current_dir)
@@ -894,59 +995,104 @@ def main(config):
                     "validation_loss_epoch_<E>.json"
                 )
                 return
-            source_dir, epochs, _ = runs[0]
+            source_dir, _epochs, _ = runs[0]
             source_label = 'fallback: newest with val curves'
             print(f"   Falling back to: {source_dir.name}")
             print("   Tip: train under the current key, or match config to that run.")
 
         print(f"📁 Source checkpoints: {source_dir} ({source_label})")
-
-        max_epoch = max(epochs)
-        # At least 3 digits (e001); widen for max_epoch >= 1000 so sort stays
-        # alphabetical (e0001 … e1000).
-        epoch_width = max(3, len(str(max_epoch)))
-        e_example = f'e{1:0{epoch_width}d}'
-        print(f"🎯 Epochs:            1..{max_epoch} "
-              f"(saved: {', '.join(str(e) for e in epochs)}; "
-              f"files like {e_example}.png)")
-
-        n_full = 0
-        n_slice = 0
-        n_missing = 0
-        for e in range(1, max_epoch + 1):
-            ve = ValidationEpochLoss.load(source_dir, e)
-            if ve is None or not ve.batch_losses:
-                print(f"⚠ Skipping epoch {e}: no validation loss curve")
-                n_missing += 1
-                continue
-
-            e_tag = f'{e:0{epoch_width}d}'
-            full_path = report_dir / f'validation_e{e_tag}.png'
-            fig = ve.plot(
-                save_path=str(full_path),
-                percent_lo=0.0,
-                percent_hi=100.0,
-                show=False,
+        stats = _export_validation_epoch_plots(source_dir, report_dir)
+        if stats['max_epoch'] > 0:
+            e_example = f"e{1:0{stats['epoch_width']}d}"
+            print(
+                f"🎯 Epochs:            1..{stats['max_epoch']} "
+                f"(saved: {', '.join(str(e) for e in stats['epochs'])}; "
+                f"files like {e_example}.png)"
             )
-            if fig is not None:
-                n_full += 1
-
-            slice_path = report_dir / f'validation_e{e_tag}_p0_30.png'
-            fig30 = ve.plot(
-                save_path=str(slice_path),
-                percent_lo=0.0,
-                percent_hi=30.0,
-                show=False,
-            )
-            if fig30 is not None:
-                n_slice += 1
-
         print(
             f"\n✅ Report export completed: "
-            f"{n_full} full + {n_slice} p0_30 plots → {report_dir}"
+            f"{stats['n_full']} full + {stats['n_slice']} p0_30 plots → {report_dir}"
         )
-        if n_missing:
-            print(f"   Skipped {n_missing} missing epoch curve(s).")
+        if stats['n_missing']:
+            print(f"   Skipped {stats['n_missing']} missing epoch curve(s).")
+        return
+
+    # ============================================================
+    # STEP 2e: --ensemble-report 'folder name' (all --ensemble delays)
+    # ============================================================
+    if getattr(args, 'ensemble_report', None) is not None:
+        print("\n" + "=" * 60)
+        print("📑 ENSEMBLE VALIDATION REPORT EXPORT MODE")
+        print("=" * 60)
+
+        report_root, err = _resolve_report_dir(
+            args.ensemble_report, flag='--ensemble-report'
+        )
+        if err:
+            print(err)
+            return
+
+        delays = parse_delay_list(
+            config.get('telepred_delays', [config.get('telepred_delay', 0)])
+        )
+        checkpoint_dir = Path(config['checkpoint_dir'])
+        print(f"📁 Project root: {project_root_dir()}")
+        print(f"📁 Report root:  {report_root}")
+        print(f"🎯 Delays:       {list(delays)}")
+        if not checkpoint_dir.exists():
+            print(f"⚠ Checkpoint directory not found: {checkpoint_dir}")
+            return
+
+        from trainer import list_validation_loss_epochs
+
+        n_members_ok = 0
+        n_members_skip = 0
+        total_full = 0
+        total_slice = 0
+        for d in delays:
+            elem_cfg = dict(config)
+            elem_cfg['telepred_delay'] = int(d)
+            sig, key, key_dir = resolve_checkpoint_identity(elem_cfg)
+            member_dir = report_root / f'd{int(d)}'
+            print("\n" + "-" * 60)
+            print(f"ENSEMBLE REPORT d={d}")
+            print("-" * 60)
+            print(f"🔑 Dataset signature: {sig}")
+            print(f"🔑 Checkpoint key:    {key}")
+            print(f"📁 Member report dir: {member_dir}")
+
+            if not key_dir.exists():
+                print(f"⚠ No checkpoint folder: {key_dir}")
+                n_members_skip += 1
+                continue
+            epochs = list_validation_loss_epochs(key_dir)
+            if not epochs:
+                print(
+                    f"⚠ No validation_loss_epoch_*.json under {key_dir.name}/"
+                )
+                n_members_skip += 1
+                continue
+
+            stats = _export_validation_epoch_plots(key_dir, member_dir)
+            print(
+                f"✓ d={d}: {stats['n_full']} full + {stats['n_slice']} p0_30 "
+                f"(epochs saved: {', '.join(str(e) for e in stats['epochs'])})"
+            )
+            if stats['n_missing']:
+                print(f"   Skipped {stats['n_missing']} missing epoch curve(s).")
+            n_members_ok += 1
+            total_full += stats['n_full']
+            total_slice += stats['n_slice']
+
+        print("\n" + "=" * 60)
+        print(
+            f"✅ Ensemble report completed: {n_members_ok}/{len(delays)} "
+            f"members with curves; {total_full} full + {total_slice} p0_30 plots"
+        )
+        print(f"   → {report_root}")
+        if n_members_skip:
+            print(f"   Skipped {n_members_skip} member(s) without val history.")
+        print("=" * 60)
         return
 
     # ============================================================
@@ -1174,6 +1320,25 @@ def main(config):
 
     # Single-element path (and legacy --sweep on one delay's dataset)
     dataset, total_features = get_dataset(config)
+
+    if getattr(args, 'error_ensemble', False):
+        from error_ensemble import run_error_ensemble_train
+        outcome = run_error_ensemble_train(
+            config,
+            dataset,
+            total_features,
+            n=int(config.get('error_ensemble_n', 3)),
+            num_epochs=float(config['epochs']),
+            resume=config.get('resume', True),
+            extend=(args.extend is not None and args.extend != 0),
+            extend_epochs=args.extend if args.extend is not None else 0.0,
+            probe_weights=True,
+        )
+        print(
+            f"\n✅ ErrorEnsemble training completed: "
+            f"{outcome['n_ok']}/{outcome['n']} stages ok"
+        )
+        return
 
     if getattr(args, 'sweep', False) or getattr(args, 'vae_sweep', False):
         from vae_sweep import run_hparam_sweep

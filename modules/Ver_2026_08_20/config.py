@@ -65,6 +65,16 @@ config = {
     'telepred_delays': [0, 2, 5, 10],
     # Bump via telepred.DEFINITION_ID when slice math changes.
     'telepred_definition_id': 'telepred_v1',
+
+    # ============================================================
+    # ERROR ENSEMBLE (residual boosting; see error_ensemble.py)
+    # ============================================================
+    # model_0 fits y; model_i fits residual e_{i-1} = e_{i-2} - y_{i-1}
+    # (e_{-1} := y). Final ŷ = Σ y_i. Train with TRAIN.py --error-ensemble.
+    # Number of stages / models: model_0 .. model_{n-1}.
+    'error_ensemble_n': 3,
+    # Set at runtime per stage (0-based); included in checkpoint key.
+    # 'error_ensemble_stage': None,
     'num_features': 5,
     'num_shapes': 4,
     'total_synthetic_days': 30,
@@ -217,10 +227,10 @@ config = {
     # ============================================================
     # TRANSFORMER / VAE ENCODER CONFIGURATION
     # ============================================================
-    'patch_size': 20,   # 20, 10
+    'patch_size': 10,   # 20, 10
     'embed_dim': None,  # AUTO-COMPUTED
-    'num_layers': 6,    # 6, 2
-    'num_heads': 8,     # 8, 4
+    'num_layers': 3,    # 6, 2
+    'num_heads': 4,     # 8, 4
     'ff_dim_multiplier': 4,
     'dropout': 0.0,
     'causal': False,
@@ -243,9 +253,9 @@ config = {
     # ============================================================
     # TRAINING CONFIGURATION
     # ============================================================
-    'epochs': 1,
-    'batch_size': 24,
-    'learning_rate': 0.000_01, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
+    'epochs': 2,
+    'batch_size': 20,
+    'learning_rate': 0.000_1, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
     'save_every_n_minutes': 5,
     'checkpoint_dir': 'trading_checkpoints',
     # How many newest rolling weight files to keep (recency, not quality).
