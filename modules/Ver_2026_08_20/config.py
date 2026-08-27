@@ -49,7 +49,7 @@ config = {
     # DATA / TELEPRED WINDOWS (bars on binance_interval, usually 1m)
     # ============================================================
     # delta1: model input length X(t,d)
-    'past_window': 60 * 30,   # 24h of 1m bars (formerly past_hours=24)
+    'past_window': 60 * 48,   # 24h of 1m bars (formerly past_hours=24)
     # delta2: label future length p[t+1 : t+1+future_window]
     # Shared by yield, trend, and latent (TelePred delta2).
     'future_window': 40,
@@ -229,7 +229,7 @@ config = {
     # ============================================================
     'patch_size': 15,   # 20, 10
     'embed_dim': None,  # AUTO-COMPUTED
-    'num_layers': 5,    # 6, 2
+    'num_layers': 6,    # 6, 2
     'num_heads': 5,     # 8, 4
     'ff_dim_multiplier': 4,
     'dropout': 0.1,

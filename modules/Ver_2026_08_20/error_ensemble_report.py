@@ -369,6 +369,48 @@ def _evaluate_loaded_ensemble(
     }
 
 
+def _discover_stage_keys_from_sidecars(
+    ckpt_root: Path,
+    n: int,
+) -> Optional[List[str]]:
+    """
+    Find model_0.. prefix from error_stage_norm.json ``stage`` fields.
+
+    Used when config-derived checkpoint keys do not match an existing train run
+    (dataset signature / hparam drift).
+    """
+    from error_ensemble import STAGE_NORM_FILENAME, STAGE_NORM_VERSION
+
+    found: Dict[int, tuple] = {}  # stage -> (mtime, key)
+    if not ckpt_root.is_dir():
+        return None
+    for sub in ckpt_root.iterdir():
+        if not sub.is_dir():
+            continue
+        norm_path = sub / STAGE_NORM_FILENAME
+        if not norm_path.exists():
+            continue
+        try:
+            with open(norm_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            ver = int(data.get("version", 1) or 1)
+            stage = int(data.get("stage", -1))
+        except Exception:
+            continue
+        if ver < STAGE_NORM_VERSION or stage < 0 or stage >= n:
+            continue
+        mtime = norm_path.stat().st_mtime
+        prev = found.get(stage)
+        if prev is None or mtime >= prev[0]:
+            found[stage] = (mtime, sub.name)
+    keys: List[str] = []
+    for i in range(n):
+        if i not in found:
+            break
+        keys.append(found[i][1])
+    return keys or None
+
+
 def build_report(
     report_name: str,
     stage_keys: Optional[List[str]] = None,
@@ -380,20 +422,81 @@ def build_report(
     total_features=None,
     git_commit: bool = True,
 ) -> Path:
+    from error_ensemble import (
+        STAGE_RUN_CONFIG_FILENAME,
+        load_error_ensemble_run_config,
+        error_ensemble_stage_keys,
+    )
+
     cfg = get_config()
     sync_output_dim(cfg)
     n = int(cfg.get("error_ensemble_n", 3) or 3)
-    sig = generate_dataset_signature(cfg)
     ckpt_root = Path(cfg["checkpoint_dir"])
     if not ckpt_root.is_absolute():
         ckpt_root = project_root_dir() / ckpt_root
 
+    key_source = "cli"
     if stage_keys is None:
-        stage_keys = []
+        # First try config-derived keys (cheap, no dataset load).
+        prelim_sig = generate_dataset_signature(cfg)
+        prelim_keys = []
         for stage in range(n):
             c = dict(cfg)
             c["error_ensemble_stage"] = stage
-            stage_keys.append(generate_checkpoint_key(c, sig))
+            prelim_keys.append(generate_checkpoint_key(c, prelim_sig))
+        if all((ckpt_root / k).exists() for k in prelim_keys):
+            stage_keys = prelim_keys
+            key_source = "config+signature"
+        else:
+            discovered = _discover_stage_keys_from_sidecars(ckpt_root, n)
+            if discovered:
+                print(
+                    "⚠ Config-derived checkpoint keys not found on disk:\n"
+                    f"    {prelim_keys}\n"
+                    "  Falling back to ErrorEnsemble sidecars on disk:\n"
+                    f"    {discovered}"
+                )
+                stage_keys = discovered
+                key_source = "discovered_sidecars"
+            else:
+                stage_keys = prelim_keys
+                key_source = "config+signature_missing"
+                print(
+                    "⚠ No ErrorEnsemble checkpoint keys found.\n"
+                    f"  Looked for: {prelim_keys}\n"
+                    f"  under: {ckpt_root}"
+                )
+
+    # Restore train-time config from stage-0 snapshot when present so dataset
+    # windows / label / arch match the weights.
+    if stage_keys:
+        run_cfg = load_error_ensemble_run_config(ckpt_root / stage_keys[0])
+        if run_cfg:
+            print(
+                f"Restoring train config from "
+                f"{stage_keys[0]}/{STAGE_RUN_CONFIG_FILENAME}"
+            )
+            for k, v in run_cfg.items():
+                if v is not None and k != "error_ensemble_logic":
+                    cfg[k] = v
+            sync_output_dim(cfg)
+
+    # Prefer dataset.cache_key (same identity train_one_run uses) when available.
+    if dataset is None and (eval_ensemble or key_source.startswith("discovered")):
+        from dataset_build import get_dataset
+
+        print("Loading dataset for checkpoint-key identity + ensemble eval...")
+        dataset, total_features = get_dataset(cfg)
+
+    if dataset is not None and hasattr(dataset, "cache_key"):
+        sig = str(dataset.cache_key)
+    else:
+        sig = generate_dataset_signature(cfg)
+
+    # If we only had prelim config keys, recompute with dataset.cache_key.
+    if key_source == "config+signature" and dataset is not None:
+        stage_keys = error_ensemble_stage_keys(cfg, n=n, dataset_signature=sig)
+        key_source = "dataset.cache_key"
 
     report_dir = project_root_dir() / "_save" / report_name
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -407,9 +510,12 @@ def build_report(
         "model_type": cfg.get("model_type"),
         "telepred_delay": cfg.get("telepred_delay"),
         "epochs_planned": cfg.get("epochs"),
+        "stage_keys": list(stage_keys),
+        "stage_key_source": key_source,
         "stages": [],
         "ensemble_over_stages": None,
     }
+    print(f"Report stage keys ({key_source}): {stage_keys}")
 
     # Combined train/val history overlay (per-stage training curves)
     fig, ax = plt.subplots(figsize=(12, 6))

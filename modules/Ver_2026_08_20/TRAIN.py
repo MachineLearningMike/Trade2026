@@ -291,6 +291,15 @@ def main(config):
         ),
     )
     parser.add_argument(
+        '--error-ensemble-extend', type=int, default=None, metavar='N',
+        help=(
+            'Append N more ErrorEnsemble stages after the last finished stage '
+            'already on disk (model_0..model_{k-1} kept; train model_k..'
+            'model_{k+N-1}). Implies ErrorEnsemble training. '
+            'Cannot be combined with --clean.'
+        ),
+    )
+    parser.add_argument(
         '--validate', type=float, nargs='*', default=None, metavar='V',
         help=(
             'Run validation with the best checkpoint on a percent slice of '
@@ -484,6 +493,19 @@ def main(config):
         config['error_ensemble_n'] = max(
             1, int(config.get('error_ensemble_n', 3) or 3)
         )
+    if getattr(args, 'error_ensemble_extend', None) is not None:
+        if int(args.error_ensemble_extend) < 1:
+            raise SystemExit('⚠ --error-ensemble-extend N requires N >= 1')
+        if config.get('clean'):
+            raise SystemExit(
+                '⚠ --error-ensemble-extend cannot be combined with --clean '
+                '(extend keeps existing finished stages).'
+            )
+        # Extending implies ErrorEnsemble mode.
+        args.error_ensemble = True
+        config['error_ensemble_extend'] = int(args.error_ensemble_extend)
+    else:
+        config['error_ensemble_extend'] = None
 
     if args.no_normalize_window:
         config['normalize_window'] = False
@@ -1338,13 +1360,35 @@ def main(config):
     dataset, total_features = get_dataset(config)
 
     if getattr(args, 'error_ensemble', False):
-        from error_ensemble import run_error_ensemble_train
+        from error_ensemble import (
+            count_finished_error_ensemble_stages,
+            run_error_ensemble_train,
+        )
+        start_stage = 0
+        n_total = int(config.get('error_ensemble_n', 3))
+        add_n = config.get('error_ensemble_extend')
+        if add_n is not None:
+            n_done = count_finished_error_ensemble_stages(config, dataset)
+            if n_done <= 0:
+                raise SystemExit(
+                    '⚠ --error-ensemble-extend requires at least one finished '
+                    'stage (model_0) on disk. Train with --error-ensemble first.'
+                )
+            start_stage = n_done
+            n_total = n_done + int(add_n)
+            config['error_ensemble_n'] = n_total
+            print(
+                f"ErrorEnsemble extend: keeping model_0..model_{n_done - 1}; "
+                f"training model_{start_stage}..model_{n_total - 1} "
+                f"(+{int(add_n)} stages → n={n_total})"
+            )
         # --clean already wiped stage folders and set resume=False.
         outcome = run_error_ensemble_train(
             config,
             dataset,
             total_features,
-            n=int(config.get('error_ensemble_n', 3)),
+            n=n_total,
+            start_stage=start_stage,
             num_epochs=float(config['epochs']),
             resume=False if config.get('clean') else config.get('resume', True),
             extend=(args.extend is not None and args.extend != 0),
@@ -1353,7 +1397,8 @@ def main(config):
         )
         print(
             f"\n✅ ErrorEnsemble training completed: "
-            f"{outcome['n_ok']}/{outcome['n']} stages ok"
+            f"{outcome['n_ok']}/{outcome.get('n_attempted', outcome['n'])} "
+            f"new stages ok (total n={outcome['n']})"
         )
         return
 

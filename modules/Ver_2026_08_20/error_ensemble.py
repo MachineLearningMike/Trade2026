@@ -30,8 +30,22 @@ LossFn = Callable[[torch.Tensor, Any, torch.Tensor], torch.Tensor]
 
 # Sidecar next to each stage checkpoint key (mean/std of that stage's target).
 STAGE_NORM_FILENAME = 'error_stage_norm.json'
+STAGE_RUN_CONFIG_FILENAME = 'error_ensemble_config.json'
 # v2: residual stats / summing in y-normalized space (error_ensemble_logic.txt).
 STAGE_NORM_VERSION = 2
+
+# Config keys persisted so report/eval can rebuild matching dataset + model.
+_RUN_CONFIG_KEYS = (
+    'label', 'yield_target', 'model_type', 'latent_distribution',
+    'past_window', 'future_window', 'step', 'telepred_delay',
+    'patch_size', 'num_layers', 'num_heads', 'n_latent_macros',
+    'ff_dim_multiplier', 'head_hidden_dim_multiplier', 'dropout',
+    'causal', 'use_reconstruction', 'look_price', 'output_dim',
+    'num_shapes', 'normalize_window', 'train_ratio', 'val_ratio',
+    'error_ensemble_n', 'error_ensemble_stage',
+    'binance_start_date', 'binance_end_date', 'binance_symbols',
+    'prediction_target', 'min_yield_percent', 'device',
+)
 
 
 def head_prediction(output: Any) -> torch.Tensor:
@@ -69,6 +83,76 @@ def label_norm_from_dataset(dataset) -> Tuple[torch.Tensor, torch.Tensor]:
     std = torch.as_tensor(dataset._label_stat_std, dtype=torch.float32).reshape(-1)
     std = torch.where(std.abs() < 1e-8, torch.ones_like(std), std)
     return mean.detach().cpu(), std.detach().cpu()
+
+
+def save_error_ensemble_run_config(checkpoint_dir: Path, config: dict) -> Path:
+    """Persist train-time config next to a stage checkpoint (for report/eval)."""
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    path = checkpoint_dir / STAGE_RUN_CONFIG_FILENAME
+    payload = {k: config.get(k) for k in _RUN_CONFIG_KEYS}
+    payload['error_ensemble_logic'] = 'error_ensemble_logic.txt'
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2, default=str)
+    return path
+
+
+def load_error_ensemble_run_config(checkpoint_dir: Path) -> Optional[dict]:
+    path = Path(checkpoint_dir) / STAGE_RUN_CONFIG_FILENAME
+    if not path.exists():
+        return None
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def infer_arch_from_state_dict(
+    state_dict: dict,
+    config: dict,
+    *,
+    n_market_features: Optional[int] = None,
+) -> dict:
+    """
+    Override architecture fields in ``config`` from a checkpoint state_dict
+    so weights load even if the live config drifted.
+    """
+    cfg = dict(config)
+    w = state_dict.get('patch_embed.proj.weight')
+    if w is not None:
+        embed_dim = int(w.shape[0])
+        cfg['embed_dim'] = embed_dim
+        n_market = int(
+            n_market_features
+            if n_market_features is not None
+            else cfg.get('n_market_features', 0) or 0
+        )
+        n_after = n_market + int(cfg.get('n_latent_macros', 0) or 0)
+        if n_after > 0 and embed_dim % n_after == 0:
+            cfg['patch_size'] = embed_dim // n_after
+    layer_ids = sorted(
+        {
+            int(k.split('.')[2])
+            for k in state_dict
+            if k.startswith('transformer.layers.')
+            and k.endswith('.linear1.weight')
+        }
+    )
+    if layer_ids:
+        cfg['num_layers'] = max(layer_ids) + 1
+    for key in (
+        'prediction_head.fc2.weight',
+        'prediction_head.net.4.weight',
+        'head.fc2.weight',
+    ):
+        if key in state_dict:
+            cfg['output_dim'] = int(state_dict[key].shape[0])
+            break
+    fc1 = state_dict.get('prediction_head.fc1.weight')
+    if fc1 is not None and cfg.get('embed_dim'):
+        n_stat = 1 + 1 + int(cfg.get('num_shapes', 4))
+        base = n_stat * int(cfg['embed_dim'])
+        in_dim = int(fc1.shape[1])
+        cfg['look_price'] = in_dim > base
+    return cfg
 
 
 def save_stage_norm(
@@ -635,9 +719,59 @@ def _load_stage_weights(
     return model
 
 
-def _iter_loader_batches(loader, max_batches: Optional[int] = None):
+def _loader_total_batches(loader, max_batches: Optional[int] = None) -> Optional[int]:
+    """Best-effort total batch count for progress logs."""
+    total = None
+    if hasattr(loader, 'get_total_batches_in_epoch'):
+        try:
+            total = int(loader.get_total_batches_in_epoch())
+        except Exception:
+            total = None
+    if total is None and hasattr(loader, 'dataset') and hasattr(loader, 'batch_size'):
+        try:
+            import math
+            n = len(loader.dataset)
+            bs = max(1, int(loader.batch_size))
+            total = max(1, int(math.ceil(n / bs)))
+        except Exception:
+            total = None
+    if total is not None and max_batches is not None:
+        total = min(total, int(max_batches))
+    return total
+
+
+def _iter_loader_batches(
+    loader,
+    max_batches: Optional[int] = None,
+    *,
+    progress_label: Optional[str] = None,
+    progress_every: int = 50,
+):
     """Yield batches from ThreadedDataLoader or a plain iterable."""
     n_batches = 0
+    total = _loader_total_batches(loader, max_batches)
+    if progress_label:
+        if total is not None:
+            print(f"    {progress_label}: 0/{total} batches", flush=True)
+        else:
+            print(f"    {progress_label}: starting...", flush=True)
+
+    def _maybe_progress():
+        if not progress_label:
+            return
+        if progress_every > 0 and (
+            n_batches == 1
+            or n_batches % int(progress_every) == 0
+            or (total is not None and n_batches >= total)
+        ):
+            if total is not None:
+                print(
+                    f"    {progress_label}: {n_batches}/{total} batches",
+                    flush=True,
+                )
+            else:
+                print(f"    {progress_label}: {n_batches} batches", flush=True)
+
     if hasattr(loader, 'start_epoch') and hasattr(loader, 'get_next_batch'):
         loader.start_epoch(0)
         while True:
@@ -648,12 +782,18 @@ def _iter_loader_batches(loader, max_batches: Optional[int] = None):
                 break
             yield batch
             n_batches += 1
+            _maybe_progress()
+        if progress_label:
+            print(f"    {progress_label}: done ({n_batches} batches)", flush=True)
         return
     for batch in loader:
         if max_batches is not None and n_batches >= int(max_batches):
             break
         yield batch
         n_batches += 1
+        _maybe_progress()
+    if progress_label:
+        print(f"    {progress_label}: done ({n_batches} batches)", flush=True)
 
 
 def _release_model(model: Optional[nn.Module]) -> None:
@@ -715,16 +855,40 @@ def load_one_error_stage(
         raise FileNotFoundError(f"stage {stage}: no weights under key {key}")
     path, _ = found
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    state = ckpt.get('model_state_dict', ckpt.get('model', ckpt))
+
+    # Prefer train-time snapshot if present; always reconcile shapes from weights.
+    run_cfg = load_error_ensemble_run_config(key_dir)
+    if run_cfg:
+        for k, v in run_cfg.items():
+            if k in _RUN_CONFIG_KEYS and v is not None:
+                cfg[k] = v
+    cfg = infer_arch_from_state_dict(
+        state,
+        cfg,
+        n_market_features=int(dataset.n_market_features),
+    )
+    if ckpt.get('embed_dim') is not None:
+        cfg['embed_dim'] = int(ckpt['embed_dim'])
+    if ckpt.get('max_seq_len') is not None:
+        cfg['max_seq_len'] = int(ckpt['max_seq_len'])
 
     past_window = int(resolve_past_window(cfg))
     F = int(getattr(dataset, 'F', dataset.n_market_features + dataset.n_macro_features))
-    n_features_after_latent = dataset.n_market_features + cfg['n_latent_macros']
-    cfg['embed_dim'] = n_features_after_latent * cfg['patch_size']
-    cfg['max_seq_len'] = int(ckpt.get('max_seq_len') or resolve_max_seq_len(cfg, past_window))
-    cfg['output_dim'] = int(getattr(dataset, 'output_dim', cfg.get('output_dim', 2)))
+    n_features_after_latent = dataset.n_market_features + int(cfg['n_latent_macros'])
+    if not cfg.get('embed_dim'):
+        cfg['embed_dim'] = n_features_after_latent * int(cfg['patch_size'])
+    if not cfg.get('max_seq_len'):
+        cfg['max_seq_len'] = resolve_max_seq_len(cfg, past_window)
     model_past_len = int(
-        getattr(dataset, 'model_past_len', resolve_model_past_len(cfg))
+        getattr(dataset, 'model_past_len', None)
+        or resolve_model_past_len(cfg)
     )
+    # Head was trained with this past length; prefer ckpt-implied look_price path.
+    if bool(cfg.get('look_price', False)):
+        # n_max_past_horizon equals model_past_len used at train time.
+        # If run config has future_window, model_past_len often equals it for yield.
+        pass
 
     model = build_market_model(
         cfg,
@@ -732,9 +896,8 @@ def load_one_error_stage(
         n_market_features=dataset.n_market_features,
         n_macro_features=dataset.n_macro_features,
         n_max_past_horizon=model_past_len,
-        max_seq_len=cfg['max_seq_len'],
+        max_seq_len=int(cfg['max_seq_len']),
     )
-    state = ckpt.get('model_state_dict', ckpt.get('model', ckpt))
     model.load_state_dict(state)
     model.to(device)
     model.eval()
@@ -835,9 +998,15 @@ def evaluate_ensemble_over_stages(
         return []
 
     # Pass over D once with no model: collect y (normalized) on CPU.
+    print("  collecting y(D) labels...", flush=True)
     y_chunks: List[torch.Tensor] = []
     n_batches = 0
-    for batch in _iter_loader_batches(loader, max_batches=max_batches):
+    for batch in _iter_loader_batches(
+        loader,
+        max_batches=max_batches,
+        progress_label="collect y(D)",
+        progress_every=100,
+    ):
         if not isinstance(batch, (tuple, list)) or len(batch) < 6:
             raise ValueError(
                 "evaluate_ensemble_over_stages expects batches "
@@ -850,21 +1019,32 @@ def evaluate_ensemble_over_stages(
         return []
     y_all = torch.cat(y_chunks, dim=0)
     n_examples = int(y_all.shape[0])
+    print(f"  y(D) ready: {n_examples} examples / {n_batches} batches", flush=True)
 
     running: Optional[torch.Tensor] = None  # CPU, y-normalized space
     out: List[Dict[str, Any]] = []
 
     for stage, key in available:
         # Wholesale: model_i(D) as a whole pass, then add into en (y-space).
-        print(f"  wholesale model_{stage}(D)  key={key}")
+        print(f"  wholesale model_{stage}(D)  key={key}", flush=True)
         model = None
         try:
             model, _key, stage_norm = load_one_error_stage(
                 config, dataset, stage=stage, key=key, device=device
             )
             s_mean, s_std = stage_norm
+            print(
+                f"    model_{stage} loaded; running full forward over D "
+                f"(this can take a long time on the train split)...",
+                flush=True,
+            )
             contrib_chunks: List[torch.Tensor] = []
-            for batch in _iter_loader_batches(loader, max_batches=max_batches):
+            for batch in _iter_loader_batches(
+                loader,
+                max_batches=max_batches,
+                progress_label=f"model_{stage}(D)",
+                progress_every=50,
+            ):
                 x, p, mean, std, shape, _y = batch[:6]
                 x = x.to(device)
                 p = p.to(device)
@@ -1150,12 +1330,71 @@ def load_error_ensemble_stages(
     return models, keys_loaded, stages_loaded, stage_norms, label_norm
 
 
+def count_finished_error_ensemble_stages(
+    config: dict,
+    dataset,
+    *,
+    max_stages: int = 64,
+) -> int:
+    """
+    Count consecutive finished stages model_0, model_1, ... on disk.
+
+    A stage counts if its checkpoint key exists, ``training_finished`` is true,
+    and (for stage>0) a current-version y-space norm sidecar is present.
+    Stops at the first gap.
+    """
+    from config import project_root_dir
+
+    cfg = dict(config)
+    sig = str(getattr(dataset, 'cache_key', '') or '')
+    if not sig:
+        from data import generate_dataset_signature
+        from labels import sync_output_dim
+        sync_output_dim(cfg)
+        sig = generate_dataset_signature(cfg)
+
+    ckpt_root = Path(cfg.get('checkpoint_dir', 'trading_checkpoints'))
+    if not ckpt_root.is_absolute():
+        ckpt_root = project_root_dir() / ckpt_root
+
+    n_done = 0
+    for stage in range(max(1, int(max_stages))):
+        key = stage_checkpoint_key(cfg, sig, stage)
+        key_dir = ckpt_root / key
+        if not key_dir.exists():
+            break
+        state_file = key_dir / 'training_state.json'
+        finished = False
+        if state_file.exists():
+            try:
+                with open(state_file, 'r', encoding='utf-8') as f:
+                    finished = bool(json.load(f).get('training_finished'))
+            except Exception:
+                finished = False
+        if not finished:
+            break
+        if stage > 0:
+            norm_path = key_dir / STAGE_NORM_FILENAME
+            if not norm_path.exists():
+                break
+            try:
+                with open(norm_path, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
+                if int(meta.get('version', 1) or 1) < STAGE_NORM_VERSION:
+                    break
+            except Exception:
+                break
+        n_done += 1
+    return n_done
+
+
 def run_error_ensemble_train(
     config: dict,
     dataset,
     total_features,
     *,
     n: Optional[int] = None,
+    start_stage: int = 0,
     num_epochs: Optional[float] = None,
     resume: Optional[bool] = None,
     extend: bool = False,
@@ -1164,10 +1403,10 @@ def run_error_ensemble_train(
     continue_on_error: bool = False,
 ) -> Dict[str, Any]:
     """
-    Sequentially train ``model_0 .. model_{n-1}`` on residuals.
+    Sequentially train residual stages ``model_{start_stage} .. model_{n-1}``.
 
-    Stage ``i`` uses checkpoint identity ``error_ensemble_stage=i``.
-    Earlier stages are loaded frozen to form the residual target.
+    Existing finished stages ``0 .. start_stage-1`` are kept and loaded frozen
+    when building residual targets for later stages.
     """
     from model_vae import build_market_model, resolve_max_seq_len, wrap_model_loss
     from train_run import train_one_run
@@ -1176,8 +1415,13 @@ def run_error_ensemble_train(
 
     cfg_base = dict(config)
     n_models = int(n if n is not None else cfg_base.get('error_ensemble_n', 3))
+    start = max(0, int(start_stage))
     if n_models < 1:
         raise ValueError(f"error_ensemble_n must be >= 1, got {n_models}")
+    if start >= n_models:
+        raise ValueError(
+            f"start_stage={start} must be < total stages n={n_models}"
+        )
 
     label_mode = str(
         getattr(dataset, 'label_mode', cfg_base.get('label', 'yield'))
@@ -1203,6 +1447,11 @@ def run_error_ensemble_train(
     print("ERROR ENSEMBLE TRAINING (residual boosting)")
     print("=" * 60)
     print(f"  stages (n):     {n_models}  → model_0 .. model_{n_models - 1}")
+    if start > 0:
+        print(
+            f"  extend from:    model_{start} "
+            f"(keeping finished model_0 .. model_{start - 1})"
+        )
     print(f"  label:          {label_mode}")
     print(f"  model_type:     {model_type}")
     print(f"  telepred_delay: {int(cfg_base.get('telepred_delay', 0) or 0)}")
@@ -1210,9 +1459,13 @@ def run_error_ensemble_train(
     print("=" * 60 + "\n")
 
     results: List[Dict[str, Any]] = []
-    for stage in range(n_models):
+    for stage in range(start, n_models):
         print("\n" + "-" * 60)
-        print(f"ERROR ENSEMBLE STAGE {stage + 1}/{n_models}: model_{stage}")
+        print(
+            f"ERROR ENSEMBLE STAGE {stage - start + 1}/"
+            f"{n_models - start}: model_{stage}  "
+            f"(absolute {stage + 1}/{n_models})"
+        )
         print("-" * 60)
 
         stage_cfg = dict(cfg_base)
@@ -1306,6 +1559,9 @@ def run_error_ensemble_train(
             #   model_0 → identity (fits y as-is)
             #   model_i (i>=1) → (mean_{i-1}, std_{i-1}) = stats of e_{i-1}
             # Reuse current-version sidecar; else recompute + save under model_i/.
+            # Always snapshot train config so report/eval can match this run.
+            save_error_ensemble_run_config(stage_dir, stage_cfg)
+
             if stage == 0:
                 active_norm = identity_norm
                 save_stage_norm(
@@ -1448,13 +1704,19 @@ def run_error_ensemble_train(
         print(f"⚠ Could not assemble final ErrorEnsemble: {exc}")
 
     n_ok = sum(1 for r in results if r.get('status') == 'ok')
+    n_attempted = n_models - start
     print("\n" + "=" * 60)
-    print(f"ERROR ENSEMBLE DONE: {n_ok}/{n_models} stages ok")
+    print(
+        f"ERROR ENSEMBLE DONE: {n_ok}/{n_attempted} new stages ok "
+        f"(total planned model_0..model_{n_models - 1})"
+    )
     print("=" * 60 + "\n")
 
     return {
         'n': n_models,
+        'start_stage': start,
         'results': results,
         'ensemble': ensemble,
         'n_ok': n_ok,
+        'n_attempted': n_attempted,
     }
