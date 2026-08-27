@@ -49,10 +49,10 @@ config = {
     # DATA / TELEPRED WINDOWS (bars on binance_interval, usually 1m)
     # ============================================================
     # delta1: model input length X(t,d)
-    'past_window': 60 * 36,   # 24h of 1m bars (formerly past_hours=24)
+    'past_window': 60 * 30,   # 24h of 1m bars (formerly past_hours=24)
     # delta2: label future length p[t+1 : t+1+future_window]
     # Shared by yield, trend, and latent (TelePred delta2).
-    'future_window': 50,
+    'future_window': 40,
     'step': 3,
 
     # ============================================================
@@ -123,7 +123,7 @@ config = {
     #   'both'   → output_dim=2  (chance, near)
     #   'chance' → output_dim=1  (chance,)
     #   'near'   → output_dim=1  (near,)
-    'yield_target': 'both',
+    'yield_target': 'near',
 
     # ------------------------------------------------------------
     # LATENT (label=latent) — same model as trend/yield
@@ -227,12 +227,12 @@ config = {
     # ============================================================
     # TRANSFORMER / VAE ENCODER CONFIGURATION
     # ============================================================
-    'patch_size': 10,   # 20, 10
+    'patch_size': 15,   # 20, 10
     'embed_dim': None,  # AUTO-COMPUTED
-    'num_layers': 3,    # 6, 2
-    'num_heads': 4,     # 8, 4
+    'num_layers': 5,    # 6, 2
+    'num_heads': 5,     # 8, 4
     'ff_dim_multiplier': 4,
-    'dropout': 0.0,
+    'dropout': 0.1,
     'causal': False,
     'max_seq_len': None,  # AUTO-COMPUTED
     
@@ -255,7 +255,7 @@ config = {
     # ============================================================
     'epochs': 1,
     'batch_size': 20,
-    'learning_rate': 0.000_1, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
+    'learning_rate': 0.000_01, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
     'save_every_n_minutes': 5,
     'checkpoint_dir': 'trading_checkpoints',
     # How many newest rolling weight files to keep (recency, not quality).
