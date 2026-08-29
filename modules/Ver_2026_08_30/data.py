@@ -32,6 +32,7 @@ from labels import (
     LABEL_YIELD,
     LABEL_LATENT,
     LABEL_RISE_FLAG,
+    LABEL_NONE,
     VALID_LABEL_MODES,
     LABEL_FULL_DIM_TREND,
     LABEL_FULL_DIM_YIELD,
@@ -173,6 +174,11 @@ def resolve_feature_layout(config: dict) -> Dict[str, Any]:
     }
 
 
+def _resolve_norm_mode(config: dict) -> str:
+    from sample_batch import resolve_normalization_mode
+    return resolve_normalization_mode(config)
+
+
 def generate_dataset_signature(config: dict) -> str:
     """
     Hash everything that defines label-cache / dataset identity from config alone.
@@ -230,6 +236,8 @@ def generate_dataset_signature(config: dict) -> str:
         'horizon_search': config.get('horizon_search', HORIZON_SEARCH_LONGEST_LINEAR),
         'output_dim': config.get('output_dim', 3),
         'normalize_window': config.get('normalize_window', True),
+        # FeaturePrep mode (one-layer | two-layer); see sample_batch.resolve_normalization_mode
+        'normalization': _resolve_norm_mode(config),
 
 
         # --- train-split stats ---
@@ -848,6 +856,16 @@ class TradingDataset(Dataset):
         self.device = device
         self.normalize_window = normalize_window
         self.num_shapes = config['num_shapes']
+        from sample_batch import resolve_normalization_mode
+        # Prefer explicit normalization; keep normalize_window in sync for signature.
+        if 'normalization' in config and config.get('normalization') is not None:
+            self.normalization_mode = resolve_normalization_mode(config)
+            self.normalize_window = self.normalization_mode == 'two-layer'
+        else:
+            self.normalization_mode = resolve_normalization_mode({
+                'normalize_window': normalize_window,
+            })
+            self.normalize_window = bool(normalize_window)
 
         self.label_mode = _normalize_label_mode(config.get('label', LABEL_TREND))
         self.min_yield_percent = float(config.get('min_yield_percent', 0.0))
@@ -937,6 +955,13 @@ class TradingDataset(Dataset):
             self.output_dim = forced_dim
             self.latent_dim = forced_dim
             self._label_slice = label_target_slice(self.label_mode, self.output_dim)
+        elif self.label_mode == LABEL_NONE:
+            from labels import Label_None
+            self.yield_target = 'both'
+            forced_dim = Label_None.resolve_output_dim(config)
+            self.output_dim = forced_dim
+            self.latent_dim = forced_dim
+            self._label_slice = label_target_slice(self.label_mode, self.output_dim)
         else:
             self.yield_target = 'both'
             self.output_dim = int(config.get('output_dim', 3))
@@ -1007,7 +1032,8 @@ class TradingDataset(Dataset):
         self._label_stat_mean = self.stats['label']['mean'][self._label_slice]
         self._label_stat_std = self.stats['label']['std'][self._label_slice]
         # Binary rise_flag targets stay in {0,1} for BCE — no z-score.
-        if self.label_mode == LABEL_RISE_FLAG:
+        # none placeholders are unused zeros — identity stats.
+        if self.label_mode in (LABEL_RISE_FLAG, LABEL_NONE):
             self._label_stat_mean = torch.zeros_like(self._label_stat_mean)
             self._label_stat_std = torch.ones_like(self._label_stat_std)
         
@@ -1204,92 +1230,24 @@ class TradingDataset(Dataset):
             ]
             current_price = self.Total[int(win["bot_time"]), self.price_feature_idx]
 
-            if self.label_mode == LABEL_TREND:
-                # Trend labels: free OLS fitness needs a dimensionless price scale,
-                # so use the same window z-score as the model input.
-                if self.normalize_window:
-                    price_mean = mean[self.price_feature_idx]
-                    price_std = std[self.price_feature_idx]
-                    if float(price_std) == 0.0:
-                        price_std = 1.0
-                    future_for_label = (future_prices - price_mean) / price_std
-                    history_for_label = (history_prices - price_mean) / price_std
-                else:
-                    future_for_label = future_prices
-                    history_for_label = history_prices
-
-                best_h, best_slope, best_intercept, best_h_past = find_trend(
-                    future_for_label,
-                    history_for_label,
-                    min_horizon=self.min_trend_horizon,
-                    max_horizon=self.future_window,
-                    fitness_threshold=self.fitness_threshold,
-                    mode=self.horizon_search,
-                    max_past_horizon=self.future_window,
-                    use_past=self.regime_use_past,
-                )
-                # Full cache vector; model may slice to (m,b) when output_dim=2.
-                # h_past cached separately for viz (not a model target).
-                label = torch.tensor(
-                    [best_h, best_slope, best_intercept], dtype=torch.float32
-                )
-                h_past_list.append(float(best_h_past))
-            elif self.label_mode == LABEL_YIELD:
-                # Y(t)=label(p[t+1:t+1+delta2], p[t]). MUST use raw prices —
-                # window z-score makes p[t]≈0 and blows up chance.
-                result = find_yield(
-                    future_prices,
-                    current_price,
-                    min_yield_percent=self.min_yield_percent,
-                    max_hope_future_horizon=self.future_window,
-                    # full cache always (chance, near); model uses yield_target slice
-                )
-                if len(result) == 1:
-                    chance, near = float(result[0]), 0.0
-                else:
-                    chance, near = float(result[0]), float(result[1])
-                label = torch.tensor([chance, near], dtype=torch.float32)
-                h_past_list.append(0.0)
-            elif self.label_mode == LABEL_RISE_FLAG:
-                # Same TelePred contract as Yield: raw future vs p[t].
-                from labels import Label_RiseFlag
-                result = Label_RiseFlag.find(
-                    future_prices,
-                    current_price,
-                    min_yield_percent=self.min_yield_percent,
-                    max_hope_future_horizon=self.future_window,
-                )
-                flag = float(result[0] if isinstance(result, (tuple, list)) else result)
-                label = torch.tensor([flag], dtype=torch.float32)
-                h_past_list.append(0.0)
-            elif self.label_mode == LABEL_LATENT:
-                # Realized next bar (future[0]) as one draw from the latent
-                # price density. Window z-score (from history) keeps the
-                # observation scale-free across regimes; find() returns
-                # future[0] in that space.
-                from labels import Label_Latent
-                if self.normalize_window:
-                    price_mean = mean[self.price_feature_idx]
-                    price_std = std[self.price_feature_idx]
-                    if float(price_std) == 0.0:
-                        price_std = 1.0
-                    future_for_label = (future_prices - price_mean) / price_std
-                    history_for_label = (history_prices - price_mean) / price_std
-                else:
-                    future_for_label = future_prices
-                    history_for_label = history_prices
-                result = Label_Latent.find(future_for_label, history_for_label)
-                if isinstance(result, (tuple, list)):
-                    y_obs = float(result[0])
-                else:
-                    y_obs = float(
-                        result.item() if hasattr(result, 'item') else result
-                    )
-                label = torch.tensor([y_obs], dtype=torch.float32)
-                h_past_list.append(0.0)
-            else:
-                raise ValueError(f"Unknown label mode: {self.label_mode!r}")
-
+            from label_cache import build_cache_row
+            label, h_past = build_cache_row(
+                self.label_mode,
+                future_prices=future_prices,
+                history_prices=history_prices,
+                current_price=current_price,
+                mean=mean,
+                std=std,
+                price_feature_idx=self.price_feature_idx,
+                normalize_window=self.normalize_window,
+                min_trend_horizon=self.min_trend_horizon,
+                future_window=self.future_window,
+                fitness_threshold=self.fitness_threshold,
+                horizon_search=self.horizon_search,
+                regime_use_past=self.regime_use_past,
+                min_yield_percent=self.min_yield_percent,
+            )
+            h_past_list.append(float(h_past))
             label_list.append(label)
 
         # Unnormalized labels and x's properties of all data samples - train, validation, and test
@@ -1337,6 +1295,9 @@ class TradingDataset(Dataset):
         )
     
     def _load_or_compute_labels(self):
+        # Label cache key = dataset_signature (NOT epochs / lr / batch_size).
+        print(f"Label cache key: {self.cache_key}")
+        print(f"  path: {self.cache_file}")
         if self.cache_file.exists():
             print(f"Loading cached labels from: {self.cache_file}")
             try:
@@ -1375,6 +1336,16 @@ class TradingDataset(Dataset):
 
                 if not shape_ok:
                     print("⚠ Cache mismatch (shapes/windows). Recomputing...")
+                    print(
+                        f"  cached: samples={cached_data.get('num_samples')} "
+                        f"F={cached_data.get('F')} T={cached_data.get('T')} "
+                        f"past={cached_data.get('past_window')} "
+                        f"future={cached_data.get('future_window')}"
+                    )
+                    print(
+                        f"  now:    samples={len(self)} F={self.F} T={self.T} "
+                        f"past={self.past_window} future={self.future_window}"
+                    )
                 else:
                     print(
                         f"⚠ Cache label_algo_version={algo_ver} "
@@ -1383,6 +1354,8 @@ class TradingDataset(Dataset):
                     )
             except Exception as e:
                 print(f"⚠ Failed to load cache: {e}. Recomputing...")
+        else:
+            print("  (no cache file yet for this dataset signature)")
         
         print("Computing labels and normalization parameters...")
         (
@@ -1555,47 +1528,71 @@ class TradingDataset(Dataset):
     def __len__(self) -> int:
         return len(self.valid_starts)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Optimized __getitem__ with cached references and view() instead of unsqueeze()."""
+    def __getitem__(self, idx: int) -> dict:
+        """
+        Opaque sample dict (Phase 3).
+
+        Keys: x, p, mean, std, shape, y  — packed by LabelSpec via label_cache.
+        FeaturePrep: two-layer (default) or one-layer from config normalization.
+        """
+        from label_cache import pack_sample_for_label
+        from sample_batch import resolve_normalization_mode
+
         t = self._valid_t[idx]
         win = windows_for_sample(
             t, self._telepred_delay, self._past_window, self._future_window
         )
-        x = self._Total[win["input"], :]
-        
-        if self._normalize:
+        x_raw = self._Total[win["input"], :]
+
+        mode = getattr(self, 'normalization_mode', None)
+        if mode is None:
+            mode = resolve_normalization_mode({
+                'normalization': getattr(self, 'normalization', None),
+                'normalize_window': self._normalize,
+            })
+
+        if mode == 'two-layer':
             mean = self._mean_tensor[idx]       # (F,)
             std = self._std_tensor[idx].clone()  # clone: do not mutate cache
             std[std == 0] = 1
-            x_normalized = (x - mean) / std     # (T, F)
+            x_normalized = (x_raw - mean) / std     # (T, F)
             shape = self._shape_tensor[idx]     # (num_shapes, F)
+            mean_normalized = (
+                (mean - self.stats['mean']['mean'])
+                / (self.stats['mean']['std'] + 1e-8)
+            )
+            std_normalized = (
+                (std - self.stats['std']['mean'])
+                / (self.stats['std']['std'] + 1e-8)
+            )
+            shape_normalized = (
+                (shape - self.stats['shape']['mean'])
+                / (self.stats['shape']['std'] + 1e-8)
+            )
         else:
-            x_normalized = x
-            mean = torch.zeros(self._F)
-            std = torch.ones(self._F)
-            shape = torch.zeros(self.num_shapes, self._F)
-        
-        # Full label cache is always (horizon, slope, intercept); slice for model.
+            # one-layer: no intra-window x rewrite; FiLM moments neutral.
+            x_normalized = x_raw
+            mean_normalized = torch.zeros(self._F)
+            std_normalized = torch.ones(self._F)
+            shape_normalized = torch.zeros(self.num_shapes, self._F)
+
         y_full = self._label_tensor[idx]
         y = y_full[self._label_slice]
-
-        # Normalize label, mean, std, and shape using dataset statistics
         y_normalized = self.normalize_y(y)
 
-        # p: last model_past_len bars of normalized target price.
-        # Length must match model.n_max_past_horizon (mode-dependent).
-        recent_prices = x_normalized[-self.model_past_len:, self.price_feature_idx]
-        
-        # Mean: (F,)
-        mean_normalized = (mean - self.stats['mean']['mean']) / (self.stats['mean']['std'] + 1e-8)
-        
-        # Std: (F,)
-        std_normalized = (std - self.stats['std']['mean']) / (self.stats['std']['std'] + 1e-8)
-        
-        # Shape: (num_shapes, F)
-        shape_normalized = (shape - self.stats['shape']['mean']) / (self.stats['shape']['std'] + 1e-8)
-        
-        return x_normalized, recent_prices, mean_normalized, std_normalized, shape_normalized, y_normalized
+        recent_prices = x_normalized[
+            -self.model_past_len:, self.price_feature_idx
+        ]
+
+        return pack_sample_for_label(
+            self.label_mode,
+            x=x_normalized,
+            p=recent_prices,
+            mean=mean_normalized,
+            std=std_normalized,
+            shape=shape_normalized,
+            y=y_normalized,
+        )
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1684,31 +1681,18 @@ class ThreadedDataLoader:
         for i in range(0, len(indices), batch_size):
             batch_indices = indices[i:i + batch_size]
             
-            x_list, p_list, mean_list, std_list, shape_list, y_list = [], [], [], [], [], []
+            from sample_batch import coerce_sample, collate_samples
+            samples = []
             
             for idx in batch_indices:
                 try:
-                    x, p, mean, std, shape, y = self.dataset.__getitem__(idx)
-                    x_list.append(x)
-                    p_list.append(p)
-                    mean_list.append(mean)
-                    std_list.append(std)
-                    shape_list.append(shape)
-                    y_list.append(y)
+                    samples.append(coerce_sample(self.dataset.__getitem__(idx)))
                 except IndexError as e:
                     print(f"⚠ IndexError for idx={idx}, dataset length={len(self.dataset)}, indices length={len(self.current_epoch_indices)}")
                     raise
-            
-            x_batch = torch.stack(x_list)
-            p_batch = torch.stack(p_list)
-            mean_batch = torch.stack(mean_list)
-            std_batch = torch.stack(std_list)
-            shape_batch = torch.stack(shape_list)
-            y_batch = torch.stack(y_list)
 
-            # (B, T, F), (B, model_past_len), (B, F), (B, F), (B, 4, F), (B, out).
-            # All normalized and ready for model input.
-            yield x_batch, p_batch, mean_batch, std_batch, shape_batch, y_batch
+            # Opaque batched dict: x, p, mean, std, shape, y
+            yield collate_samples(samples)
     
     def get_total_batches_in_epoch(self):
         """Get total number of batches in current epoch."""

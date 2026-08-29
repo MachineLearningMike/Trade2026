@@ -99,9 +99,9 @@ Design principle — accommodate broadly on purpose:
 
 0.6 Summary checklist — “accommodated means”
 --------------------------------------------
-  [ ] registry lists every id in 0.1–0.2
-  [ ] COMPAT lists every pair in 0.3; assert_compatible enforces it
-  [ ] ENSEMBLE_KINDS covers telepred + error; stack stub OK
+  [x] registry lists every id in 0.1–0.2
+  [x] COMPAT lists every pair in 0.3; assert_compatible enforces it
+  [x] ENSEMBLE_KINDS covers telepred + error; stack stub OK
   [ ] TRAIN/INFER/data paths exercise regression×{trend,yield,latent,rise_flag}
       and vae×none without label if-ladders outside LabelSpec
   [ ] TelePred + ErrorEnsemble expressed as ensemble kinds over those pairs
@@ -1087,13 +1087,28 @@ modules/Ver_2026_08_30/
     INFER dim-1 / rise_flag metrics, VAE help)  (done in Ver_2026_08_30)
 [x] Phase 1 minimum e2e smoke: test_phase1_smoke.py
     (CPU synthetic regression×rise_flag train + INFER metrics; PASSED)
-[ ] Add registry.py + compat.py; gate train_one_run
-[ ] Move dataset label branches into LabelSpec
-[ ] Move INFER metrics/viz into LabelSpec
-[ ] Split / thin TRAIN + INFER CLIs
-[ ] Config section pass + run_config.json for all trains
-    (incl. normalization: "one-layer" | "two-layer")
-[ ] Golden smoke matrix
+[x] Add registry.py + compat.py; gate train_one_run
+    (+ ensemble_train telepred, error_ensemble; Label_None; --label none)
+    test_phase2_compat.py PASSED; Phase 1 smoke still PASSED
+[x] Phase 3 (core ABI): FeaturePrep modes via "normalization";
+    label_cache.build_cache_row; opaque sample dict __getitem__;
+    sample_batch unpack; trainer/loader/INFER/error_ensemble migrated;
+    test_phase3_sample_abi.py + Phase1 smoke PASSED
+    (INFER metrics/viz trees still label_mode ifs — defer full Label.metrics)
+[x] Phase 4: vae⇒none coerce; wrap_loss by COMPAT objective;
+    emit_reconstruction clarify; output_dim positive int;
+    ensemble_spec.EnsembleModelSpec + LabelCollection;
+    telepred/error describe via specs; test_phase4_product.py PASSED
+[x] Phase 5: cli_commands subcommands (flat flags kept);
+    label_metrics.report_test_metrics wired in INFER.run_test;
+    INFER thin CLI; run_config.json written by train_one_run;
+    test_phase5_cli_metrics.py PASSED
+[x] Phase 6: config_sections (paths/data/label/model/train/ensemble);
+    apply_overrides / apply_cli_namespace / filter_active_knobs;
+    TRAIN uses apply_cli_namespace; test_phase6_config.py PASSED
+[x] Phase 7: test_golden_matrix.py PASSED
+    (regression×trend/yield/latent/rise_flag, vae×none,
+     telepred delays [0,2], error_ensemble n=2)
 
 END OF refactor_plan.txt
 

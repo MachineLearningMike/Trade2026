@@ -12,8 +12,8 @@ import torch.optim as optim
 
 from data import ThreadedDataLoader
 from labels import bind_label_loss, label_target_names, resolve_model_past_len
-from model import report_model_size, check_all_weights_updated
-from model_vae import build_market_model, resolve_max_seq_len, wrap_model_loss
+from model_regression import report_model_size, check_all_weights_updated
+from model_v_autoencoder import build_market_model, resolve_max_seq_len, wrap_loss, wrap_model_loss
 from trainer import ResumableTrainer, generate_checkpoint_key
 
 
@@ -42,6 +42,10 @@ def train_one_run(
     inject a wrapped module and residual loss without rebuilding.
     """
     cfg = config
+    from compat import resolve_atomic_slot
+    from model_v_autoencoder import wrap_loss
+    objective = resolve_atomic_slot(cfg)
+
     from telepred import resolve_past_window
     past_window = int(resolve_past_window(cfg))
     F = (
@@ -127,7 +131,7 @@ def train_one_run(
                 cfg.get('latent_distribution', 'normal'),
             ),
         )
-        loss_fn = wrap_model_loss(model, base_loss_fn, cfg)
+        loss_fn = wrap_loss(model, base_loss_fn, cfg, objective=objective)
 
     if probe_weights:
         _probe_T = (past_window // cfg['patch_size']) * cfg['patch_size']
@@ -159,6 +163,36 @@ def train_one_run(
     )
 
     ckpt_key = generate_checkpoint_key(cfg, dataset.cache_key)
+    # Phase 5/6: persist run config beside checkpoints (reports must not
+    # depend on live config.py alone).
+    try:
+        import json
+        from config import project_root_dir
+        key_dir = Path(cfg.get('checkpoint_dir', 'trading_checkpoints'))
+        if not key_dir.is_absolute():
+            key_dir = project_root_dir() / key_dir
+        key_dir = key_dir / ckpt_key
+        key_dir.mkdir(parents=True, exist_ok=True)
+        run_cfg_path = key_dir / 'run_config.json'
+        payload = {
+            k: cfg.get(k)
+            for k in (
+                'label', 'model_type', 'yield_target', 'latent_distribution',
+                'normalization', 'normalize_window', 'output_dim',
+                'past_window', 'future_window', 'telepred_delay',
+                'patch_size', 'num_layers', 'num_heads', 'n_latent_macros',
+                'look_price', 'emit_reconstruction', 'use_reconstruction',
+                'error_ensemble_n', 'error_ensemble_stage',
+            )
+            if k in cfg or cfg.get(k) is not None
+        }
+        payload['dataset_signature'] = dataset.cache_key
+        payload['checkpoint_key'] = ckpt_key
+        with open(run_cfg_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, sort_keys=True, default=str)
+    except Exception as e:
+        print(f"⚠ Could not write run_config.json: {e}")
+
     trainer = ResumableTrainer(
         dataset_signature=dataset.cache_key,
         model=model,

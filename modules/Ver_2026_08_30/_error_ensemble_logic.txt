@@ -178,5 +178,5 @@ After logic/norm-version changes, retrain with:
   TRAIN.py --error-ensemble --clean
 
 ================================================================================
-END OF error_ensemble_logic.txt
+END OF _error_ensemble_logic.txt
 ================================================================================

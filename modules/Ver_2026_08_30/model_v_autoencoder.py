@@ -1,5 +1,5 @@
-# model_vae.py
-# Variational Auto-Encoder drop-in for MarketTransformerWithHeads.
+# model_v_autoencoder.py
+# Variational Auto-Encoder drop-in for MarketRegressionWithHeads.
 #
 # The VAE operates on x only. mean/std define the meaning of x and condition
 # encoder/decoder via FiLM (not parallel time tokens). shape is accepted for
@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 from config import get_config
 from labels import resolve_model_past_len
-from model import (
+from model_regression import (
     Depatch,
     PatchEmbed,
     PredictionHead,
@@ -70,7 +70,10 @@ def build_market_model(
         causal=config['causal'],
         head_hidden_dim_multiplier=config['head_hidden_dim_multiplier'],
         output_dim=config['output_dim'],
-        use_reconstruction=config['use_reconstruction'],
+        use_reconstruction=config.get('use_reconstruction', False),
+        emit_reconstruction=config.get(
+            'emit_reconstruction', config.get('use_reconstruction', False)
+        ),
         num_shapes=config.get('num_shapes', 4),
         look_price=config.get('look_price', True),
     )
@@ -83,54 +86,84 @@ def build_market_model(
         raise ValueError(
             f"Unknown model_type={model_type!r}; expected 'regression' or 'vae'"
         )
-    from model import MarketTransformerWithHeads
-    return MarketTransformerWithHeads(**common)
+    from model_regression import MarketRegressionWithHeads
+    return MarketRegressionWithHeads(**common)
+
+
+def unpack_model_input(sample_or_batch):
+    """ModelSpec.unpack_input — see sample_batch.unpack_model_input."""
+    from sample_batch import unpack_model_input as _unpack
+    return _unpack(sample_or_batch)
+
+
+def wrap_loss(model: nn.Module, label_loss_fn, config: dict, objective: Optional[str] = None):
+    """
+    ModelSpec.wrap_loss — compose train loss from COMPAT objective.
+
+    objective:
+      'supervised'   → label_loss_fn only (regression × true label)
+      'unsupervised' → VAE recon+KL only; y ignored (vae × none)
+    If objective is None, resolved from config via compat/COMPAT.
+    """
+    from compat import assert_config_compatible
+    from registry import normalize_model_id
+
+    if objective is None:
+        objective = assert_config_compatible(config)
+
+    recon_w = float(config.get('reconstruction_loss_weight', 1.0))
+    kl_w = float(config.get('vae_kl_weight', 0.1))
+    model_id = normalize_model_id(config.get('model_type', 'regression'))
+
+    if objective == 'supervised':
+        def loss_fn(x, pred, y):
+            return label_loss_fn(x, pred, y)
+
+        loss_fn.label_cls = getattr(label_loss_fn, 'label_cls', None)
+        loss_fn.objective = objective  # type: ignore[attr-defined]
+        loss_fn.auxiliary = getattr(label_loss_fn, 'auxiliary', None)
+        return loss_fn
+
+    if objective == 'unsupervised':
+        if model_id != 'vae':
+            raise ValueError(
+                f"objective='unsupervised' expects model_type=vae, got {model_id!r}"
+            )
+
+        def loss_fn(x, pred, y):
+            del y  # unused by design for (vae, none)
+            x_hat = getattr(model, 'last_x_hat', None)
+            x_tgt = getattr(model, 'last_x', None)
+            if x_hat is None or x_tgt is None:
+                raise RuntimeError(
+                    "VAE loss requires model.last_x and model.last_x_hat; "
+                    "was forward() called?"
+                )
+            loss = recon_w * F.mse_loss(x_hat, x_tgt)
+            kl = getattr(model, 'last_kl', None)
+            if kl is not None:
+                loss = loss + kl_w * kl
+            # Keep prediction head on the graph (zero contribution).
+            if isinstance(pred, (tuple, list)):
+                loss = loss + pred[0].sum() * 0.0
+            elif torch.is_tensor(pred):
+                loss = loss + pred.sum() * 0.0
+            return loss
+
+        loss_fn.label_cls = getattr(label_loss_fn, 'label_cls', None)
+        loss_fn.objective = objective  # type: ignore[attr-defined]
+        loss_fn.auxiliary = getattr(label_loss_fn, 'auxiliary', None)
+        return loss_fn
+
+    raise ValueError(
+        f"Unknown COMPAT objective {objective!r}; expected "
+        f"'supervised' or 'unsupervised'"
+    )
 
 
 def wrap_model_loss(model: nn.Module, base_loss_fn, config: dict):
-    """
-    Build ``loss_fn(x, pred, y)`` for ResumableTrainer.
-
-    - regression: supervised label loss only (``base_loss_fn``).
-    - vae: **no** supervised label loss (yield/trend/latent/rise_flag) — only
-      ``reconstruction_loss_weight * MSE(x_hat, x) + vae_kl_weight * KL``.
-      ``y`` is ignored. Product cell is effectively (vae, none); a supervised
-      ``--label`` does not change the train objective. Recon is always applied
-      for VAE (independent of ``use_reconstruction``, which only gates the
-      returned ``recon`` tensor).
-    """
-    recon_w = float(config.get('reconstruction_loss_weight', 1.0))
-    kl_w = float(config.get('vae_kl_weight', 0.1))
-    is_vae = str(config.get('model_type', 'regression')).lower() == 'vae'
-
-    def loss_fn(x, pred, y):
-        if not is_vae:
-            return base_loss_fn(x, pred, y)
-
-        # Pure VAE objective — do not use chance/near (or any label) targets.
-        del y  # unused by design
-        x_hat = getattr(model, 'last_x_hat', None)
-        x_tgt = getattr(model, 'last_x', None)
-        if x_hat is None or x_tgt is None:
-            raise RuntimeError(
-                "VAE loss requires model.last_x and model.last_x_hat; "
-                "was forward() called?"
-            )
-        loss = recon_w * F.mse_loss(x_hat, x_tgt)
-        kl = getattr(model, 'last_kl', None)
-        if kl is not None:
-            loss = loss + kl_w * kl
-        # Keep prediction head on the graph (zero contribution) so diagnostics
-        # do not report missing grads; no yield supervision.
-        if isinstance(pred, (tuple, list)):
-            loss = loss + pred[0].sum() * 0.0
-        elif torch.is_tensor(pred):
-            loss = loss + pred.sum() * 0.0
-        return loss
-
-    loss_fn.label_cls = getattr(base_loss_fn, 'label_cls', None)
-    loss_fn.auxiliary = getattr(base_loss_fn, 'auxiliary', None)
-    return loss_fn
+    """Backward-compatible alias for ``wrap_loss``."""
+    return wrap_loss(model, base_loss_fn, config)
 
 
 class MeanStdConditioner(nn.Module):
@@ -215,13 +248,15 @@ class MarketVAEWithHeads(nn.Module):
         head_hidden_dim_multiplier: int = 4,
         output_dim: int = 3,
         use_reconstruction: bool = True,
+        emit_reconstruction: Optional[bool] = None,
         num_shapes: int = 4,
         look_price: bool = True,
         vae_latent_dim: int = 64,
     ):
         super().__init__()
-        if output_dim not in (1, 2, 3):
-            raise ValueError(f"output_dim must be 1, 2, or 3, got {output_dim}")
+        output_dim = int(output_dim)
+        if output_dim < 1:
+            raise ValueError(f"output_dim must be a positive int, got {output_dim}")
 
         self.patch_size = int(patch_size)
         self.in_features = int(in_features)
@@ -230,8 +265,11 @@ class MarketVAEWithHeads(nn.Module):
         self.n_latent_macros = int(n_latent_macros)
         self.causal = bool(causal)
         self.max_seq_len = int(max_seq_len)
-        self.use_reconstruction = bool(use_reconstruction)
-        self.output_dim = int(output_dim)
+        if emit_reconstruction is None:
+            emit_reconstruction = use_reconstruction
+        self.use_reconstruction = bool(emit_reconstruction)
+        self.emit_reconstruction = self.use_reconstruction
+        self.output_dim = output_dim
         self.num_shapes = int(num_shapes)
         self.n_max_past_horizon = int(n_max_past_horizon)
         self.look_price = bool(look_price)
@@ -458,7 +496,7 @@ class MarketVAEWithHeads(nn.Module):
             head_in = torch.cat([z, p], dim=1)
         predictions = self.prediction_head(head_in)
 
-        recon = x_hat if self.use_reconstruction else None
+        recon = x_hat if self.emit_reconstruction else None
         return predictions, patch_map, recon
 
 
@@ -538,4 +576,4 @@ if __name__ == "__main__":
         loss_fn=_loss,
         name="MarketVAEWithHeads",
     )
-    print("\n✅ model_vae demo complete.")
+    print("\n✅ model_v_autoencoder demo complete.")

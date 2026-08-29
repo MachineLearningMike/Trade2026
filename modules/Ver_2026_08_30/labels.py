@@ -1,7 +1,7 @@
 # labels.py
 # Label modes, target construction, training loss, and visualization.
 #
-# Shared by data.py (label cache / dataset), model.py (objective), TRAIN, and INFER.
+# Shared by data.py (label cache / dataset), model_regression.py, TRAIN, and INFER.
 #
 # Each label family is a class (find + loss). Bind Label_*.loss for training.
 # Families: Label_Trend, Label_Yield, Label_Latent, Label_RiseFlag.
@@ -28,7 +28,14 @@ LABEL_TREND = 'trend'
 LABEL_YIELD = 'yield'
 LABEL_LATENT = 'latent'
 LABEL_RISE_FLAG = 'rise_flag'
-VALID_LABEL_MODES = (LABEL_TREND, LABEL_YIELD, LABEL_LATENT, LABEL_RISE_FLAG)
+LABEL_NONE = 'none'  # unsupervised / (vae, none) — no supervised target
+VALID_LABEL_MODES = (
+    LABEL_TREND,
+    LABEL_YIELD,
+    LABEL_LATENT,
+    LABEL_RISE_FLAG,
+    LABEL_NONE,
+)
 
 LABEL_FULL_DIM_TREND = 3
 LABEL_FULL_DIM_YIELD = 2
@@ -36,6 +43,7 @@ LABEL_FULL_DIM_YIELD_SINGLE = 1  # chance-only or near-only head
 # Latent: scalar observation in the label cache; model head width from density mode.
 LABEL_FULL_DIM_LATENT = 1
 LABEL_FULL_DIM_RISE_FLAG = 1  # binary flag {0, 1}
+LABEL_FULL_DIM_NONE = 1  # placeholder head width when no supervised y
 
 # Latent parametric density (config key ``latent_distribution``).
 # See Basic/Predict_normal_disttribution.py and Predict_student_t_disttribution.py.
@@ -335,6 +343,60 @@ class Label_Trend:
             f"{cls.name} loss: unsupported pred dim {out_dim}; expected 2 or 3"
         )
 
+    @classmethod
+    def measure_slots(cls) -> Tuple[str, ...]:
+        """Declared eval measure names for this label (LabelSpec slot)."""
+        return (
+            'horizon_mse', 'slope_mse', 'intercept_mse',
+        )
+
+    @classmethod
+    def compute_measures(
+        cls,
+        y_pred: torch.Tensor,
+        y_truth: torch.Tensor,
+        *,
+        auxiliary: Optional[dict] = None,
+        dataset=None,
+        config: Optional[dict] = None,
+        **_kwargs,
+    ) -> dict:
+        """Per-channel MSE measures (slots present depend on output_dim)."""
+        out_dim = int(y_pred.shape[-1])
+        metrics = {}
+        if out_dim == 3:
+            metrics['horizon_mse'] = float(
+                nn.functional.mse_loss(y_pred[:, 0], y_truth[:, 0]).item()
+            )
+            metrics['slope_mse'] = float(
+                nn.functional.mse_loss(y_pred[:, 1], y_truth[:, 1]).item()
+            )
+            metrics['intercept_mse'] = float(
+                nn.functional.mse_loss(y_pred[:, 2], y_truth[:, 2]).item()
+            )
+        elif out_dim == 2:
+            metrics['slope_mse'] = float(
+                nn.functional.mse_loss(y_pred[:, 0], y_truth[:, 0]).item()
+            )
+            metrics['intercept_mse'] = float(
+                nn.functional.mse_loss(y_pred[:, 1], y_truth[:, 1]).item()
+            )
+        else:
+            raise ValueError(
+                f"{cls.name} measures: unsupported pred dim {out_dim}"
+            )
+        return metrics
+
+    @classmethod
+    def pack_measures(cls, y_pred, y_truth, **kwargs) -> dict:
+        """Opaque measures dict — models never see this."""
+        return cls.compute_measures(y_pred, y_truth, **kwargs)
+
+    @classmethod
+    def unpack_measures(cls, measures: dict) -> dict:
+        slots = cls.measure_slots()
+        return {k: measures[k] for k in slots if k in measures}
+
 
 # ═══════════════════════════════════════════════════════════
 # YIELD TARGET RESOLUTION
@@ -633,6 +695,57 @@ class Label_Yield:
             f"{cls.name} loss: unknown yield_target {yt!r}"
         )
 
+    @classmethod
+    def measure_slots(cls) -> Tuple[str, ...]:
+        return ('chance_mse', 'near_mse')
+
+    @classmethod
+    def compute_measures(
+        cls,
+        y_pred: torch.Tensor,
+        y_truth: torch.Tensor,
+        *,
+        auxiliary: Optional[dict] = None,
+        dataset=None,
+        config: Optional[dict] = None,
+        **_kwargs,
+    ) -> dict:
+        cfg = dict(config or {})
+        if auxiliary:
+            cfg.update({k: v for k, v in auxiliary.items() if v is not None})
+        yt = resolve_yield_target(cfg)
+        out_dim = int(y_pred.shape[-1])
+        metrics = {}
+        if yt == YIELD_TARGET_CHANCE:
+            metrics['chance_mse'] = float(
+                nn.functional.mse_loss(y_pred[:, 0], y_truth[:, 0]).item()
+            )
+        elif yt == YIELD_TARGET_NEAR:
+            metrics['near_mse'] = float(
+                nn.functional.mse_loss(y_pred[:, 0], y_truth[:, 0]).item()
+            )
+        elif yt == YIELD_TARGET_BOTH and out_dim == 2:
+            metrics['chance_mse'] = float(
+                nn.functional.mse_loss(y_pred[:, 0], y_truth[:, 0]).item()
+            )
+            metrics['near_mse'] = float(
+                nn.functional.mse_loss(y_pred[:, 1], y_truth[:, 1]).item()
+            )
+        else:
+            raise ValueError(
+                f"{cls.name} measures: yield_target={yt!r} dim={out_dim}"
+            )
+        return metrics
+
+    @classmethod
+    def pack_measures(cls, y_pred, y_truth, **kwargs) -> dict:
+        return cls.compute_measures(y_pred, y_truth, **kwargs)
+
+    @classmethod
+    def unpack_measures(cls, measures: dict) -> dict:
+        slots = cls.measure_slots()
+        return {k: measures[k] for k in slots if k in measures}
+
 
 # ═══════════════════════════════════════════════════════════
 # LABEL FAMILY: RISE FLAG (binary; refine find() as needed)
@@ -640,15 +753,22 @@ class Label_Yield:
 
 class Label_RiseFlag:
     """
-    Binary rise flag on raw prices (scaffold for refinement).
+    Binary classifier: rise flag on raw prices (scaffold for refinement).
 
     Config id: ``rise_flag``
-    Cache / model target: single scalar in {0.0, 1.0}.
+    Cache / model target: single scalar in {0.0, 1.0} (class label).
+    Model head: one logit (output_dim=1). At inference, P(rise)=sigmoid(logit).
     Price space: raw (same TelePred contract as Yield):
         Y(t) = find( p[t+1 : t+1+delta2], p[t] )
 
     Initial ``find`` is a crude chance-like threshold stub — refine freely.
-    Loss: BCE-with-logits (``y_pred`` treated as logits; ``y_truth`` in {0,1}).
+
+    Loss (binary classification):
+        BCE-with-logits ≡ BCE(sigmoid(y_pred), y_truth)
+        with ``y_pred`` = logits, ``y_truth`` ∈ {0,1}.
+        (Fused form is used for numerical stability; same objective as
+        explicit sigmoid + BCE.)
+
     Do not z-score these targets in the dataset (identity label stats).
     """
 
@@ -748,14 +868,19 @@ class Label_RiseFlag:
     @classmethod
     def make_auxiliary(cls, config: Optional[dict] = None, **overrides) -> dict:
         """
-        Class-private loss knobs for rise_flag.
+        Class-private knobs for rise_flag (loss + measure decision).
 
-        Keys: rise_flag_weight (optional scale on BCE)
+        Keys:
+          rise_flag_weight — scale on BCE-with-logits
+          decision_threshold — P(rise) cutoff for TP/TN/FP/FN (from config)
         """
         cfg = dict(config or {})
         cfg.update({k: v for k, v in overrides.items() if v is not None})
         aux = {
             'rise_flag_weight': float(cfg.get('rise_flag_loss_weight', 1.0)),
+            'decision_threshold': float(
+                cfg.get('rise_flag_decision_threshold', 0.5)
+            ),
         }
         return aux
 
@@ -768,9 +893,15 @@ class Label_RiseFlag:
         auxiliary: Optional[dict] = None,
     ) -> torch.Tensor:
         """
+        Binary classifier loss: sigmoid + BCE on a single logit.
+
         Uniform signature: loss(x, y_pred, y_truth, auxiliary).
 
-        BCE-with-logits: ``y_pred`` are logits, ``y_truth`` in {0,1}.
+        Equivalent forms:
+            prob = sigmoid(y_pred);  loss = BCE(prob, y_truth)
+            loss = BCEWithLogits(y_pred, y_truth)   # used here (stable)
+
+        ``y_pred`` last dim 1 = logit; ``y_truth`` ∈ {0,1}.
         ``x`` unused (API uniformity).
         """
         aux = auxiliary or {}
@@ -780,10 +911,126 @@ class Label_RiseFlag:
                 f"{cls.name} loss expects pred/truth last dim 1, "
                 f"got pred={tuple(y_pred.shape)} truth={tuple(y_truth.shape)}"
             )
-        # Flatten to (B,) for binary BCE.
+        # Flatten to (B,) for binary classification.
         logits = y_pred[:, 0]
         target = y_truth[:, 0].clamp(0.0, 1.0)
+        # sigmoid(logits) is inside binary_cross_entropy_with_logits.
         return w * F.binary_cross_entropy_with_logits(logits, target)
+
+    @classmethod
+    def measure_slots(cls) -> Tuple[str, ...]:
+        """
+        Binary-classifier measure slots.
+
+        Confusion counts use decision P(rise)=sigmoid(logit) >= 0.5.
+        """
+        return (
+            'bce_with_logits',
+            'accuracy',
+            'true_positive', 'true_negative',
+            'false_positive', 'false_negative',
+            'tpr', 'tnr', 'fpr', 'fnr', 'precision',
+            'mean_prob',
+            'positive_rate_true', 'positive_rate_pred',
+            'decision_threshold',
+        )
+
+    @classmethod
+    def compute_measures(
+        cls,
+        y_pred: torch.Tensor,
+        y_truth: torch.Tensor,
+        *,
+        auxiliary: Optional[dict] = None,
+        dataset=None,
+        config: Optional[dict] = None,
+        decision_threshold: float = 0.5,
+        **_kwargs,
+    ) -> dict:
+        """
+        Binary classification measures including TP/TN/FP/FN.
+
+        Positive class = rise (y=1). Decision: sigmoid(logit) >= threshold
+        (default 0.5).
+        """
+        if y_pred.shape[-1] != 1 or y_truth.shape[-1] != 1:
+            raise ValueError(
+                f"{cls.name} measures expect pred/truth last dim 1, "
+                f"got pred={tuple(y_pred.shape)} truth={tuple(y_truth.shape)}"
+            )
+        aux = dict(auxiliary or {})
+        if config is not None:
+            # Config is the source of truth for thr when aux omitted.
+            if 'decision_threshold' not in aux:
+                aux['decision_threshold'] = float(
+                    config.get('rise_flag_decision_threshold', decision_threshold)
+                )
+        thr = float(aux.get('decision_threshold', decision_threshold))
+
+        logits = y_pred[:, 0]
+        target = y_truth[:, 0].clamp(0.0, 1.0)
+        prob = torch.sigmoid(logits)
+        pred_pos = prob >= thr
+        true_pos = target >= 0.5
+
+        tp = int((pred_pos & true_pos).sum().item())
+        tn = int((~pred_pos & ~true_pos).sum().item())
+        fp = int((pred_pos & ~true_pos).sum().item())
+        fn = int((~pred_pos & true_pos).sum().item())
+        eps = 1e-12
+        tpr = tp / (tp + fn + eps)  # recall / sensitivity
+        tnr = tn / (tn + fp + eps)  # specificity
+        fpr = fp / (fp + tn + eps)
+        fnr = fn / (fn + tp + eps)
+        precision = tp / (tp + fp + eps)
+
+        metrics = {
+            'bce_with_logits': float(
+                F.binary_cross_entropy_with_logits(logits, target).item()
+            ),
+            'accuracy': float((pred_pos == true_pos).float().mean().item()),
+            'true_positive': tp,
+            'true_negative': tn,
+            'false_positive': fp,
+            'false_negative': fn,
+            'tpr': float(tpr),
+            'tnr': float(tnr),
+            'fpr': float(fpr),
+            'fnr': float(fnr),
+            'precision': float(precision),
+            'mean_prob': float(prob.mean().item()),
+            'positive_rate_true': float(true_pos.float().mean().item()),
+            'positive_rate_pred': float(pred_pos.float().mean().item()),
+            'decision_threshold': thr,
+        }
+        return metrics
+
+    @classmethod
+    def pack_measures(
+        cls,
+        y_pred: torch.Tensor,
+        y_truth: torch.Tensor,
+        *,
+        auxiliary: Optional[dict] = None,
+        dataset=None,
+        config: Optional[dict] = None,
+        **kwargs,
+    ) -> dict:
+        """
+        Pack eval measures into an opaque dict (LabelSpec ownership).
+
+        Models never see this — only INFER/report call sites.
+        """
+        return cls.compute_measures(
+            y_pred, y_truth,
+            auxiliary=auxiliary, dataset=dataset, config=config, **kwargs,
+        )
+
+    @classmethod
+    def unpack_measures(cls, measures: dict) -> dict:
+        """Select declared measure slots from a packed measures dict."""
+        slots = cls.measure_slots()
+        return {k: measures[k] for k in slots if k in measures}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -971,7 +1218,7 @@ class Label_Latent:
     forecast; the NLL trains the density against the realized next bar).
 
     Config id: 'latent'
-    Shares ``model.MarketTransformerWithHeads`` with trend/yield.
+    Shares ``model_regression.MarketRegressionWithHeads`` with trend/yield.
 
     Mode (config ``latent_distribution``):
       'normal'  → y_pred (B, 2) = (mu, var_raw);   var = softplus(var_raw)+eps
@@ -1196,6 +1443,170 @@ class Label_Latent:
             nll = y_pred.sum() * 0.0
         return weight * nll
 
+    @classmethod
+    def measure_slots(cls) -> Tuple[str, ...]:
+        return (
+            'nll', 'location_mae', 'location_rmse',
+            'mean_pred_std', 'mean_pred_df',
+        )
+
+    @classmethod
+    def compute_measures(
+        cls,
+        y_pred: torch.Tensor,
+        y_truth: torch.Tensor,
+        *,
+        auxiliary: Optional[dict] = None,
+        dataset=None,
+        config: Optional[dict] = None,
+        **_kwargs,
+    ) -> dict:
+        cfg = dict(config or {})
+        aux = cls.make_auxiliary(cfg, **(auxiliary or {}))
+        dist = resolve_latent_distribution(aux)
+        metrics = {
+            'nll': float(cls.loss(y_pred, y_pred, y_truth, auxiliary=aux).item()),
+        }
+        loc_n, scale_n, df_t = decode_latent_params(
+            y_pred, latent_distribution=dist
+        )
+        if dataset is None:
+            metrics['mean_pred_std'] = float(
+                scale_n.reshape(-1).float().mean().item()
+            )
+            return metrics
+        loc_obs, scale_obs = latent_params_to_obs_space(
+            loc_n, scale_n,
+            dataset._label_stat_mean, dataset._label_stat_std,
+        )
+        y_obs = dataset.denormalize_y(y_truth.detach().cpu()).reshape(-1)
+        loc_obs = loc_obs.reshape(-1).to(y_obs.device)
+        scale_obs = scale_obs.reshape(-1).to(y_obs.device)
+        metrics['location_mae'] = float((loc_obs - y_obs).abs().mean().item())
+        metrics['location_rmse'] = float(
+            (loc_obs - y_obs).pow(2).mean().sqrt().item()
+        )
+        metrics['mean_pred_std'] = float(scale_obs.mean().item())
+        if df_t is not None:
+            metrics['mean_pred_df'] = float(
+                df_t.reshape(-1).float().mean().item()
+            )
+        return metrics
+
+    @classmethod
+    def pack_measures(cls, y_pred, y_truth, **kwargs) -> dict:
+        return cls.compute_measures(y_pred, y_truth, **kwargs)
+
+    @classmethod
+    def unpack_measures(cls, measures: dict) -> dict:
+        slots = cls.measure_slots()
+        return {k: measures[k] for k in slots if k in measures}
+
+
+class Label_None:
+    """
+    No supervised target — for ``(vae, none)`` and similar unsupervised slots.
+
+    Cache holds a placeholder scalar of zeros. Loss is a zero that stays on
+    the prediction graph (VAE wrap_model_loss ignores y anyway).
+    """
+
+    name = LABEL_NONE
+
+    @classmethod
+    def full_cache_dim(cls) -> int:
+        return LABEL_FULL_DIM_NONE
+
+    @classmethod
+    def full_dim(cls, **_kwargs) -> int:
+        return LABEL_FULL_DIM_NONE
+
+    @classmethod
+    def resolve_future_window(cls, config: dict) -> int:
+        return int(config.get('future_window', 50))
+
+    @classmethod
+    def resolve_model_past_len(cls, config: dict) -> int:
+        return cls.resolve_future_window(config)
+
+    @classmethod
+    def resolve_output_dim(cls, config: Optional[dict] = None, **_kwargs) -> int:
+        # Placeholder head width is always 1 (cache row is a scalar zero).
+        return LABEL_FULL_DIM_NONE
+
+    @classmethod
+    def target_slice(cls, output_dim: int, **_kwargs) -> slice:
+        return slice(0, max(1, int(output_dim)))
+
+    @classmethod
+    def target_names(cls, output_dim: int, **_kwargs) -> Tuple[str, ...]:
+        return ('none',)
+
+    @classmethod
+    def find(cls, future, current, **_kwargs):
+        return (0.0,)
+
+    @classmethod
+    def make_auxiliary(cls, config: Optional[dict] = None, **overrides) -> dict:
+        return {}
+
+    @classmethod
+    def loss(
+        cls,
+        x: torch.Tensor,
+        y_pred: torch.Tensor,
+        y_truth: torch.Tensor,
+        auxiliary: Optional[dict] = None,
+    ) -> torch.Tensor:
+        if isinstance(y_pred, (tuple, list)):
+            y_pred = y_pred[0]
+        return y_pred.sum() * 0.0
+
+    @classmethod
+    def measure_slots(cls) -> Tuple[str, ...]:
+        return ()
+
+    @classmethod
+    def compute_measures(
+        cls,
+        y_pred: torch.Tensor,
+        y_truth: torch.Tensor,
+        *,
+        auxiliary: Optional[dict] = None,
+        dataset=None,
+        config: Optional[dict] = None,
+        **_kwargs,
+    ) -> dict:
+        return {'note': 'label=none (no supervised measures)'}
+
+    @classmethod
+    def pack_measures(cls, y_pred, y_truth, **kwargs) -> dict:
+        return cls.compute_measures(y_pred, y_truth, **kwargs)
+
+    @classmethod
+    def unpack_measures(cls, measures: dict) -> dict:
+        return {}
+
+
+def label_measure_slots(label_mode: str) -> Tuple[str, ...]:
+    """Declared measure names for a label id."""
+    return get_label_class(label_mode).measure_slots()
+
+
+def compute_label_measures(
+    label_mode: str,
+    y_pred: torch.Tensor,
+    y_truth: torch.Tensor,
+    **kwargs,
+) -> dict:
+    """Dispatch Label_*.pack_measures (opaque; hidden from models)."""
+    return get_label_class(label_mode).pack_measures(y_pred, y_truth, **kwargs)
+
+
+def unpack_label_measures(label_mode: str, measures: dict) -> dict:
+    """Dispatch Label_*.unpack_measures."""
+    return get_label_class(label_mode).unpack_measures(measures)
+
 
 # ═══════════════════════════════════════════════════════════
 # REGISTRY + DISPATCH
@@ -1206,6 +1617,7 @@ LABEL_CLASSES: dict[str, Type] = {
     LABEL_YIELD: Label_Yield,
     LABEL_LATENT: Label_Latent,
     LABEL_RISE_FLAG: Label_RiseFlag,
+    LABEL_NONE: Label_None,
     # legacy / shorthand aliases
     'linear_regime': Label_Trend,
     'linear_trend': Label_Trend,
@@ -1273,6 +1685,7 @@ def sync_output_dim(config: dict) -> int:
     - yield      → from ``yield_target`` (always)
     - latent     → from ``latent_distribution`` (always)
     - rise_flag  → always 1
+    - none       → keep / default placeholder dim (VAE unsupervised)
     - trend      → leave ``config['output_dim']`` unchanged (2 or 3)
 
     Returns the resulting ``output_dim``. Used so CLI modes and training
@@ -1287,6 +1700,8 @@ def sync_output_dim(config: dict) -> int:
         config['output_dim'] = Label_Latent.resolve_output_dim(config)
     elif cls is Label_RiseFlag:
         config['output_dim'] = Label_RiseFlag.resolve_output_dim(config)
+    elif cls is Label_None:
+        config['output_dim'] = Label_None.resolve_output_dim(config)
     return int(config.get('output_dim', LABEL_FULL_DIM_TREND))
 
 

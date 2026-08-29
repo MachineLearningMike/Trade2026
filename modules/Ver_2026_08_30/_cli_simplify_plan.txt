@@ -1,0 +1,250 @@
+# CLI Simplification Plan — Ver_2026_08_30
+
+**Goal:** Make TRAIN/INFER memorable and small, without losing capabilities you use.
+
+**Chosen approach:** Subcommands + short shared product flags. Daily loop stays one-liner. Rare knobs move to `config.py` / `--set key=value`. Old mega-flag list becomes deprecated aliases (not deleted on day one).
+
+**Host file (repo):** `modules/Ver_2026_08_30/_cli_simplify_plan.txt` (copy of this plan for later reference).
+
+---
+
+## 1. Why it feels unmemorable
+
+Today `TRAIN.py` is one argparse surface doing **six jobs at once**:
+
+1. Train (single / telepred / error-ensemble / sweep)
+2. Infer / validate / test
+3. Plot history / loss / validation curves
+4. Batch-export reports
+5. One-off viz (`--trend`, `--features`)
+6. Special tools (`--vae-compare`, `--validate-yield`)
+
+~60 flags share one `--help`. Verbs collide (`--validate` vs `--validation` vs `--validate-yield` vs `--last-validate`). Product knobs (`--label`, `--model-type`) sit next to plot slice syntax. Subcommands exist but are optional and incomplete, so the mental model stays “remember every flag.”
+
+---
+
+## 2. What you must still be able to do (preserve)
+
+| Capability | Keep as first-class CLI |
+|---|---|
+| Single-element train | yes |
+| Test-set eval | yes |
+| Validate (best / latest) | yes |
+| TelePred delay bank | yes |
+| ErrorEnsemble (+ extend / clean) | yes |
+| History / loss / validation plots | yes |
+| Report export | yes (subcommand) |
+| Hparam sweep | yes (subcommand; less prominent) |
+| Product cell `(model, label)` + yield/latent variants | yes |
+| Epochs / extend / clean / device-ish basics | yes |
+
+| Capability | Preserve, but demote off daily help |
+|---|---|
+| `--vae-compare` | `tools compare` or script |
+| `--validate-yield` | `infer --label yield --plot-windows` or tools |
+| `--trend` / `--features` | `tools viz …` |
+| `--ensemble-sweep` / `--vae-sweep` | `sweep` options / config |
+| Architecture knobs (patch, layers, heads, …) | config / `--set` |
+| Per-label loss weights | config / `--set` |
+| Binance symbol, ratios, windows | config / `--set` (windows may stay short flags) |
+
+Nothing in the current matrix is deleted; only the **default visible surface** shrinks.
+
+---
+
+## 3. Target CLI (memorable)
+
+### 3.1 One entry, clear verbs
+
+```text
+python TRAIN.py <command> [shared flags] [command flags]
+```
+
+| Command | Purpose | Remembers as |
+|---|---|---|
+| `train` | single-element train | “train a cell” |
+| `infer` | test (+ optional validate) | “run the model” |
+| `validate` | val curves / checkpoint val | “check val” |
+| `ensemble` | TelePred delay bank | “train delays” |
+| `error-ensemble` | residual stages | “boost residuals” |
+| `plot` | history / loss / validation curves | “look at curves” |
+| `report` | batch-export plots to `_save/…` | “export plots” |
+| `sweep` | hparam scout | “search hypers” |
+| `tools` | rare: compare, viz trend/features | “misc” |
+
+`INFER.py` becomes a thin alias of `TRAIN.py infer` (same flags), or a one-line wrapper — one mental entry point.
+
+### 3.2 Shared flags (every command that needs a product cell)
+
+Keep **≤12** shared names:
+
+| Flag | Replaces / notes |
+|---|---|
+| `--model` | alias of `--model-type` (`regression`\|`vae`) |
+| `--label` | unchanged |
+| `--yield-target` | only meaningful for yield |
+| `--latent-distribution` | only for latent (short alias `--latent-dist`) |
+| `--epochs` / `--extend` | train / ensemble / error-ensemble |
+| `--clean` | train / ensemble / error-ensemble |
+| `--delay` | single TelePred delay (alias `--telepred-delay`) |
+| `--delays` | bank list (alias `--telepred-delays`) |
+| `--checkpoint` | alias `--checkpoint-key` |
+| `--set KEY=VAL` | repeatable escape hatch into flat config |
+| `--help` | command-local help (only that verb’s flags) |
+
+Optional short shared (if you use them daily):
+
+| Flag | Notes |
+|---|---|
+| `--past` / `--future` | aliases `--past-window` / `--future-window` |
+| `--batch` | alias `--batch-size` |
+
+### 3.3 Command-local flags only
+
+**train**
+
+- `--epochs`, `--extend`, `--clean`, `--set …`
+- (no plot flags)
+
+**infer**
+
+- `--test [N]` (default all) or make `infer` imply test
+- `--checkpoint`
+- `--no-viz` (default viz on/off policy documented)
+
+**validate**
+
+- `--best` \| `--latest` (replaces `--validate` vs `--last-validate` naming collision)
+- optional percent slice: `--slice V` or `--slice V1:V2`
+
+**ensemble**
+
+- `--delays 0,2,5,10`
+- `--epochs` / `--extend` / `--clean`
+
+**error-ensemble**
+
+- `--stages N` (maps `error_ensemble_n`)
+- `--extend-stages N` (maps `--error-ensemble-extend`)
+- `--epochs` / `--clean`
+
+**plot**
+
+- `--history [KEY|all]`
+- `--loss [KEY|all]`
+- `--validation [E [slice]]`
+- `--checkpoint`
+
+**report**
+
+- positional or `--out DIR`
+- `--ensemble` to mean ensemble-report
+
+**sweep**
+
+- `--epochs-per-trial` / `--extend`
+- `--model vae` instead of `--vae-sweep`
+
+**tools**
+
+- `tools compare --vae-key … --yield-key …`
+- `tools viz-trend` / `tools viz-features`
+
+### 3.4 Example daily one-liners (after)
+
+```text
+python TRAIN.py train --model regression --label rise_flag --epochs 12
+python TRAIN.py infer --label rise_flag --test 32
+python TRAIN.py validate --latest --slice 0:30
+python TRAIN.py ensemble --label yield --delays 0,2,5,10
+python TRAIN.py error-ensemble --label yield --stages 3 --clean
+python TRAIN.py plot --history
+python TRAIN.py plot --loss
+python TRAIN.py report my_run
+```
+
+Rare:
+
+```text
+python TRAIN.py train --label yield --set patch_size=15 --set num_layers=6
+python TRAIN.py tools compare --vae-key aaa --yield-key bbb
+```
+
+---
+
+## 4. Capability map (old → new)
+
+| Today | After |
+|---|---|
+| bare `TRAIN.py …` train | `train …` (bare with only shared flags may default to `train`) |
+| `--test` | `infer` / `infer --test N` |
+| `--validate` / `--last-validate` | `validate --best` / `validate --latest` |
+| `--ensemble` | `ensemble` |
+| `--error-ensemble` / `--error-ensemble-extend` | `error-ensemble` / `--extend-stages` |
+| `--history` / `--loss` / `--validation` | `plot --history\|--loss\|--validation` |
+| `--report` / `--ensemble-report` | `report` / `report --ensemble` |
+| `--sweep` / `--vae-sweep` | `sweep` / `sweep --model vae` |
+| `--ensemble-sweep` | `sweep --with-delays` (or config) |
+| `--vae-compare` | `tools compare` |
+| `--trend` / `--features` | `tools viz-trend` / `tools viz-features` |
+| `--validate-yield` | `infer --label yield` + plot windows, or `tools yield-windows` |
+| `--patch-size`, loss weights, … | `--set` or `config.py` |
+| `--model-type` | `--model` (keep `--model-type` as hidden alias) |
+| `--checkpoint-key` | `--checkpoint` |
+| `--telepred-delay(s)` | `--delay` / `--delays` |
+
+---
+
+## 5. Design rules (so it stays simple)
+
+1. **One verb per invocation.** No more “train flags + plot flags” in one mental bag.
+2. **Command `--help` shows ≤15 flags.** Advanced via `--help-advanced` or docs.
+3. **Product cell is always `--model` + `--label` (+ variant).** COMPAT still enforced.
+4. **Defaults live in `config.py`.** CLI overrides the few you change often; `--set` for the rest.
+5. **Deprecate, don’t hard-break.** Old flags print one-line “use X instead” for one version; still work.
+6. **INFER is not a second language.** Same infer flags as `TRAIN.py infer`.
+
+---
+
+## 6. Implementation steps (Ver_2026_08_30)
+
+1. **Write `_cli_simplify_plan.txt`** in the module (this plan).
+2. **Introduce `cli_app.py`** (or expand `cli_commands.py`) with real argparse subparsers per verb; shared parent parser for product flags.
+3. **Route each subparser** to existing library calls (`train_one_run`, `run_test`, `run_ensemble_train`, …) — no logic rewrite.
+4. **Add `--set KEY=VAL`** into `apply_overrides`.
+5. **Add short aliases** (`--model`, `--delay`, `--checkpoint`) mapping to current config keys.
+6. **Move rare modes** under `tools` / `plot` / `report`.
+7. **Deprecation shim:** if legacy flat flag appears without subcommand, accept + warn once.
+8. **Shrink INFER `__main__`** to forward to `TRAIN infer` or shared `run_infer_cli`.
+9. **Docs:** one cheat-sheet (daily one-liners) at top of `TRAIN.py` docstring / `CLI.md`.
+10. **Smoke:** extend `test_phase5_cli_metrics.py` for new subparser names; golden matrix still uses library APIs (unaffected).
+
+---
+
+## 7. Non-goals
+
+- Deleting ErrorEnsemble / TelePred / sweep capabilities.
+- Forcing YAML-only workflow (optional later).
+- Renaming checkpoint folders or COMPAT ids.
+- Rewriting trainer/infer math.
+
+---
+
+## 8. Success criteria
+
+- Daily loop fits on one cheat-sheet card (~8 commands).
+- `TRAIN.py train --help` and `TRAIN.py plot --help` are short and non-overlapping.
+- Every current capability reachable via new command **or** `--set` **or** `tools`.
+- Golden matrix still passes (library path).
+- Old scripts keep working with deprecation warnings for one cut.
+
+---
+
+## 9. Suggested first cut (smallest useful PR)
+
+1. Make subcommands **required or default-to-train** (stop optional half-mode).
+2. Add shared `--model`, `--checkpoint`, `--delay(s)`, `--set`.
+3. Split `plot` + `report` out of the train help surface.
+4. Leave architecture/loss-weight flags as hidden deprecated aliases → `--set`.
+
+Then a second cut moves `vae-compare` / viz / validate-yield into `tools`.

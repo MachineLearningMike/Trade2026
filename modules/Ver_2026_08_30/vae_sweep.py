@@ -15,7 +15,7 @@ import torch
 import torch.optim as optim
 
 from labels import bind_label_loss
-from model_vae import build_market_model, resolve_max_seq_len, wrap_model_loss
+from model_v_autoencoder import build_market_model, resolve_max_seq_len, wrap_model_loss
 from trainer import ResumableTrainer, generate_checkpoint_key
 
 DEFAULT_PATCH_SIZES = (5, 10, 20)

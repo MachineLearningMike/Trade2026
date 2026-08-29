@@ -1,4 +1,4 @@
-# model.py
+# model_regression.py
 # Transformer model with prediction heads
 
 import math
@@ -251,8 +251,9 @@ class PredictionHead(nn.Module):
 
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int = 3, dropout: float = 0.1):
         super().__init__()
-        if output_dim not in (1, 2, 3):
-            raise ValueError(f"output_dim must be 1, 2, or 3, got {output_dim}")
+        output_dim = int(output_dim)
+        if output_dim < 1:
+            raise ValueError(f"output_dim must be a positive int, got {output_dim}")
         self.output_dim = output_dim
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, output_dim)
@@ -269,7 +270,7 @@ class PredictionHead(nn.Module):
 # TRANSFORMER MODEL WITH PREDICTION HEADS
 # ═══════════════════════════════════════════════════════════
 
-class MarketTransformerWithHeads(nn.Module):
+class MarketRegressionWithHeads(nn.Module):
     """
     Transformer model with a prediction head for trend labels and optional
     reconstruction.
@@ -301,12 +302,14 @@ class MarketTransformerWithHeads(nn.Module):
         head_hidden_dim_multiplier: int = 4,
         output_dim: int = 3,
         use_reconstruction: bool = True,
+        emit_reconstruction: Optional[bool] = None,
         num_shapes: int = 4,
         look_price: bool = True,
     ):
         super().__init__()
-        if output_dim not in (1, 2, 3):
-            raise ValueError(f"output_dim must be 1, 2, or 3, got {output_dim}")
+        output_dim = int(output_dim)
+        if output_dim < 1:
+            raise ValueError(f"output_dim must be a positive int, got {output_dim}")
         self.patch_size = patch_size
         self.in_features = in_features
         self.n_market_features = n_market_features
@@ -314,7 +317,12 @@ class MarketTransformerWithHeads(nn.Module):
         self.n_latent_macros = n_latent_macros
         self.causal = causal
         self.max_seq_len = max_seq_len
-        self.use_reconstruction = use_reconstruction
+        # emit_reconstruction: whether forward returns a recon tensor.
+        # Does NOT add recon MSE to regression train loss (VAE uses wrap_loss).
+        if emit_reconstruction is None:
+            emit_reconstruction = use_reconstruction
+        self.use_reconstruction = bool(emit_reconstruction)
+        self.emit_reconstruction = self.use_reconstruction
         self.output_dim = output_dim
         self.num_shapes = num_shapes
         self.n_max_past_horizon = int(n_max_past_horizon)
@@ -408,8 +416,8 @@ class MarketTransformerWithHeads(nn.Module):
             dropout=dropout
         )
 
-        # ---- Reconstruction Decoder (auxiliary) ----
-        if use_reconstruction:
+        # ---- Reconstruction Decoder (emit only; not regression train loss) ----
+        if self.emit_reconstruction:
             self.depatch = Depatch(in_features, patch_size, embed_dim)
         else:
             self.depatch = None
@@ -595,8 +603,8 @@ class MarketTransformerWithHeads(nn.Module):
             flat = torch.cat([flat, p], dim=1)
         predictions = self.prediction_head(flat)                   # (B, output_dim)
 
-        # ---- 4. Reconstruction from encoder map (optional) ----
-        if self.use_reconstruction:
+        # ---- 4. Reconstruction tensor (optional emit; loss is separate) ----
+        if self.emit_reconstruction:
             recon = self.depatch(patch_map)
         else:
             recon = None
@@ -640,7 +648,7 @@ if __name__ == "__main__":
     print(f"  output_dim: {config['output_dim']}")
 
     n_max_past = int(resolve_model_past_len(config))
-    model = MarketTransformerWithHeads(
+    model = MarketRegressionWithHeads(
         in_features=F,
         n_market_features=n_market,
         n_macro_features=n_macro,
@@ -661,7 +669,7 @@ if __name__ == "__main__":
     ).to(device)
 
     # ---- Size + weight-update diagnostics at start ----
-    report_model_size(model, name="MarketTransformerWithHeads")
+    report_model_size(model, name="MarketRegressionWithHeads")
 
     B = 4
     T = (past_window // config['patch_size']) * config['patch_size']
@@ -680,7 +688,7 @@ if __name__ == "__main__":
         loss_fn=lambda x_, y_pred, y_truth: Label_Trend.loss(
             x_, y_pred, y_truth, _trend_aux
         ),
-        name="MarketTransformerWithHeads",
+        name="MarketRegressionWithHeads",
     )
 
     print(f"\nTesting forward() with input shape: {x.shape}")

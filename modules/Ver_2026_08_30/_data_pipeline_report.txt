@@ -316,5 +316,5 @@ max_latent_future_horizon was later unified into future_window (removed
 from config and dataset signature).
 
 ================================================================================
-END OF data_pipeline_report.txt
+END OF _data_pipeline_report.txt
 ================================================================================

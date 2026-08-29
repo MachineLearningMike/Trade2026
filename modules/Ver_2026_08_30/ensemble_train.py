@@ -126,15 +126,17 @@ def run_ensemble_train(
 
     label = str(config.get('label', 'yield')).lower()
     mt = str(config.get('model_type', 'regression')).lower()
+    from compat import assert_compatible
+    from ensemble_spec import EnsembleModelSpec, describe_ensemble
+    assert_compatible(mt, label, ensemble_kind='telepred')
+    telepred_spec = EnsembleModelSpec.telepred(mt, label, delays)
     if write_csv and csv_path is None:
         csv_path = ensemble_csv_path(label=label, model_type=mt)
 
     print("\n" + "=" * 60)
     print("ENSEMBLE TRAINING (TelePred delay bank)")
     print("=" * 60)
-    print(f"  delays: {list(delays)}")
-    print(f"  label: {label}")
-    print(f"  model_type: {mt}")
+    print(describe_ensemble(telepred_spec))
     print(f"  continue_on_error: {continue_on_error}")
     if write_csv and csv_path is not None:
         print(f"  CSV: {csv_path}")

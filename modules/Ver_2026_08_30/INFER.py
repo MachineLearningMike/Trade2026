@@ -16,7 +16,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from config import get_config
-from model_vae import build_market_model, resolve_max_seq_len, wrap_model_loss
+from model_v_autoencoder import build_market_model, resolve_max_seq_len, wrap_model_loss
 from labels import resolve_model_past_len
 from labels import visualize_trend, visualize_yield, visualize_latent
 from labels import Label_Latent, resolve_latent_distribution
@@ -215,33 +215,24 @@ def load_model(
 
 
 def _collate_batch(dataset, indices: List[int]):
-    """Load a small batch of samples from the dataset (CPU tensors)."""
-    xs, ps, ys, means, stds, shapes = [], [], [], [], [], []
-    for idx in indices:
-        sample = dataset[idx]
-        if len(sample) == 6:
-            x, p, mean, std, shape, y = sample
-        else:
-            x, y, mean, std, shape = sample
-            n_p = int(
-                getattr(dataset, 'model_past_len', None)
-                or getattr(dataset, 'max_past_horizon', None)
-                or 0
-            )
-            p = x[-n_p:, getattr(dataset, 'price_feature_idx', 0)] if n_p else x.new_zeros(0)
-        xs.append(x)
-        ps.append(p)
-        ys.append(y)
-        means.append(mean)
-        stds.append(std)
-        shapes.append(shape)
+    """
+    Load a small batch from the dataset (CPU tensors).
+
+    Returns legacy tuple (x, p, y, mean, std, shape) for existing INFER call
+    sites; samples themselves are opaque dicts from TradingDataset.
+    """
+    from sample_batch import coerce_sample, collate_samples, unpack_model_input, unpack_target
+    samples = [coerce_sample(dataset[idx]) for idx in indices]
+    batch = collate_samples(samples)
+    kwargs = unpack_model_input(batch)
+    y = unpack_target(batch)
     return (
-        torch.stack(xs),      # (B, T, F)
-        torch.stack(ps),      # (B, max_past_horizon)
-        torch.stack(ys),      # (B, target_dim)  1 for latent; output_dim otherwise
-        torch.stack(means),   # (B, F)
-        torch.stack(stds),    # (B, F)
-        torch.stack(shapes),  # (B, num_shapes, F)
+        kwargs['x'],
+        kwargs['p'],
+        y,
+        kwargs['mean'],
+        kwargs['std'],
+        kwargs['shape'],
     )
 
 
@@ -767,190 +758,18 @@ def run_test(
         config,
         latent_distribution=getattr(dataset, 'latent_distribution', None),
     )
-    print("\n📊 Test Set Results:")
-    metrics = {}
-    if label_mode == 'latent':
-        aux = Label_Latent.make_auxiliary(config, latent_distribution=latent_dist)
-        metrics['nll'] = Label_Latent.loss(
-            preds, preds, test_labels, auxiliary=aux
-        ).item()
-        loc_n, scale_n, df_t = decode_latent_params(preds, latent_distribution=latent_dist)
-        loc_obs, scale_obs = latent_params_to_obs_space(
-            loc_n, scale_n,
-            dataset._label_stat_mean, dataset._label_stat_std,
-        )
-        y_obs = dataset.denormalize_y(test_labels.detach().cpu()).reshape(-1)
-        loc_obs = loc_obs.reshape(-1).to(y_obs.device)
-        scale_obs = scale_obs.reshape(-1).to(y_obs.device)
-        metrics['location_mae'] = (loc_obs - y_obs).abs().mean().item()
-        metrics['location_rmse'] = (loc_obs - y_obs).pow(2).mean().sqrt().item()
-        metrics['mean_pred_std'] = scale_obs.mean().item()
-        print(f"  Density:         {latent_dist}")
-        print(f"  NLL:             {metrics['nll']:.4f}")
-        print(f"  Location MAE:    {metrics['location_mae']:.4f}")
-        print(f"  Location RMSE:   {metrics['location_rmse']:.4f}")
-        print(f"  Mean pred std:   {metrics['mean_pred_std']:.4f}")
-        if df_t is not None:
-            metrics['mean_pred_df'] = df_t.reshape(-1).float().mean().item()
-            print(f"  Mean pred df:    {metrics['mean_pred_df']:.2f}")
-    elif label_mode == 'yield' and yield_target == 'chance':
-        metrics['chance_mse'] = torch.nn.functional.mse_loss(
-            preds[:, 0], test_labels[:, 0]
-        ).item()
-        print(f"  Chance MSE:      {metrics['chance_mse']:.4f}")
-    elif label_mode == 'yield' and yield_target == 'near':
-        metrics['near_mse'] = torch.nn.functional.mse_loss(
-            preds[:, 0], test_labels[:, 0]
-        ).item()
-        print(f"  Near MSE:        {metrics['near_mse']:.4f}")
-    elif label_mode == 'yield' and out_dim == 2:
-        metrics['chance_mse'] = torch.nn.functional.mse_loss(
-            preds[:, 0], test_labels[:, 0]
-        ).item()
-        metrics['near_mse'] = torch.nn.functional.mse_loss(
-            preds[:, 1], test_labels[:, 1]
-        ).item()
-        print(f"  Chance MSE:      {metrics['chance_mse']:.4f}")
-        print(f"  Near MSE:        {metrics['near_mse']:.4f}")
-    elif label_mode in ('rise_flag', 'riseflag', 'rise') and out_dim == 1:
-        # Logits vs {0,1} targets (identity label norm in dataset).
-        logits = preds[:, 0]
-        target = test_labels[:, 0].clamp(0.0, 1.0)
-        metrics['bce_with_logits'] = torch.nn.functional.binary_cross_entropy_with_logits(
-            logits, target
-        ).item()
-        prob = torch.sigmoid(logits)
-        pred_bin = (prob >= 0.5).to(dtype=target.dtype)
-        metrics['accuracy'] = (pred_bin == target).float().mean().item()
-        metrics['mean_prob'] = prob.mean().item()
-        metrics['positive_rate_true'] = target.mean().item()
-        metrics['positive_rate_pred'] = pred_bin.mean().item()
-        print(f"  BCE (logits):    {metrics['bce_with_logits']:.4f}")
-        print(f"  Accuracy @0.5:   {metrics['accuracy']:.4f}")
-        print(f"  Mean P(rise):    {metrics['mean_prob']:.4f}")
-        print(f"  True pos rate:   {metrics['positive_rate_true']:.4f}")
-        print(f"  Pred pos rate:   {metrics['positive_rate_pred']:.4f}")
-    elif out_dim == 3:
-        metrics['horizon_mse'] = torch.nn.functional.mse_loss(
-            preds[:, 0], test_labels[:, 0]
-        ).item()
-        metrics['slope_mse'] = torch.nn.functional.mse_loss(
-            preds[:, 1], test_labels[:, 1]
-        ).item()
-        metrics['intercept_mse'] = torch.nn.functional.mse_loss(
-            preds[:, 2], test_labels[:, 2]
-        ).item()
-        print(f"  Horizon MSE:     {metrics['horizon_mse']:.4f}")
-        print(f"  Slope MSE:       {metrics['slope_mse']:.4f}")
-        print(f"  Intercept MSE:   {metrics['intercept_mse']:.4f}")
-    elif out_dim == 2:
-        metrics['slope_mse'] = torch.nn.functional.mse_loss(
-            preds[:, 0], test_labels[:, 0]
-        ).item()
-        metrics['intercept_mse'] = torch.nn.functional.mse_loss(
-            preds[:, 1], test_labels[:, 1]
-        ).item()
-        print(f"  Slope MSE:       {metrics['slope_mse']:.4f}")
-        print(f"  Intercept MSE:   {metrics['intercept_mse']:.4f}")
-    else:
-        raise ValueError(
-            f"Unexpected pred dim {out_dim} for label_mode={label_mode!r}"
-        )
-
-    print(f"\n📈 Sample Predictions (first 5):")
-    if label_mode == 'latent':
-        loc_n, scale_n, df_t = decode_latent_params(preds, latent_distribution=latent_dist)
-        loc_obs, scale_obs = latent_params_to_obs_space(
-            loc_n, scale_n,
-            dataset._label_stat_mean, dataset._label_stat_std,
-        )
-        y_obs = dataset.denormalize_y(test_labels.detach().cpu()).reshape(-1)
-        loc_obs = loc_obs.reshape(-1).to(y_obs.device)
-        scale_obs = scale_obs.reshape(-1).to(y_obs.device)
-        if df_t is None:
-            print(
-                f"  {'Index':<6} {'y future[0]':<12} {'μ (obs)':<12} {'σ (obs)':<12}"
-            )
-            print(f"  {'-'*6} {'-'*12} {'-'*12} {'-'*12}")
-            for i in range(min(5, len(preds))):
-                print(
-                    f"  {i:<6} {y_obs[i].item():<+12.4f} "
-                    f"{loc_obs[i].item():<+12.4f} {scale_obs[i].item():<12.4f}"
-                )
-        else:
-            df_flat = df_t.reshape(-1)
-            print(
-                f"  {'Index':<6} {'y future[0]':<12} {'Pred loc':<12} "
-                f"{'Pred scale':<12} {'Pred df':<10}"
-            )
-            print(f"  {'-'*6} {'-'*12} {'-'*12} {'-'*12} {'-'*10}")
-            for i in range(min(5, len(preds))):
-                print(
-                    f"  {i:<6} {y_obs[i].item():<+12.4f} "
-                    f"{loc_obs[i].item():<+12.4f} {scale_obs[i].item():<12.4f} "
-                    f"{df_flat[i].item():<10.2f}"
-                )
-    elif label_mode == 'yield' and yield_target == 'chance':
-        print(f"  {'Index':<6} {'True Chance':<12} {'Pred Chance':<12}")
-        print(f"  {'-'*6} {'-'*12} {'-'*12}")
-        for i in range(min(5, len(preds))):
-            print(
-                f"  {i:<6} {test_labels[i, 0].item():<12.4f} {preds[i, 0].item():<12.4f}"
-            )
-    elif label_mode == 'yield' and yield_target == 'near':
-        print(f"  {'Index':<6} {'True Near':<12} {'Pred Near':<12}")
-        print(f"  {'-'*6} {'-'*12} {'-'*12}")
-        for i in range(min(5, len(preds))):
-            print(
-                f"  {i:<6} {test_labels[i, 0].item():<12.4f} {preds[i, 0].item():<12.4f}"
-            )
-    elif label_mode == 'yield' and out_dim == 2:
-        print(
-            f"  {'Index':<6} {'True Chance':<12} {'Pred Chance':<12} "
-            f"{'True Near':<12} {'Pred Near':<12}"
-        )
-        print(f"  {'-'*6} {'-'*12} {'-'*12} {'-'*12} {'-'*12}")
-        for i in range(min(5, len(preds))):
-            print(
-                f"  {i:<6} {test_labels[i, 0].item():<12.4f} {preds[i, 0].item():<12.4f} "
-                f"{test_labels[i, 1].item():<12.4f} {preds[i, 1].item():<12.4f}"
-            )
-    elif label_mode in ('rise_flag', 'riseflag', 'rise') and out_dim == 1:
-        print(
-            f"  {'Index':<6} {'True':<8} {'Logit':<12} {'P(rise)':<12} {'Pred@0.5':<10}"
-        )
-        print(f"  {'-'*6} {'-'*8} {'-'*12} {'-'*12} {'-'*10}")
-        for i in range(min(5, len(preds))):
-            logit = preds[i, 0].item()
-            prob = float(torch.sigmoid(preds[i, 0]).item())
-            pred_bin = 1 if prob >= 0.5 else 0
-            print(
-                f"  {i:<6} {test_labels[i, 0].item():<8.0f} "
-                f"{logit:<+12.4f} {prob:<12.4f} {pred_bin:<10d}"
-            )
-    elif out_dim == 3:
-        print(
-            f"  {'Index':<6} {'True H':<8} {'Pred H':<8} {'True Slope':<12} {'Pred Slope':<12} "
-            f"{'True Intercept':<14} {'Pred Intercept':<14}"
-        )
-        print(f"  {'-'*6} {'-'*8} {'-'*8} {'-'*12} {'-'*12} {'-'*14} {'-'*14}")
-        for i in range(min(5, len(preds))):
-            print(
-                f"  {i:<6} {test_labels[i, 0].item():<8.0f} {preds[i, 0].item():<8.0f} "
-                f"{test_labels[i, 1].item():<12.4f} {preds[i, 1].item():<12.4f} "
-                f"{test_labels[i, 2].item():<14.2f} {preds[i, 2].item():<14.2f}"
-            )
-    else:
-        print(
-            f"  {'Index':<6} {'True Slope':<12} {'Pred Slope':<12} "
-            f"{'True Intercept':<14} {'Pred Intercept':<14}"
-        )
-        print(f"  {'-'*6} {'-'*12} {'-'*12} {'-'*14} {'-'*14}")
-        for i in range(min(5, len(preds))):
-            print(
-                f"  {i:<6} {test_labels[i, 0].item():<12.4f} {preds[i, 0].item():<12.4f} "
-                f"{test_labels[i, 1].item():<14.2f} {preds[i, 1].item():<14.2f}"
-            )
+    from label_metrics import report_test_metrics
+    metrics = report_test_metrics(
+        label_mode,
+        preds,
+        test_labels,
+        config=config,
+        dataset=dataset,
+        yield_target=yield_target,
+        latent_distribution=latent_dist,
+        print_samples=True,
+        n_samples=5,
+    )
 
     if visualize:
         n_viz = len(used_indices)
@@ -2092,4 +1911,10 @@ def run_validate_yield(
 
 
 if __name__ == "__main__":
-    run_test(get_config())
+    # One language with TRAIN: forward to simplified `TRAIN.py infer …`
+    import sys
+    from config import get_config
+    print("INFER.py → TRAIN.py infer (same CLI). Prefer: python TRAIN.py infer …")
+    sys.argv = [sys.argv[0], 'infer'] + sys.argv[1:]
+    from TRAIN import main as train_main
+    train_main(get_config())

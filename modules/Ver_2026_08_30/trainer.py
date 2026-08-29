@@ -48,7 +48,9 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
         'head_hidden_dim_multiplier': config.get('head_hidden_dim_multiplier'),
         'output_dim': config.get('output_dim', 3),
         'causal': config.get('causal'),
-        'use_reconstruction': config.get('use_reconstruction'),
+        'use_reconstruction': config.get(
+            'emit_reconstruction', config.get('use_reconstruction')
+        ),
         'look_price': config.get('look_price', True),
     }
     if model_type == 'vae':
@@ -856,7 +858,12 @@ class TrainingHistory:
         self.val_losses = data.get('val_losses', [])
         self.timestamps = data.get('timestamps', [])
     
-    def plot(self, save_path: Optional[str] = None, figsize: Tuple[int, int] = (12, 6)):
+    def plot(
+        self,
+        save_path: Optional[str] = None,
+        figsize: Tuple[int, int] = (12, 6),
+        show: bool = True,
+    ):
         if not self.epochs:
             print("No training history to plot.")
             return
@@ -896,7 +903,10 @@ class TrainingHistory:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             print(f"✓ Training history plot saved to: {save_path}")
         
-        plt.show()
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
         return fig
     
     def print_summary(self):
@@ -1670,15 +1680,12 @@ class ResumableTrainer:
                 if batch is None:
                     break
                 
-                x, p, mean, std, shape, y = batch
-                x = x.to(self.device, non_blocking=True)
-                p = p.to(self.device, non_blocking=True)
-                y = y.to(self.device, non_blocking=True)
-                mean = mean.to(self.device, non_blocking=True)
-                std = std.to(self.device, non_blocking=True)
-                shape = shape.to(self.device, non_blocking=True)
-                
-                PRED = self.model(x, p, mean, std, shape)
+                from sample_batch import batch_to_device, unpack_model_input, unpack_target
+                batch = batch_to_device(batch, self.device, non_blocking=True)
+                kwargs = unpack_model_input(batch)
+                x = kwargs['x']
+                y = unpack_target(batch)
+                PRED = self.model(**kwargs)
                 LOSS = self.loss_fn(x, PRED, y)
                 batch_loss = float(LOSS.item())
                 total_loss += batch_loss
@@ -2354,18 +2361,14 @@ class ResumableTrainer:
                         
             compute_start = time.perf_counter()
             
-            x, p, mean, std, shape, y = batch   # All normalized and ready for model input
-            # x: (B, F, T), p: (B, max_past_horizon), mean: (B, F, 1), std: (B, F, 1), shape: (B, F, 4), y: (B, output_dim)
-            
-            x = x.to(device, non_blocking=True)
-            p = p.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            mean = mean.to(device, non_blocking=True)
-            std = std.to(device, non_blocking=True)
-            shape = shape.to(device, non_blocking=True)
-            
+            from sample_batch import batch_to_device, unpack_model_input, unpack_target
+            batch = batch_to_device(batch, device, non_blocking=True)
+            kwargs = unpack_model_input(batch)
+            x = kwargs['x']
+            y = unpack_target(batch)
+
             optimizer.zero_grad()
-            PRED = model(x, p, mean, std, shape)
+            PRED = model(**kwargs)
             LOSS = loss_fn(x, PRED, y)
             LOSS.backward()
             optimizer.step()

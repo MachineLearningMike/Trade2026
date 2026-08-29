@@ -1,7 +1,7 @@
 # error_ensemble.py
 # Residual / error-boosting ensemble.
 #
-# SOURCE OF TRUTH: error_ensemble_logic.txt — keep this module aligned with it.
+# SOURCE OF TRUTH: _error_ensemble_logic.txt — keep this module aligned with it.
 #
 # All additive structure is in **y-normalized** Yield space:
 #   e_0 = y - y_0
@@ -31,7 +31,7 @@ LossFn = Callable[[torch.Tensor, Any, torch.Tensor], torch.Tensor]
 # Sidecar next to each stage checkpoint key (mean/std of that stage's target).
 STAGE_NORM_FILENAME = 'error_stage_norm.json'
 STAGE_RUN_CONFIG_FILENAME = 'error_ensemble_config.json'
-# v2: residual stats / summing in y-normalized space (error_ensemble_logic.txt).
+# v2: residual stats / summing in y-normalized space (_error_ensemble_logic.txt).
 STAGE_NORM_VERSION = 2
 
 # Config keys persisted so report/eval can rebuild matching dataset + model.
@@ -91,7 +91,7 @@ def save_error_ensemble_run_config(checkpoint_dir: Path, config: dict) -> Path:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     path = checkpoint_dir / STAGE_RUN_CONFIG_FILENAME
     payload = {k: config.get(k) for k in _RUN_CONFIG_KEYS}
-    payload['error_ensemble_logic'] = 'error_ensemble_logic.txt'
+    payload['error_ensemble_logic'] = '_error_ensemble_logic.txt'
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2, default=str)
     return path
@@ -260,7 +260,7 @@ def contribution_in_y_space(
     """
     Map ``model_stage`` output into y-normalized space for additive ensembling.
 
-    Per error_ensemble_logic.txt:
+    Per _error_ensemble_logic.txt:
       - model_0: ``y_0`` already in y-space → return ``pred``
       - model_i (i>=1): ``pred`` is in norm_{i-1}-space; ``stage_norm`` is
         ``(mean_{i-1}, std_{i-1})`` stored in model_i's sidecar
@@ -428,7 +428,7 @@ def bind_residual_stage_loss(
     stage_model: ResidualStageWrapper,
 ) -> LossFn:
     """
-    Stage loss in y-normalized space (error_ensemble_logic.txt):
+    Stage loss in y-normalized space (_error_ensemble_logic.txt):
 
       e = y - sum_{j<i} contrib_y(model_j)     # e_{-1} path: e = y
       target = normalize_i(e)                  # active stage mean/std
@@ -457,7 +457,7 @@ class ErrorEnsemble(nn.Module):
     """
     Ensemble of residual error models ``{model_0, ..., model_{n-1}}``.
 
-    Flat ensembles in y-normalized space (error_ensemble_logic.txt):
+    Flat ensembles in y-normalized space (_error_ensemble_logic.txt):
 
       en_k = y_0 + denorm_0(y_1) + ... + denorm_{k-1}(y_k)
     """
@@ -829,7 +829,7 @@ def load_one_error_stage(
     """
     from config import project_root_dir
     from labels import resolve_model_past_len, sync_output_dim
-    from model_vae import build_market_model, resolve_max_seq_len
+    from model_v_autoencoder import build_market_model, resolve_max_seq_len
     from telepred import resolve_past_window
     from INFER import find_checkpoint_by_key
 
@@ -1007,12 +1007,15 @@ def evaluate_ensemble_over_stages(
         progress_label="collect y(D)",
         progress_every=100,
     ):
-        if not isinstance(batch, (tuple, list)) or len(batch) < 6:
+        from sample_batch import as_train_tuple
+        try:
+            _x, _p, _mean, _std, _shape, y_t = as_train_tuple(batch)
+        except Exception as e:
             raise ValueError(
-                "evaluate_ensemble_over_stages expects batches "
-                "(x, p, mean, std, shape, y)"
-            )
-        y_norm = batch[5].detach().cpu()
+                "evaluate_ensemble_over_stages expects sample dict or "
+                "(x, p, mean, std, shape, y) batches"
+            ) from e
+        y_norm = y_t.detach().cpu()
         y_chunks.append(y_norm)
         n_batches += 1
     if not y_chunks:
@@ -1045,7 +1048,8 @@ def evaluate_ensemble_over_stages(
                 progress_label=f"model_{stage}(D)",
                 progress_every=50,
             ):
-                x, p, mean, std, shape, _y = batch[:6]
+                from sample_batch import as_train_tuple
+                x, p, mean, std, shape, _y = as_train_tuple(batch)
                 x = x.to(device)
                 p = p.to(device)
                 mean = mean.to(device)
@@ -1176,7 +1180,8 @@ def compute_stage_target_stats(
         batch, _w, _l = loader.get_next_batch()
         if batch is None:
             break
-        x, p, mean, std, shape, y_norm = batch[:6]
+        from sample_batch import as_train_tuple
+        x, p, mean, std, shape, y_norm = as_train_tuple(batch)
         x = x.to(device)
         p = p.to(device)
         mean = mean.to(device)
@@ -1236,7 +1241,7 @@ def load_error_ensemble_stages(
     """
     from config import project_root_dir
     from labels import resolve_model_past_len, sync_output_dim
-    from model_vae import build_market_model, resolve_max_seq_len
+    from model_v_autoencoder import build_market_model, resolve_max_seq_len
     from telepred import resolve_past_window
     from INFER import find_checkpoint_by_key
 
@@ -1408,7 +1413,7 @@ def run_error_ensemble_train(
     Existing finished stages ``0 .. start_stage-1`` are kept and loaded frozen
     when building residual targets for later stages.
     """
-    from model_vae import build_market_model, resolve_max_seq_len, wrap_model_loss
+    from model_v_autoencoder import build_market_model, resolve_max_seq_len, wrap_model_loss
     from train_run import train_one_run
     from labels import resolve_model_past_len
     from telepred import resolve_past_window
@@ -1427,16 +1432,10 @@ def run_error_ensemble_train(
         getattr(dataset, 'label_mode', cfg_base.get('label', 'yield'))
     ).lower()
     model_type = str(cfg_base.get('model_type', 'regression')).lower()
-    if model_type == 'vae':
-        raise ValueError(
-            "ErrorEnsemble requires model_type='regression' "
-            "(VAE has no label residual to fit)."
-        )
-    if label_mode == 'latent':
-        raise ValueError(
-            "ErrorEnsemble does not support label='latent' "
-            "(density params are not residual-additive point targets)."
-        )
+    from compat import assert_compatible
+    from ensemble_spec import EnsembleModelSpec, describe_ensemble
+    assert_compatible(model_type, label_mode, ensemble_kind='error')
+    err_spec = EnsembleModelSpec.error(label_mode, n_models, model_id=model_type)
 
     cfg_base['error_ensemble_n'] = n_models
     device = torch.device(
@@ -1446,14 +1445,12 @@ def run_error_ensemble_train(
     print("\n" + "=" * 60)
     print("ERROR ENSEMBLE TRAINING (residual boosting)")
     print("=" * 60)
-    print(f"  stages (n):     {n_models}  → model_0 .. model_{n_models - 1}")
+    print(describe_ensemble(err_spec))
     if start > 0:
         print(
             f"  extend from:    model_{start} "
             f"(keeping finished model_0 .. model_{start - 1})"
         )
-    print(f"  label:          {label_mode}")
-    print(f"  model_type:     {model_type}")
     print(f"  telepred_delay: {int(cfg_base.get('telepred_delay', 0) or 0)}")
     print(f"  device:         {device}")
     print("=" * 60 + "\n")

@@ -1,8 +1,24 @@
 # TRAIN.py
-# Main training script - Clean version with all logic in trainer
+# Main training / infer entry (simplified CLI — see _cli_simplify_plan.txt).
+#
+# Daily cheat-sheet:
+#   python TRAIN.py train --model regression --label rise_flag --epochs 12
+#   python TRAIN.py infer --label rise_flag --test 32
+#   python TRAIN.py validate --latest --slice 0:30
+#   python TRAIN.py ensemble --label yield --delays 0,2,5,10
+#   python TRAIN.py error-ensemble --label yield --stages 3 --clean
+#   python TRAIN.py plot --history
+#   python TRAIN.py plot --loss
+#   python TRAIN.py report              # → _save/YYYYMMDD_HHMMSS/ + git commit
+#   python TRAIN.py report my_run
+#   python TRAIN.py train --label yield --set patch_size=15
+#
+# Rare: tools compare | viz-trend | viz-features | yield-windows ; search
+# Legacy flat flags still work (deprecation warning). TRAIN_CLI_LEGACY=1 forces them.
 
 import sys
 from pathlib import Path
+from typing import Optional
 
 import argparse
 import json
@@ -108,405 +124,446 @@ def _export_validation_epoch_plots(source_dir: Path, report_dir: Path) -> dict:
     }
 
 
+def _export_training_history_plot(source_dir: Path, report_dir: Path) -> Optional[Path]:
+    """
+    Write the same training-history figure as ``plot --history`` into ``report_dir``.
+
+    Saves ``training_history.png`` (report artifact name). Returns the path, or
+    None if history is missing / empty.
+    """
+    from trainer import TrainingHistory
+
+    source_dir = Path(source_dir)
+    report_dir = Path(report_dir)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    state_file = source_dir / 'training_state.json'
+    if not state_file.exists():
+        print(f"⚠ No training_state.json in {source_dir.name}; skipping history plot")
+        return None
+    try:
+        with open(state_file, 'r', encoding='utf-8') as f:
+            state_info = json.load(f)
+    except Exception as exc:
+        print(f"⚠ Failed to read {state_file}: {exc}")
+        return None
+    history_data = state_info.get('history') or {}
+    epochs = history_data.get('epochs') or []
+    if not epochs:
+        print(f"⚠ Empty epoch history in {source_dir.name}; skipping history plot")
+        return None
+    temp_history = TrainingHistory()
+    temp_history.from_dict(history_data)
+    plot_path = report_dir / 'training_history.png'
+    temp_history.plot(save_path=str(plot_path), show=False)
+    print(f"📈 History plot → {plot_path}")
+    return plot_path
+
+
 def main(config):
     """Main training function."""
     
     # Ensure price_feature_idx exists
     if 'price_feature_idx' not in config:
         config['price_feature_idx'] = 0
+
+    # Simplified subcommand CLI (cli_app); legacy mega-parser as fallback.
+    from cli_app import apply_set_pairs, try_parse_simplified, warn_legacy_once
+    from cli_commands import (
+        apply_command_to_namespace,
+        command_help_epilog,
+        split_command_argv,
+    )
+
+    simple_args = try_parse_simplified(config)
+    if simple_args is not None:
+        args = simple_args
+        _legacy_cli = False
+    else:
+        _legacy_cli = True
+        warn_legacy_once()
+        cmd, rest = split_command_argv()
+        if cmd == 'report' and rest and not str(rest[0]).startswith('-'):
+            rest = ['--report', rest[0]] + rest[1:]
+        _old_argv = sys.argv
+        sys.argv = [_old_argv[0]] + rest
+
+        parser = argparse.ArgumentParser(
+            description='Resilient Trading Training (regression / VAE) [legacy flat flags]',
+            epilog=command_help_epilog(),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        parser.add_argument('--epochs', type=int, default=config['epochs'], help='Number of epochs')
+        parser.add_argument(
+            '--save-every', type=float, default=config['save_every_n_minutes'],
+            help='Save checkpoint every N wall-clock minutes',
+        )
+        parser.add_argument(
+            '--clean', action='store_true',
+            help='Delete checkpoints for the current checkpoint key only '
+                 '(other key folders under checkpoint_dir are preserved)',
+        )
+        parser.add_argument(
+            '--extend', type=float, default=None,
+            help=(
+                'Adjust planned total epochs by N (float OK). '
+                'Positive adds beyond max(plan, progress); negative shortens the plan '
+                '(not below current progress). Examples: --extend 10, --extend 1.5, --extend -5'
+            ),
+        )
+        parser.add_argument('--trend', action='store_true', default=False,
+                           help='Generate and visualize trends without training')
+        parser.add_argument(
+            '--history', nargs='?', const='current', default=None,
+            help=(
+                'Visualize training history without loading market data. '
+                'Use --history (current config key), --history all, or '
+                '--history <checkpoint_key> (e.g. 541f3423a2cec4a6).'
+            ),
+        )
+        parser.add_argument(
+            '--loss', nargs='?', const='current', default=None,
+            help=(
+                'Display per-minibatch loss of the latest training epoch '
+                '(no market data load). '
+                'Use --loss (current config key), --loss all, or '
+                '--loss <checkpoint_key>.'
+            ),
+        )
+        parser.add_argument(
+            '--validation', nargs='*', default=None, metavar='E',
+            help=(
+                'Plot per-batch validation loss for epoch E (no market data load), '
+                'including moving average and running loss. Curves come from '
+                'validation_loss_epoch_<E>.json written during training. '
+                'Optional percent slice of the saved batch series: '
+                '--validation → latest epoch, [0%%, 100%%]; '
+                '--validation E → epoch E, [0%%, 100%%]; '
+                '--validation E V2 → epoch E, [0%%, V2%%]; '
+                '--validation E V1 V2 → epoch E, [V1%%, V2%%].'
+            ),
+        )
+        parser.add_argument(
+            '--report', type=str, default=None, metavar='DIR_NAME',
+            help=(
+                "Batch-export validation loss plots for every saved epoch under the "
+                "current checkpoint key, plus training_history.png (same figure as "
+                "plot --history). Prefer: TRAIN.py report [DIR]. "
+                "Images → <project_root>/_save/<dir_name>/ as validation_e001.png "
+                "and validation_e001_p0_30.png. Bare 'report' (no DIR) uses "
+                "YYYYMMDD_HHMMSS and git-commits all changes with that message."
+            ),
+        )
+        parser.add_argument(
+            '--ensemble-report', type=str, default=None, metavar='DIR_NAME',
+            help=(
+                "Like --report, but for every TelePred delay trained by --ensemble. "
+                "Canonical form: --ensemble-report 'folder name'. "
+                "Writes <project_root>/_save/<folder name>/d<delay>/validation_eXXX.png "
+                "(and _p0_30.png) for each delay in config/--telepred-delays. "
+                "No interactive plots."
+            ),
+        )
+        parser.add_argument(
+            '--checkpoint-key', type=str, default=None, metavar='KEY',
+            help=(
+                'Force a checkpoint folder under checkpoint_dir (e.g. a prior '
+                'yield transformer run). Use with --validate / --test / '
+                '--validate-yield. Architecture must still match the weights '
+                '(set --model-type regression for yield models).'
+            ),
+        )
+        parser.add_argument(
+            '--vae-compare', type=float, nargs='*', default=None, metavar='V',
+            help=(
+                'Compare per-sample VAE loss vs yield loss on sorted val samples '
+                '(scatter + dual series + Pearson/Spearman). Requires --vae-key '
+                'and --yield-key. Optional percent slice like --validate: '
+                '--vae-compare | --vae-compare V | --vae-compare V1 V2.'
+            ),
+        )
+        parser.add_argument(
+            '--vae-key', type=str, default=None, metavar='KEY',
+            help='VAE checkpoint folder name for --vae-compare.',
+        )
+        parser.add_argument(
+            '--yield-key', type=str, default=None, metavar='KEY',
+            help='Yield (regression) checkpoint folder name for --vae-compare.',
+        )
+        parser.add_argument(
+            '--search', '--sweep', dest='sweep', action='store_true', default=False,
+            help=(
+                'Hyperparameter search over patch_size × num_layers '
+                '(default 5/10/20 × 2/4/6) for the designated model_type '
+                '(config or --model-type). Prefer: TRAIN.py search … '
+                'Appends to <project_root>/_save/<model_type>_sweep/results.csv. '
+                'Resumes existing trial keys; use --search-extend to add epochs.'
+            ),
+        )
+        parser.add_argument(
+            '--vae-search', '--vae-sweep', dest='vae_sweep',
+            action='store_true', default=False,
+            help='Alias for --search --model-type vae (prefer: search --model vae).',
+        )
+        parser.add_argument(
+            '--search-epochs', '--sweep-epochs', dest='sweep_epochs',
+            type=int, default=1, metavar='N',
+            help='Base epoch plan per trial for --search (default 1).',
+        )
+        parser.add_argument(
+            '--search-extend', '--sweep-extend', dest='sweep_extend',
+            type=float, default=1.0, metavar='N',
+            help=(
+                'If a trial checkpoint already exists, add this many epochs '
+                '(default 1) and append a new row to results.csv. '
+                'Fresh trials still use --search-epochs only.'
+            ),
+        )
+        parser.add_argument(
+            '--telepred-delay', type=int,
+            default=int(config.get('telepred_delay', 0) or 0),
+            metavar='D',
+            help='TelePred delay d (bars): input ends at bot_time-d (default 0)',
+        )
+        parser.add_argument(
+            '--telepred-delays', type=str, default=None, metavar='LIST',
+            help=(
+                'Comma-separated delays for --ensemble / --ensemble-sweep '
+                '(default: config telepred_delays)'
+            ),
+        )
+        parser.add_argument(
+            '--ensemble', action='store_true', default=False,
+            help=(
+                'Train the full TelePred delay bank (one checkpoint per d). '
+                'Appends rows to '
+                '<project_root>/_save/ensemble_<label>_<model_type>/results.csv'
+            ),
+        )
+        parser.add_argument(
+            '--ensemble-sweep', action='store_true', default=False,
+            help=(
+                'Hyperparameter scout: outer patch_size×num_layers; '
+                'each trial trains the full TelePred delay bank'
+            ),
+        )
+        parser.add_argument(
+            '--validate', type=float, nargs='*', default=None, metavar='V',
+            help=(
+                'Run validation with the best checkpoint on a percent slice of '
+                'sorted validation samples, then plot batch/MA/running-loss '
+                '(same series as --validation; no files saved). '
+                '--validate → [0%%, 100%%]; '
+                '--validate V → [0%%, V%%]; '
+                '--validate V1 V2 → [V1%%, V2%%]. '
+                'Examples: --validate   |   --validate 30   |   --validate 20 40'
+            ),
+        )
+        parser.add_argument(
+            '--last-validate', type=float, nargs='*', default=None, metavar='V',
+            help=(
+                'Same as --validate, but loads the latest available checkpoint '
+                '(training_state latest_checkpoint / newest .pt) instead of best_val. '
+                '--last-validate → [0%%, 100%%]; '
+                '--last-validate V → [0%%, V%%]; '
+                '--last-validate V1 V2 → [V1%%, V2%%].'
+            ),
+        )
+        parser.add_argument('--features', action='store_true', default=False,
+                           help='Visualize total_features without training')
+        parser.add_argument(
+            '--validate-yield', nargs='?', const=-1, default=None, type=int,
+            metavar='N',
+            help=(
+                'Load the latest checkpoint and plot chance / near over '
+                'validation samples (yield label mode). '
+                '--validate-yield uses all val samples; --validate-yield N uses '
+                'N samples spaced across the chronological validation period. '
+                'Shows series + pred-vs-true plots, then interactive yield windows. '
+                'Batch size is config validate_batch_size.'
+            ),
+        )
+        parser.add_argument(
+            '--test', nargs='?', const=-1, default=None, type=int, metavar='N',
+            help=(
+                'Run test-set evaluation without training (same as INFER.py). '
+                '--test uses all test samples; --test N uses N samples spaced '
+                'across the chronological test period (not a fixed-seed head). '
+                'Batch size is config test_batch_size; latent viz count is '
+                'config test_viz_samples.'
+            ),
+        )
+        parser.add_argument(
+            '--past-window', type=int,
+            default=int(config.get('past_window', 1440)),
+            help='TelePred delta1: past input length in bars',
+        )
+        parser.add_argument(
+            '--future-window', type=int,
+            default=int(config.get('future_window', 50)),
+            help='TelePred delta2: label future length in bars (yield/trend/latent)',
+        )
+        parser.add_argument('--batch-size', type=int, default=config['batch_size'], help='Batch size')
+        parser.add_argument('--total-days', type=int, default=config['total_synthetic_days'], help='Total days of data')
+        parser.add_argument('--step', type=int, default=config['step'], help='Step size for start indices')
+        parser.add_argument('--max-accum-deviation', type=float, default=config['max_accum_deviation'],
+                           help='Threshold for cumulative absolute deviation')
+        parser.add_argument(
+            '--min-trend-horizon', type=int,
+            default=config.get('min_trend_horizon', 3),
+            help='Minimum linear-regime horizon',
+        )
+        parser.add_argument(
+            '--min-yield-percent', type=float,
+            default=config.get('min_yield_percent', 0.0),
+            help='Minimum yield percent for yield',
+        )
+        parser.add_argument(
+            '--model-type', type=str,
+            default=config.get('model_type', 'regression'),
+            choices=['regression', 'vae'],
+            help=(
+                "Model backend: 'regression' (supervised label loss) or "
+                "'vae' (recon+KL only — supervised --label is ignored by the "
+                "train objective; prefer label unused / future label=none)."
+            ),
+        )
+        from registry import label_cli_choices
+        parser.add_argument(
+            '--label', type=str, default=config.get('label', 'trend'),
+            choices=list(label_cli_choices()),
+            help=(
+                'Label family: trend | yield | latent | rise_flag | none. '
+                'COMPAT: regression×{trend,yield,latent,rise_flag}; '
+                'vae requires --label none (unsupervised recon+KL).'
+            ),
+        )
+        parser.add_argument(
+            '--yield-target', type=str,
+            default=config.get('yield_target', 'both'),
+            choices=['both', 'chance', 'near'],
+            help=(
+                "Yield head target when --label yield: "
+                "'both' (dim 2), 'chance' (dim 1), or 'near' (dim 1)"
+            ),
+        )
+        parser.add_argument(
+            '--latent-distribution', type=str,
+            default=config.get('latent_distribution', 'normal'),
+            choices=[
+                'normal', 'student',
+                'normal_distribution', 'student_distribution', 'student_t',
+            ],
+            help=(
+                'Density for --label latent: normal → output_dim=2 (mu, var_raw); '
+                'student → output_dim=3 (loc, scale_raw, df_raw)'
+            ),
+        )
+        parser.add_argument(
+            '--error-ensemble', action='store_true', default=False,
+            help=(
+                'Train residual ErrorEnsemble stages model_0..model_{n-1} '
+                '(regression + point labels only; see _error_ensemble_logic.txt). '
+                'Uses config error_ensemble_n unless --error-ensemble-extend.'
+            ),
+        )
+        parser.add_argument(
+            '--error-ensemble-extend', type=int, default=None, metavar='N',
+            help=(
+                'Add N new ErrorEnsemble stages after finished ones on disk '
+                '(implies --error-ensemble). Example: 2 finished + '
+                '--error-ensemble-extend 2 → train model_2..model_3.'
+            ),
+        )
+        parser.add_argument('--no-normalize-window', action='store_true', help='Disable per-window z-score normalization')
+        parser.add_argument('--lr', type=float, default=config['learning_rate'], help='Learning rate')
+        parser.add_argument('--slope-weight', type=float, default=config['slope_loss_weight'],
+                           help='Weight for slope loss (--label trend)')
+        parser.add_argument('--intercept-weight', type=float, default=config['intercept_loss_weight'],
+                           help='Weight for intercept loss (--label trend)')
+        parser.add_argument('--chance-weight', type=float,
+                           default=config.get('chance_loss_weight', 1.0),
+                           help='Weight for chance loss (--label yield)')
+        parser.add_argument('--near-weight', type=float,
+                           default=config.get('near_loss_weight', 1.0),
+                           help='Weight for near loss (--label yield)')
+        parser.add_argument('--rise-flag-weight', type=float,
+                           default=config.get('rise_flag_loss_weight', 1.0),
+                           help='Weight for BCE loss (--label rise_flag)')
+        parser.add_argument('--recon-weight', type=float, default=config['reconstruction_loss_weight'],
+                           help='Weight for reconstruction loss (VAE / recon aux)')
+        parser.add_argument('--vae-kl-weight', type=float,
+                           default=config.get('vae_kl_weight', 0.1),
+                           help='KL weight when --model-type vae')
+        parser.add_argument('--patch-size', type=int, default=config['patch_size'],
+                           help='Patch size for temporal patching')
+        parser.add_argument('--num-layers', type=int, default=config['num_layers'],
+                           help='Number of transformer layers')
+        parser.add_argument('--num-heads', type=int, default=config['num_heads'],
+                           help='Number of attention heads')
+        parser.add_argument('--ff-dim-multiplier', type=int, default=config['ff_dim_multiplier'],
+                           help='Feed-forward dimension')
+        parser.add_argument('--dropout', type=float, default=config['dropout'], help='Dropout rate')
+        parser.add_argument('--head-hidden-dim-multiplier', type=int, default=config['head_hidden_dim_multiplier'],
+                           help='Hidden dimension multiplier for prediction heads')
+        parser.add_argument('--no-causal', action='store_true', default=not config['causal'],
+                           help='Disable causal attention')
+        parser.add_argument(
+            '--no-reconstruction', action='store_true',
+            default=not config.get(
+                'emit_reconstruction', config.get('use_reconstruction', False)
+            ),
+            help=(
+                'Do not emit reconstruction tensor from forward '
+                '(emit_reconstruction / legacy use_reconstruction). '
+                'Does not add recon MSE to regression loss; VAE loss is separate.'
+            ),
+        )
+        parser.add_argument(
+            '--no-look-price',
+            action='store_true',
+            default=not config.get('look_price', True),
+            help='Do not concat recent past prices p into the prediction head',
+        )
+        parser.add_argument('--use-binance', action='store_true', default=config['use_binance_data'],
+                           help='Use real Binance data instead of synthetic')
+        parser.add_argument('--symbol', type=str, default=config.get('binance_primary_symbol', 'BTCUSDT'),
+                           help='Primary trading pair symbol')
     
-    parser = argparse.ArgumentParser(description='Resilient Trading Training (regression / VAE)')
-    parser.add_argument('--epochs', type=int, default=config['epochs'], help='Number of epochs')
-    parser.add_argument(
-        '--save-every', type=float, default=config['save_every_n_minutes'],
-        help='Save checkpoint every N wall-clock minutes',
-    )
-    parser.add_argument(
-        '--clean', action='store_true',
-        help='Delete checkpoints for the current checkpoint key only '
-             '(other key folders under checkpoint_dir are preserved)',
-    )
-    parser.add_argument(
-        '--extend', type=float, default=None,
-        help=(
-            'Adjust planned total epochs by N (float OK). '
-            'Positive adds beyond max(plan, progress); negative shortens the plan '
-            '(not below current progress). Examples: --extend 10, --extend 1.5, --extend -5'
-        ),
-    )
-    parser.add_argument('--trend', action='store_true', default=False,
-                       help='Generate and visualize trends without training')
-    parser.add_argument(
-        '--history', nargs='?', const='current', default=None,
-        help=(
-            'Visualize training history without loading market data. '
-            'Use --history (current config key), --history all, or '
-            '--history <checkpoint_key> (e.g. 541f3423a2cec4a6).'
-        ),
-    )
-    parser.add_argument(
-        '--loss', nargs='?', const='current', default=None,
-        help=(
-            'Display per-minibatch loss of the latest training epoch '
-            '(no market data load). '
-            'Use --loss (current config key), --loss all, or '
-            '--loss <checkpoint_key>.'
-        ),
-    )
-    parser.add_argument(
-        '--validation', nargs='*', default=None, metavar='E',
-        help=(
-            'Plot per-batch validation loss for epoch E (no market data load), '
-            'including moving average and running loss. Curves come from '
-            'validation_loss_epoch_<E>.json written during training. '
-            'Optional percent slice of the saved batch series: '
-            '--validation → latest epoch, [0%%, 100%%]; '
-            '--validation E → epoch E, [0%%, 100%%]; '
-            '--validation E V2 → epoch E, [0%%, V2%%]; '
-            '--validation E V1 V2 → epoch E, [V1%%, V2%%].'
-        ),
-    )
-    parser.add_argument(
-        
-        '--report', type=str, default=None, metavar='DIR_NAME',
-        help=(
-            "Batch-export validation loss plots for every saved epoch under the "
-            "current checkpoint key. Canonical form: --report 'dir name'. "
-            "Images are written to <project_root>/_save/<dir_name>/ as "
-            "validation_e001.png (= --validation e) and "
-            "validation_e001_p0_30.png (= --validation e 30), "
-            "with zero-padded epoch ids for alphabetical order. "
-            "No interactive plots."
-        ),
-    )
-    parser.add_argument(
-        '--ensemble-report', type=str, default=None, metavar='DIR_NAME',
-        help=(
-            "Like --report, but for every TelePred delay trained by --ensemble. "
-            "Canonical form: --ensemble-report 'folder name'. "
-            "Writes <project_root>/_save/<folder name>/d<delay>/validation_eXXX.png "
-            "(and _p0_30.png) for each delay in config/--telepred-delays. "
-            "No interactive plots."
-        ),
-    )
-    parser.add_argument(
-        '--checkpoint-key', type=str, default=None, metavar='KEY',
-        help=(
-            'Force a checkpoint folder under checkpoint_dir (e.g. a prior '
-            'yield transformer run). Use with --validate / --test / '
-            '--validate-yield. Architecture must still match the weights '
-            '(set --model-type regression for yield models).'
-        ),
-    )
-    parser.add_argument(
-        '--vae-compare', type=float, nargs='*', default=None, metavar='V',
-        help=(
-            'Compare per-sample VAE loss vs yield loss on sorted val samples '
-            '(scatter + dual series + Pearson/Spearman). Requires --vae-key '
-            'and --yield-key. Optional percent slice like --validate: '
-            '--vae-compare | --vae-compare V | --vae-compare V1 V2.'
-        ),
-    )
-    parser.add_argument(
-        '--vae-key', type=str, default=None, metavar='KEY',
-        help='VAE checkpoint folder name for --vae-compare.',
-    )
-    parser.add_argument(
-        '--yield-key', type=str, default=None, metavar='KEY',
-        help='Yield (regression) checkpoint folder name for --vae-compare.',
-    )
-    parser.add_argument(
-        '--sweep', action='store_true', default=False,
-        help=(
-            'Hyperparameter scout over patch_size × num_layers '
-            '(default 5/10/20 × 2/4/6) for the designated model_type '
-            '(config or --model-type). Appends to '
-            '<project_root>/_save/<model_type>_sweep/results.csv. '
-            'Resumes existing trial keys; use --sweep-extend to add epochs.'
-        ),
-    )
-    parser.add_argument(
-        '--vae-sweep', action='store_true', default=False,
-        help='Alias for --sweep --model-type vae.',
-    )
-    parser.add_argument(
-        '--sweep-epochs', type=int, default=1, metavar='N',
-        help='Base epoch plan per trial for --sweep (default 1).',
-    )
-    parser.add_argument(
-        '--sweep-extend', type=float, default=1.0, metavar='N',
-        help=(
-            'If a trial checkpoint already exists, add this many epochs '
-            '(default 1) and append a new row to results.csv. '
-            'Fresh trials still use --sweep-epochs only.'
-        ),
-    )
-    parser.add_argument(
-        '--telepred-delay', type=int,
-        default=int(config.get('telepred_delay', 0) or 0),
-        metavar='D',
-        help='TelePred delay d (bars): input ends at bot_time-d (default 0)',
-    )
-    parser.add_argument(
-        '--telepred-delays', type=str, default=None, metavar='LIST',
-        help=(
-            'Comma-separated delays for --ensemble / --ensemble-sweep '
-            '(default: config telepred_delays)'
-        ),
-    )
-    parser.add_argument(
-        '--ensemble', action='store_true', default=False,
-        help=(
-            'Train the full TelePred delay bank (one checkpoint per d). '
-            'Appends rows to '
-            '<project_root>/_save/ensemble_<label>_<model_type>/results.csv'
-        ),
-    )
-    parser.add_argument(
-        '--ensemble-sweep', action='store_true', default=False,
-        help=(
-            'Hyperparameter scout: outer patch_size×num_layers; '
-            'each trial trains the full TelePred delay bank'
-        ),
-    )
-    parser.add_argument(
-        '--validate', type=float, nargs='*', default=None, metavar='V',
-        help=(
-            'Run validation with the best checkpoint on a percent slice of '
-            'sorted validation samples, then plot batch/MA/running-loss '
-            '(same series as --validation; no files saved). '
-            '--validate → [0%%, 100%%]; '
-            '--validate V → [0%%, V%%]; '
-            '--validate V1 V2 → [V1%%, V2%%]. '
-            'Examples: --validate   |   --validate 30   |   --validate 20 40'
-        ),
-    )
-    parser.add_argument(
-        '--last-validate', type=float, nargs='*', default=None, metavar='V',
-        help=(
-            'Same as --validate, but loads the latest available checkpoint '
-            '(training_state latest_checkpoint / newest .pt) instead of best_val. '
-            '--last-validate → [0%%, 100%%]; '
-            '--last-validate V → [0%%, V%%]; '
-            '--last-validate V1 V2 → [V1%%, V2%%].'
-        ),
-    )
-    parser.add_argument('--features', action='store_true', default=False,
-                       help='Visualize total_features without training')
-    parser.add_argument(
-        '--validate-yield', nargs='?', const=-1, default=None, type=int,
-        metavar='N',
-        help=(
-            'Load the latest checkpoint and plot chance / near over '
-            'validation samples (yield label mode). '
-            '--validate-yield uses all val samples; --validate-yield N uses '
-            'N samples spaced across the chronological validation period. '
-            'Shows series + pred-vs-true plots, then interactive yield windows. '
-            'Batch size is config validate_batch_size.'
-        ),
-    )
-    parser.add_argument(
-        '--test', nargs='?', const=-1, default=None, type=int, metavar='N',
-        help=(
-            'Run test-set evaluation without training (same as INFER.py). '
-            '--test uses all test samples; --test N uses N samples spaced '
-            'across the chronological test period (not a fixed-seed head). '
-            'Batch size is config test_batch_size; latent viz count is '
-            'config test_viz_samples.'
-        ),
-    )
-    parser.add_argument(
-        '--past-window', type=int,
-        default=int(config.get('past_window', 1440)),
-        help='TelePred delta1: past input length in bars',
-    )
-    parser.add_argument(
-        '--future-window', type=int,
-        default=int(config.get('future_window', 50)),
-        help='TelePred delta2: label future length in bars (yield/trend/latent)',
-    )
-    parser.add_argument('--batch-size', type=int, default=config['batch_size'], help='Batch size')
-    parser.add_argument('--total-days', type=int, default=config['total_synthetic_days'], help='Total days of data')
-    parser.add_argument('--step', type=int, default=config['step'], help='Step size for start indices')
-    parser.add_argument('--max-accum-deviation', type=float, default=config['max_accum_deviation'],
-                       help='Threshold for cumulative absolute deviation')
-    parser.add_argument(
-        '--min-trend-horizon', type=int,
-        default=config.get('min_trend_horizon', 3),
-        help='Minimum linear-regime horizon',
-    )
-    parser.add_argument(
-        '--min-yield-percent', type=float,
-        default=config.get('min_yield_percent', 0.0),
-        help='Minimum yield percent for yield',
-    )
-    parser.add_argument(
-        '--model-type', type=str,
-        default=config.get('model_type', 'regression'),
-        choices=['regression', 'vae'],
-        help=(
-            "Model backend: 'regression' (supervised label loss) or "
-            "'vae' (recon+KL only — supervised --label is ignored by the "
-            "train objective; prefer label unused / future label=none)."
-        ),
-    )
-    parser.add_argument(
-        '--label', type=str, default=config.get('label', 'trend'),
-        choices=['trend', 'yield', 'latent', 'rise_flag'],
-        help=(
-            'Label family: trend | yield | latent | rise_flag. '
-            'With --model-type vae the label loss is not applied '
-            '(VAE objective is recon+KL only).'
-        ),
-    )
-    parser.add_argument(
-        '--yield-target', type=str,
-        default=config.get('yield_target', 'both'),
-        choices=['both', 'chance', 'near'],
-        help=(
-            "Yield head target when --label yield: "
-            "'both' (dim 2), 'chance' (dim 1), or 'near' (dim 1)"
-        ),
-    )
-    parser.add_argument(
-        '--latent-distribution', type=str,
-        default=config.get('latent_distribution', 'normal'),
-        choices=[
-            'normal', 'student',
-            'normal_distribution', 'student_distribution', 'student_t',
-        ],
-        help=(
-            'Density for --label latent: normal → output_dim=2 (mu, var_raw); '
-            'student → output_dim=3 (loc, scale_raw, df_raw)'
-        ),
-    )
-    parser.add_argument(
-        '--error-ensemble', action='store_true', default=False,
-        help=(
-            'Train residual ErrorEnsemble stages model_0..model_{n-1} '
-            '(regression + point labels only; see error_ensemble_logic.txt). '
-            'Uses config error_ensemble_n unless --error-ensemble-extend.'
-        ),
-    )
-    parser.add_argument(
-        '--error-ensemble-extend', type=int, default=None, metavar='N',
-        help=(
-            'Add N new ErrorEnsemble stages after finished ones on disk '
-            '(implies --error-ensemble). Example: 2 finished + '
-            '--error-ensemble-extend 2 → train model_2..model_3.'
-        ),
-    )
-    parser.add_argument('--no-normalize-window', action='store_true', help='Disable per-window z-score normalization')
-    parser.add_argument('--lr', type=float, default=config['learning_rate'], help='Learning rate')
-    parser.add_argument('--slope-weight', type=float, default=config['slope_loss_weight'],
-                       help='Weight for slope loss (--label trend)')
-    parser.add_argument('--intercept-weight', type=float, default=config['intercept_loss_weight'],
-                       help='Weight for intercept loss (--label trend)')
-    parser.add_argument('--chance-weight', type=float,
-                       default=config.get('chance_loss_weight', 1.0),
-                       help='Weight for chance loss (--label yield)')
-    parser.add_argument('--near-weight', type=float,
-                       default=config.get('near_loss_weight', 1.0),
-                       help='Weight for near loss (--label yield)')
-    parser.add_argument('--rise-flag-weight', type=float,
-                       default=config.get('rise_flag_loss_weight', 1.0),
-                       help='Weight for BCE loss (--label rise_flag)')
-    parser.add_argument('--recon-weight', type=float, default=config['reconstruction_loss_weight'],
-                       help='Weight for reconstruction loss (VAE / recon aux)')
-    parser.add_argument('--vae-kl-weight', type=float,
-                       default=config.get('vae_kl_weight', 0.1),
-                       help='KL weight when --model-type vae')
-    parser.add_argument('--patch-size', type=int, default=config['patch_size'],
-                       help='Patch size for temporal patching')
-    parser.add_argument('--num-layers', type=int, default=config['num_layers'],
-                       help='Number of transformer layers')
-    parser.add_argument('--num-heads', type=int, default=config['num_heads'],
-                       help='Number of attention heads')
-    parser.add_argument('--ff-dim-multiplier', type=int, default=config['ff_dim_multiplier'],
-                       help='Feed-forward dimension')
-    parser.add_argument('--dropout', type=float, default=config['dropout'], help='Dropout rate')
-    parser.add_argument('--head-hidden-dim-multiplier', type=int, default=config['head_hidden_dim_multiplier'],
-                       help='Hidden dimension multiplier for prediction heads')
-    parser.add_argument('--no-causal', action='store_true', default=not config['causal'],
-                       help='Disable causal attention')
-    parser.add_argument('--no-reconstruction', action='store_true', default=not config['use_reconstruction'],
-                       help='Disable reconstruction auxiliary loss')
-    parser.add_argument(
-        '--no-look-price',
-        action='store_true',
-        default=not config.get('look_price', True),
-        help='Do not concat recent past prices p into the prediction head',
-    )
-    parser.add_argument('--use-binance', action='store_true', default=config['use_binance_data'],
-                       help='Use real Binance data instead of synthetic')
-    parser.add_argument('--symbol', type=str, default=config.get('binance_primary_symbol', 'BTCUSDT'),
-                       help='Primary trading pair symbol')
+        parser.add_argument('--train-ratio', type=float, default=config.get('train_ratio', 0.70),
+                           help='Training set ratio')
+        parser.add_argument('--val-ratio', type=float, default=config.get('val_ratio', 0.20),
+                           help='Validation set ratio')
     
-    parser.add_argument('--train-ratio', type=float, default=config.get('train_ratio', 0.70),
-                       help='Training set ratio')
-    parser.add_argument('--val-ratio', type=float, default=config.get('val_ratio', 0.20),
-                       help='Validation set ratio')
+        parser.add_argument('--no-validate', action='store_true', default=not config.get('validate', True),
+                           help='Disable validation')
+        parser.add_argument('--validate-every', type=int, default=config.get('validate_every_n_epochs', 1),
+                           help='Validate every N epochs')
+        parser.add_argument('--val-batch-size', type=int, default=config.get('validate_batch_size', 64),
+                           help='Batch size for validation')
     
-    parser.add_argument('--no-validate', action='store_true', default=not config.get('validate', True),
-                       help='Disable validation')
-    parser.add_argument('--validate-every', type=int, default=config.get('validate_every_n_epochs', 1),
-                       help='Validate every N epochs')
-    parser.add_argument('--val-batch-size', type=int, default=config.get('validate_batch_size', 64),
-                       help='Batch size for validation')
-    
-    args = parser.parse_args()
-    
-    # Update config with command-line arguments
-    config['epochs'] = args.epochs
-    config['save_every_n_minutes'] = args.save_every
-    config['clean'] = args.clean
-    config['past_window'] = int(args.past_window)
-    config['future_window'] = int(args.future_window)
-    config['batch_size'] = args.batch_size
-    config['total_synthetic_days'] = args.total_days
-    config['step'] = args.step
-    config['max_accum_deviation'] = args.max_accum_deviation
-    config['min_trend_horizon'] = args.min_trend_horizon
-    config['min_yield_percent'] = args.min_yield_percent
-    config['model_type'] = args.model_type
-    config['label'] = args.label
-    config['yield_target'] = args.yield_target
-    config['latent_distribution'] = args.latent_distribution
-    if getattr(args, 'checkpoint_key', None):
-        config['checkpoint_key'] = str(args.checkpoint_key).strip()
-    # Force head width for yield/latent/rise_flag so checkpoint keys match.
-    sync_output_dim(config)
-    config['learning_rate'] = args.lr
-    config['slope_loss_weight'] = args.slope_weight
-    config['intercept_loss_weight'] = args.intercept_weight
-    config['chance_loss_weight'] = args.chance_weight
-    config['near_loss_weight'] = args.near_weight
-    config['rise_flag_loss_weight'] = args.rise_flag_weight
-    config['reconstruction_loss_weight'] = args.recon_weight
-    config['vae_kl_weight'] = args.vae_kl_weight
-    config['patch_size'] = args.patch_size
-    config['num_layers'] = args.num_layers
-    config['num_heads'] = args.num_heads
-    config['ff_dim_multiplier'] = args.ff_dim_multiplier
-    config['dropout'] = args.dropout
-    config['head_hidden_dim_multiplier'] = args.head_hidden_dim_multiplier
-    config['causal'] = not args.no_causal
-    config['use_reconstruction'] = not args.no_reconstruction
-    config['look_price'] = not args.no_look_price
-    config['use_binance_data'] = args.use_binance
-    config['binance_primary_symbol'] = args.symbol
-    config['train_ratio'] = args.train_ratio
-    config['val_ratio'] = args.val_ratio
-    config['validate'] = not args.no_validate
-    config['validate_every_n_epochs'] = args.validate_every
-    config['validate_batch_size'] = args.val_batch_size
-    config['telepred_delay'] = int(args.telepred_delay)
+        try:
+            args = parser.parse_args()
+        finally:
+            sys.argv = _old_argv
+        if cmd is not None:
+            apply_command_to_namespace(cmd, args)
+
+    # Phase 6: local overrides (do not hand-assign every key here).
+    from config import apply_cli_namespace
+    apply_cli_namespace(config, args)
+    apply_set_pairs(config, getattr(args, 'set_pairs', None))
     if args.telepred_delays is not None:
         config['telepred_delays'] = parse_delay_list(args.telepred_delays)
     else:
         config['telepred_delays'] = parse_delay_list(
-            config.get('telepred_delays', [config['telepred_delay']])
+            config.get('telepred_delays', [config.get('telepred_delay', 0)])
         )
+    # Phase 4: vae ⇒ label none (COMPAT unsupervised cell).
+    from compat import resolve_atomic_slot
+    from registry import MODEL_VAE, normalize_model_id
+    if normalize_model_id(config.get('model_type')) == MODEL_VAE:
+        resolve_atomic_slot(config, coerce_vae_to_none=True, warn=True)
+    sync_output_dim(config)
 
     if args.no_normalize_window:
         config['normalize_window'] = False
@@ -958,16 +1015,23 @@ def main(config):
 
     # ============================================================
     # STEP 2d: Handle --report 'dir name' → <project_root>/_save/<dir_name>/
+    # Bare report (no DIR) → datetime folder + history plot + optional git commit.
     # ============================================================
     if args.report is not None:
         print("\n" + "=" * 60)
         print("📑 VALIDATION REPORT EXPORT MODE")
         print("=" * 60)
 
-        report_dir, err = _resolve_report_dir(args.report, flag='--report')
+        report_name = str(args.report).strip()
+        report_dir, err = _resolve_report_dir(report_name, flag='--report')
         if err:
             print(err)
             return
+
+        do_commit = bool(getattr(args, 'report_git_commit', False))
+        if do_commit:
+            print(f"📌 Auto report-name (bare report): {report_name}")
+            print("   Will git-commit all current changes with that message.")
 
         checkpoint_dir = Path(config['checkpoint_dir'])
         if not checkpoint_dir.exists():
@@ -1030,6 +1094,7 @@ def main(config):
 
         print(f"📁 Source checkpoints: {source_dir} ({source_label})")
         stats = _export_validation_epoch_plots(source_dir, report_dir)
+        hist_path = _export_training_history_plot(source_dir, report_dir)
         if stats['max_epoch'] > 0:
             e_example = f"e{1:0{stats['epoch_width']}d}"
             print(
@@ -1041,8 +1106,17 @@ def main(config):
             f"\n✅ Report export completed: "
             f"{stats['n_full']} full + {stats['n_slice']} p0_30 plots → {report_dir}"
         )
+        if hist_path is not None:
+            print(f"   + history: {hist_path.name}")
         if stats['n_missing']:
             print(f"   Skipped {stats['n_missing']} missing epoch curve(s).")
+
+        if do_commit:
+            try:
+                from error_ensemble_report import commit_code_with_report_name
+                commit_code_with_report_name(report_name)
+            except Exception as exc:
+                print(f"⚠ Git commit skipped/failed: {exc}")
         return
 
     # ============================================================
@@ -1313,7 +1387,8 @@ def main(config):
         # Lazy import keeps TRAIN → INFER one-way (dataset_build owns get_dataset).
         from INFER import run_test
 
-        run_test(config, max_samples=max_samples, visualize=True)
+        viz = not bool(getattr(args, 'no_viz', False))
+        run_test(config, max_samples=max_samples, visualize=viz)
         print("\n✅ Test evaluation completed!")
         return
 

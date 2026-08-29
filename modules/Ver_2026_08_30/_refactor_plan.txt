@@ -45,8 +45,8 @@ Design principle — accommodate broadly on purpose:
 -----------------------------
   Id            Implementation today              Role
   ------------  --------------------------------  ----------------------------
-  regression    model.MarketTransformerWithHeads  supervised head over windows
-  vae           model_vae.MarketVAEWithHeads      unsupervised recon + KL
+  regression    model_regression.MarketRegressionWithHeads  supervised head over windows
+  vae           model_v_autoencoder.MarketVAEWithHeads  unsupervised recon + KL
   ensemble      NEW EnsembleModelSpec             bag of atomic (model, label)
                                                   members + FusionSpec
                                                   (not an atomic net)
@@ -99,9 +99,9 @@ Design principle — accommodate broadly on purpose:
 
 0.6 Summary checklist — “accommodated means”
 --------------------------------------------
-  [ ] registry lists every id in 0.1–0.2
-  [ ] COMPAT lists every pair in 0.3; assert_compatible enforces it
-  [ ] ENSEMBLE_KINDS covers telepred + error; stack stub OK
+  [x] registry lists every id in 0.1–0.2
+  [x] COMPAT lists every pair in 0.3; assert_compatible enforces it
+  [x] ENSEMBLE_KINDS covers telepred + error; stack stub OK
   [ ] TRAIN/INFER/data paths exercise regression×{trend,yield,latent,rise_flag}
       and vae×none without label if-ladders outside LabelSpec
   [ ] TelePred + ErrorEnsemble expressed as ensemble kinds over those pairs
@@ -136,10 +136,10 @@ Notes:
 - labels.py Label_* class API: find / loss / make_auxiliary / target_slice /
   target_names / resolve_* / sync_output_dim / bind_label_loss / LABEL_CLASSES
 - train_run.train_one_run — shared single-element train primitive
-- model_vae.build_market_model + forward contract (predictions, patch_map, recon)
+- model_v_autoencoder.build_market_model + forward contract (predictions, patch_map, recon)
 - ResumableTrainer + generate_checkpoint_key / resolve_checkpoint_identity
-- TelePred delay semantics (telepred.py, ensemble_plan.txt)
-- ErrorEnsemble residual math in y-normalized space (error_ensemble_logic.txt)
+- TelePred delay semantics (telepred.py, _ensemble_plan.txt)
+- ErrorEnsemble residual math in y-normalized space (_error_ensemble_logic.txt)
   for point-label regression stages
 
 
@@ -177,7 +177,7 @@ C. Model-type branching / false product
    - use_reconstruction on regression affects architecture/checkpoint key and
      returned recon, but regression train loss never adds recon MSE — only VAE
      does. Flag name suggests supervised+recon; behavior is “maybe emit recon”.
-   - PredictionHead / MarketTransformerWithHeads hard-limit output_dim ∈ {1,2,3}
+   - PredictionHead / MarketRegressionWithHeads hard-limit output_dim ∈ {1,2,3}
      — blocks future wider labels.
    - Checkpoint key hashes model_type + output_dim but not label directly;
      label enters via dataset_signature. VAE runs with different labels still
@@ -247,7 +247,7 @@ LABELS = {
 }
 
 MODELS = {
-  "regression": RegressionTransformer,  # MarketTransformerWithHeads
+  "regression": RegressionTransformer,  # MarketRegressionWithHeads
   "vae":        MarketVAE,              # MarketVAEWithHeads
   "ensemble":   EnsembleModel,          # NEW — members + FusionSpec
 }
@@ -377,7 +377,7 @@ Layer rules (hard):
      Must NOT import model.py.
      Must NOT contain per-label if-ladders after Phase 3.
 
-  3. model / model_vae — architecture only.
+  3. model_regression / model_v_autoencoder — architecture only.
      Owns: build net from shapes, forward, wrap_loss,
            unpack_input(sample) → forward kwargs.
      Must NOT import data.py.
@@ -836,7 +836,7 @@ Specializing today's ensembles
   ErrorEnsemble (--error-ensemble):
     members = [(regression, label) @ stage s for s in 0..n-1]
     label_relation = identical AND label in {trend, yield, rise_flag}
-    fusion = sum residuals in y-normalized space (error_ensemble_logic.txt)
+    fusion = sum residuals in y-normalized space (_error_ensemble_logic.txt)
     train = sequential atomic runs with residual targets derived by
       compose/error_ensemble (stage target is still the SAME LabelSpec
       space; residual math is FusionSpec/stage plumbing, not a new label)
@@ -899,7 +899,7 @@ Phase 0 — Scaffold
   1. Copy modules/Ver_2026_08_20 → modules/Ver_2026_08_30.
   2. Freeze 08_20; all new work lands in 08_30.
   3. Keep this plan file (copy or symlink) at
-     modules/Ver_2026_08_30/refactor_plan.txt as the living checklist.
+     modules/Ver_2026_08_30/_refactor_plan.txt as the living checklist.
 
 Phase 1 — Parity fixes (same behavior, less lying)
   1. Add rise_flag to --label choices; align default with documented intent.
@@ -990,7 +990,7 @@ KEEP
   - train_one_run, ResumableTrainer, checkpoint key idea
   - build_market_model + forward (pred, patch, recon)
   - TelePred delay bank + ensemble_train loop
-  - Error-ensemble math for point labels (error_ensemble_logic.txt)
+  - Error-ensemble math for point labels (_error_ensemble_logic.txt)
   - Label viz helpers currently in labels.py
 
 REDESIGN / EXTRACT
@@ -1015,20 +1015,20 @@ DELETE OR QUARANTINE
 ================================================================================
 
 modules/Ver_2026_08_30/
-  refactor_plan.txt          # this plan (living checklist)
+  _refactor_plan.txt          # this plan (living checklist)
   config.py                  # sectioned defaults; get_config / apply_overrides
   registry.py                # LABELS, MODELS, COMPAT, ENSEMBLE_COMPAT lookups
   compat.py                  # assert_compatible / describe_matrix
   labels.py                  # LabelSpec implementations (evolve existing)
-  model.py                   # regression transformer
-  model_vae.py               # VAE + build_market_model / ModelSpec.wrap_loss
+  model_regression.py        # MarketRegressionWithHeads
+  model_v_autoencoder.py     # VAE + build_market_model / ModelSpec.wrap_loss
   data.py                    # TradingDataset + FeaturePrep (two-layer | one-layer);
                              #   no label if-ladders; not modality-agnostic
   trainer.py                 # ResumableTrainer, checkpoint keys
   train_run.py               # train_one_run
   ensemble_train.py          # TelePred delay bank
   error_ensemble.py          # residual stages (point labels only)
-  error_ensemble_logic.txt   # source of truth for residual math
+  _error_ensemble_logic.txt   # source of truth for residual math
   error_ensemble_report.py
   telepred.py
   TRAIN.py                   # thin CLI dispatcher (subcommands or grouped flags)
@@ -1087,12 +1087,27 @@ modules/Ver_2026_08_30/
     INFER dim-1 / rise_flag metrics, VAE help)  (done in Ver_2026_08_30)
 [x] Phase 1 minimum e2e smoke: test_phase1_smoke.py
     (CPU synthetic regression×rise_flag train + INFER metrics; PASSED)
-[ ] Add registry.py + compat.py; gate train_one_run
-[ ] Move dataset label branches into LabelSpec
-[ ] Move INFER metrics/viz into LabelSpec
-[ ] Split / thin TRAIN + INFER CLIs
-[ ] Config section pass + run_config.json for all trains
-    (incl. normalization: "one-layer" | "two-layer")
-[ ] Golden smoke matrix
+[x] Add registry.py + compat.py; gate train_one_run
+    (+ ensemble_train telepred, error_ensemble; Label_None; --label none)
+    test_phase2_compat.py PASSED; Phase 1 smoke still PASSED
+[x] Phase 3 (core ABI): FeaturePrep modes via "normalization";
+    label_cache.build_cache_row; opaque sample dict __getitem__;
+    sample_batch unpack; trainer/loader/INFER/error_ensemble migrated;
+    test_phase3_sample_abi.py + Phase1 smoke PASSED
+    (INFER metrics/viz trees still label_mode ifs — defer full Label.metrics)
+[x] Phase 4: vae⇒none coerce; wrap_loss by COMPAT objective;
+    emit_reconstruction clarify; output_dim positive int;
+    ensemble_spec.EnsembleModelSpec + LabelCollection;
+    telepred/error describe via specs; test_phase4_product.py PASSED
+[x] Phase 5: cli_commands subcommands (flat flags kept);
+    label_metrics.report_test_metrics wired in INFER.run_test;
+    INFER thin CLI; run_config.json written by train_one_run;
+    test_phase5_cli_metrics.py PASSED
+[x] Phase 6: config_sections (paths/data/label/model/train/ensemble);
+    apply_overrides / apply_cli_namespace / filter_active_knobs;
+    TRAIN uses apply_cli_namespace; test_phase6_config.py PASSED
+[x] Phase 7: test_golden_matrix.py PASSED
+    (regression×trend/yield/latent/rise_flag, vae×none,
+     telepred delays [0,2], error_ensemble n=2)
 
-END OF refactor_plan.txt
+END OF _refactor_plan.txt

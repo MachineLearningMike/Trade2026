@@ -1,6 +1,6 @@
 # telepred.py
 # Single owner of TelePred indexing (X(t,d), Y(t)).
-# See ensemble_plan.txt. Change definition here + bump DEFINITION_ID.
+# See _ensemble_plan.txt. Change definition here + bump DEFINITION_ID.
 
 from __future__ import annotations
 

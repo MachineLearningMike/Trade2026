@@ -17,6 +17,19 @@ def project_root_dir() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def resolve_project_path(path_value, *, default: str) -> str:
+    """
+    Absolute path under the project root for relative config entries.
+
+    Absolute inputs are kept; relative inputs → ``<project_root>/<path>``.
+    """
+    raw = default if path_value is None else str(path_value)
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = project_root_dir() / path
+    return str(path.resolve())
+
+
 def resolve_data_dir(data_dir=None) -> str:
     """
     Absolute dataset cache directory.
@@ -30,11 +43,12 @@ def resolve_data_dir(data_dir=None) -> str:
     env = os.environ.get("MACRO_DATA_DIR") or os.environ.get("FSV_DATA_DIR")
     if env:
         return str(Path(env).expanduser().resolve())
-    raw = "dataset_cache" if data_dir is None else str(data_dir)
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        path = project_root_dir() / path
-    return str(path.resolve())
+    return resolve_project_path(data_dir, default="dataset_cache")
+
+
+def resolve_checkpoint_dir(checkpoint_dir=None) -> str:
+    """Absolute checkpoint root (default ``<project_root>/trading_checkpoints``)."""
+    return resolve_project_path(checkpoint_dir, default="trading_checkpoints")
 
 
 config = {
@@ -53,10 +67,10 @@ config = {
     # delta2: label future length p[t+1 : t+1+future_window]
     # Shared by yield, trend, and latent (TelePred delta2).
     'future_window': 40,
-    'step': 3,
+    'step': 5,
 
     # ============================================================
-    # TELEPRED / ENSEMBLE (see ensemble_plan.txt, telepred.py)
+    # TELEPRED / ENSEMBLE (see _ensemble_plan.txt, telepred.py)
     # ============================================================
     # Delay d (bars): model input ends at bot_time - d; label Y(t) unchanged.
     # telepred_delay: single-element TRAIN / INFER.
@@ -115,14 +129,23 @@ config = {
     #   'yield'      → (chance, near) via find_yield; model target selected by
     #                           yield_target (cache always stores both)
     #   'latent'     → density over a scalar observation (shares model head)
-    #   'rise_flag'  → binary {0,1} via Label_RiseFlag.find (refine that stub);
-    #                           output_dim=1; BCE-with-logits loss
+    #   'rise_flag'  → binary classifier via Label_RiseFlag
+    #                           (logit head; BCE-with-logits; measures TP/TN/FP/FN)
     'label': 'rise_flag',
+
+    # ------------------------------------------------------------
+    # RISE_FLAG (binary classifier)
+    # ------------------------------------------------------------
+    # Decision threshold on P(rise)=sigmoid(logit) for TP/TN/FP/FN & accuracy.
+    # Label owns packing these measures; models never see them.
+    'rise_flag_decision_threshold': 0.5,
+    # find() stub: min percent rise vs p[t] anywhere in the future window
+    # (shared key name with yield; rise_flag reads it as the flag threshold).
 
     # ------------------------------------------------------------
     # YIELD (distribution of chance and near)
     # ------------------------------------------------------------
-    'min_yield_percent': 0.26,   # also used as rise_flag threshold stub
+    'min_yield_percent': 0.26,   # yield chance stub; also rise_flag find() stub
     # Model target from full cache (chance, near):
     #   'both'   → output_dim=2  (chance, near)
     #   'chance' → output_dim=1  (chance,)
@@ -187,7 +210,7 @@ config = {
     # past_window + future_window (plus telepred_delay if d > 0).
     # Times are UTC wall clock (naive strings). Binance klines are UTC; FSV
     # converts US-local release schedules to UTC before aligning on this grid.
-    'binance_start_date': '2023-11-01 00:00:00',    # 2023
+    'binance_start_date': '2026-01-01 00:00:00', # '2023-11-01 00:00:00',    # 2023
     'binance_end_date': '2026-07-01 00:00:00',
     'binance_symbols': {
         "BTCUSDT": ["Close", "Volume"],
@@ -211,7 +234,13 @@ config = {
     # ============================================================
     # NORMALIZATION CONFIGURATION
     # ============================================================
-    # Per-sample window z-score of x (and related moments) in TradingDataset.
+    # FeaturePrep mode (see refactor_plan FEATURE NORMALIZATION):
+    #   'two-layer' — intra-window z-score of x, then inter-window norm of
+    #                 window moments (mean/std/shape) for FiLM (default).
+    #   'one-layer' — global / no intra-window stack (legacy normalize_window=False).
+    'normalization': 'two-layer',
+    # Legacy boolean; kept for dataset_signature / older callers.
+    # Prefer 'normalization'. If only this is set, True→two-layer, False→one-layer.
     'normalize_window': True,
 
     'n_latent_macros': 30,  # Number of latent macro features to use in the model
@@ -219,8 +248,8 @@ config = {
     # ============================================================
     # MODEL SELECTION
     # ============================================================
-    # 'regression' → model.MarketTransformerWithHeads
-    # 'vae'         → model_vae.MarketVAEWithHeads
+    # 'regression' → model_regression.MarketRegressionWithHeads
+    # 'vae'         → model_v_autoencoder.MarketVAEWithHeads
     #                 Reconstructs x; mean/std FiLM-condition encoder+decoder;
     #                 shape accepted but unused. Train loss is recon+KL only
     #                 (no yield/chance/near label loss).
@@ -257,7 +286,7 @@ config = {
     # ============================================================
     # TRAINING CONFIGURATION
     # ============================================================
-    'epochs': 12,
+    'epochs': 2,
     'batch_size': 20,
     'learning_rate': 0.000_01, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
     'save_every_n_minutes': 5,
@@ -286,31 +315,63 @@ config = {
     # yield:
     'chance_loss_weight': 1.0,
     'near_loss_weight': 1.0,
-    # rise_flag:
+    # rise_flag (binary classifier loss weight):
     'rise_flag_loss_weight': 1.0,
     'reconstruction_loss_weight': 1.0,
+    # Emit recon tensor from forward (not regression train loss).
+    # Preferred name emit_reconstruction; use_reconstruction kept for older keys.
+    'emit_reconstruction': False,
     'use_reconstruction': False,
 }
 
 
-# Pin data_dir to an absolute project-root path at import time so callers that
-# read ``config`` or ``get_config()`` never depend on process cwd.
+# Pin data_dir / checkpoint_dir to absolute project-root paths at import time
+# so callers that read ``config`` or ``get_config()`` never depend on cwd.
 config['data_dir'] = resolve_data_dir(config.get('data_dir', 'dataset_cache'))
+config['checkpoint_dir'] = resolve_checkpoint_dir(
+    config.get('checkpoint_dir', 'trading_checkpoints')
+)
 
 
 def get_config():
-    """Return a copy of the config dictionary (data_dir already absolute)."""
+    """Return a copy of the config dictionary (paths already absolute)."""
     cfg = config.copy()
     # Re-resolve in case env MACRO_DATA_DIR changed after import / update_config.
     cfg['data_dir'] = resolve_data_dir(cfg.get('data_dir', 'dataset_cache'))
+    cfg['checkpoint_dir'] = resolve_checkpoint_dir(
+        cfg.get('checkpoint_dir', 'trading_checkpoints')
+    )
     return cfg
 
 
 def update_config(new_config):
-    """Update config with new values."""
+    """
+    Update the *process-global* config dict.
+
+    Prefer ``cfg = get_config(); apply_overrides(cfg, ...)`` for one-off runs
+    (Phase 6) so ensemble/sweep trials do not leak into later work.
+    """
     config.update(new_config)
     if 'data_dir' in new_config:
         config['data_dir'] = resolve_data_dir(config.get('data_dir', 'dataset_cache'))
+    if 'checkpoint_dir' in new_config:
+        config['checkpoint_dir'] = resolve_checkpoint_dir(
+            config.get('checkpoint_dir', 'trading_checkpoints')
+        )
+
+
+# Re-exports — sectioned view / local overrides (Phase 6).
+from config_sections import (  # noqa: E402
+    CONFIG_SECTIONS,
+    active_label_keys,
+    active_model_keys,
+    all_sections,
+    apply_cli_namespace,
+    apply_overrides,
+    clone_config,
+    filter_active_knobs,
+    section_view,
+)
 
 
 def print_config():

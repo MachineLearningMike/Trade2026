@@ -282,11 +282,11 @@ Later refinement — generalize Yield Transformer (and Regime) to TelePred.
 --------------------------------------------------------------------------------
 
   Read this file:
-    modules/Ver_2026_08_20/ensemble_plan.txt
+    modules/Ver_2026_08_20/ensemble_plan.txt  (08_20 baseline; this folder uses _ensemble_plan.txt)
 
   Then continue from section 3–4: implement TelePred(d) and/or lock open questions.
   Do not re-litigate agreed items in section 3 unless the user explicitly changes them.
 
 ================================================================================
-END OF ensemble_plan.txt
+END OF _ensemble_plan.txt
 ================================================================================
