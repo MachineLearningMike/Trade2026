@@ -424,6 +424,34 @@ def wants_legacy_parser(argv: Optional[Sequence[str]] = None) -> bool:
     return True  # unknown positional → legacy attempt / error later
 
 
+_VERB_SET = frozenset(COMMANDS) | frozenset({
+    'plot', 'tools', 'error-ensemble', 'infer', 'test', 'validate',
+    'ensemble', 'sweep', 'search', 'report', 'train',
+})
+
+
+def _unstick_stacked_verbs(raw: List[str]) -> List[str]:
+    """
+    Fix footguns like ``TRAIN.py train report``.
+
+    Verbs are mutually exclusive; a second verb after the first is almost
+    always a mistake. Drop the first and keep the rest (with a one-line hint).
+    """
+    if len(raw) < 2:
+        return raw
+    first = str(raw[0]).strip().lower()
+    second = str(raw[1]).strip().lower()
+    if first in _VERB_SET and second in _VERB_SET:
+        kept = list(raw[1:])
+        print(
+            f"⚠ Two commands given ({first} {second}). "
+            f"Using: {' '.join(kept)}"
+        )
+        print(f"   Tip: run  python TRAIN.py {second} …")
+        return kept
+    return raw
+
+
 def try_parse_simplified(
     config: dict,
     argv: Optional[Sequence[str]] = None,
@@ -442,6 +470,8 @@ def try_parse_simplified(
         # Show simplified help
         build_simplified_parser(config).print_help()
         raise SystemExit(0)
+
+    raw = _unstick_stacked_verbs(raw)
 
     parser = build_simplified_parser(config)
     ns = parser.parse_args(raw)

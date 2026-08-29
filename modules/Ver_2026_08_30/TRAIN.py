@@ -159,6 +159,133 @@ def _export_training_history_plot(source_dir: Path, report_dir: Path) -> Optiona
     return plot_path
 
 
+def _export_label_measures_report(
+    config: dict,
+    source_dir: Path,
+    report_dir: Path,
+    *,
+    report_name: str,
+) -> Optional[Path]:
+    """
+    Evaluate the source checkpoint on val + test, write ``report.text`` with
+    the hosting label's measure slots.
+    """
+    from INFER import (
+        _select_val_indices,
+        find_checkpoint_by_key,
+        load_model,
+        run_inference_on_indices,
+        run_inference_on_test_set,
+    )
+    from label_metrics import (
+        build_report_text,
+        compute_label_metrics,
+        write_report_text_file,
+    )
+    from labels import get_label_class, label_measure_slots, resolve_latent_distribution, resolve_yield_target
+
+    source_dir = Path(source_dir)
+    report_dir = Path(report_dir)
+    ckpt_root = Path(config['checkpoint_dir'])
+    key = source_dir.name
+    found = find_checkpoint_by_key(str(ckpt_root), key)
+    if found is None:
+        print(f"⚠ No .pt weights under {source_dir}; skipping report.text measures")
+        return None
+    checkpoint_path, checkpoint_key = found
+
+    print("\n📊 Computing label measures for report.text (val + test)...")
+    print(f"   Label: {config.get('label')}  |  checkpoint: {checkpoint_path}")
+    dataset, _total_features = get_dataset(config)
+    config['output_dim'] = dataset.output_dim
+    if getattr(dataset, 'label_mode', None) == 'yield':
+        config['yield_target'] = getattr(dataset, 'yield_target', 'both')
+    if getattr(dataset, 'label_mode', None) == 'latent':
+        config['latent_distribution'] = getattr(
+            dataset, 'latent_distribution', config.get('latent_distribution', 'normal')
+        )
+
+    label_mode = get_label_class(
+        getattr(dataset, 'label_mode', config.get('label', 'trend'))
+    ).name
+    yt = resolve_yield_target(
+        config, yield_target=getattr(dataset, 'yield_target', None),
+    )
+    ld = resolve_latent_distribution(
+        config, latent_distribution=getattr(dataset, 'latent_distribution', None),
+    )
+    slots = list(label_measure_slots(label_mode))
+
+    device = config['device']
+    batch_size = config.get(
+        'validate_batch_size',
+        config.get('test_batch_size', config.get('batch_size', 8)),
+    )
+    model = load_model(checkpoint_path, config, dataset, device)
+
+    val_metrics = None
+    val_n = None
+    val_indices = _select_val_indices(dataset, max_samples=None)
+    if val_indices:
+        print("   Running validation inference for measures...")
+        val_preds, val_labels, _ = run_inference_on_indices(
+            model, dataset, val_indices,
+            device=device, batch_size=batch_size, split_name='validation samples',
+        )
+        val_n = int(len(val_preds))
+        val_metrics = compute_label_metrics(
+            label_mode, val_preds, val_labels,
+            config=config, dataset=dataset,
+            yield_target=yt, latent_distribution=ld,
+        )
+        print(f"   ✓ Val measures on {val_n} samples")
+    else:
+        print("   ⚠ No validation samples; val section omitted")
+
+    test_metrics = None
+    test_n = None
+    print("   Running test inference for measures...")
+    try:
+        test_preds, test_labels, _ = run_inference_on_test_set(
+            model, dataset,
+            device=device, batch_size=batch_size,
+            max_samples=None, shuffle=False,
+        )
+        test_n = int(len(test_preds))
+        test_metrics = compute_label_metrics(
+            label_mode, test_preds, test_labels,
+            config=config, dataset=dataset,
+            yield_target=yt, latent_distribution=ld,
+        )
+        print(f"   ✓ Test measures on {test_n} samples")
+    except Exception as exc:
+        print(f"   ⚠ Test measures skipped: {exc}")
+
+    extra = {
+        'Yield target': yt if label_mode == 'yield' else None,
+        'Latent dist': ld if label_mode == 'latent' else None,
+        'Dataset signature': getattr(dataset, 'cache_key', None),
+    }
+    extra = {k: v for k, v in extra.items() if v is not None}
+
+    text = build_report_text(
+        report_name=report_name,
+        label_mode=label_mode,
+        model_type=str(config.get('model_type', 'regression')),
+        checkpoint_key=str(checkpoint_key),
+        checkpoint_path=str(checkpoint_path),
+        measure_slots=slots,
+        val_metrics=val_metrics,
+        test_metrics=test_metrics,
+        val_n=val_n,
+        test_n=test_n,
+        extra_header=extra or None,
+    )
+    path = write_report_text_file(report_dir, text, filename='report.text')
+    print(f"📄 Label measures → {path}")
+    return path
+
+
 def main(config):
     """Main training function."""
     
@@ -1095,6 +1222,13 @@ def main(config):
         print(f"📁 Source checkpoints: {source_dir} ({source_label})")
         stats = _export_validation_epoch_plots(source_dir, report_dir)
         hist_path = _export_training_history_plot(source_dir, report_dir)
+        measures_path = None
+        try:
+            measures_path = _export_label_measures_report(
+                config, source_dir, report_dir, report_name=report_name,
+            )
+        except Exception as exc:
+            print(f"⚠ report.text measures failed: {exc}")
         if stats['max_epoch'] > 0:
             e_example = f"e{1:0{stats['epoch_width']}d}"
             print(
@@ -1108,6 +1242,8 @@ def main(config):
         )
         if hist_path is not None:
             print(f"   + history: {hist_path.name}")
+        if measures_path is not None:
+            print(f"   + measures: {measures_path.name} (label={config.get('label')})")
         if stats['n_missing']:
             print(f"   Skipped {stats['n_missing']} missing epoch curve(s).")
 

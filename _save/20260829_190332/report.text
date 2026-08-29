@@ -1,0 +1,29 @@
+Report:           20260829_190332
+Label:            rise_flag
+Model:            regression
+Checkpoint key:   3551d008
+Checkpoint path:  D:\Projects\Trade2026\trading_checkpoints\3551d008\best_val.pt
+Measure slots:    ['bce_with_logits', 'accuracy', 'true_positive', 'true_negative', 'false_positive', 'false_negative', 'tpr', 'tnr', 'fpr', 'fnr', 'precision', 'mean_prob', 'positive_rate_true', 'positive_rate_pred', 'decision_threshold']
+Dataset signature: 5a9d1623
+
+=== Validation ===
+  n_samples:       5154
+  BCE (logits):    0.6294
+  Accuracy @thr:   0.6622  (thr=0.5)
+  Confusion:       TP=461  TN=2952  FP=436  FN=1305
+  Rates:           TPR=0.2610  TNR=0.8713  FPR=0.1287  FNR=0.7390
+  Precision:       0.5139
+  Mean P(rise):    0.3122
+  True pos rate:   0.3426
+  Pred pos rate:   0.1740
+
+=== Test ===
+  n_samples:       5155
+  BCE (logits):    0.5752
+  Accuracy @thr:   0.7236  (thr=0.5)
+  Confusion:       TP=352  TN=3378  FP=334  FN=1091
+  Rates:           TPR=0.2439  TNR=0.9100  FPR=0.0900  FNR=0.7561
+  Precision:       0.5131
+  Mean P(rise):    0.2851
+  True pos rate:   0.2799
+  Pred pos rate:   0.1331

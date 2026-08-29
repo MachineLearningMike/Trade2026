@@ -21,6 +21,7 @@ Run from this directory (or put it on PYTHONPATH), with your torch env active.
   python TRAIN.py plot --loss
   python TRAIN.py report              # → _save/YYYYMMDD_HHMMSS/ + git commit
   python TRAIN.py report my_run
+  # NOT: train report  (two verbs; CLI now redirects to report with a hint)
 
   # one-off config override without editing config.py
   python TRAIN.py train --label yield --set patch_size=15 --set num_layers=6
@@ -44,9 +45,11 @@ Run from this directory (or put it on PYTHONPATH), with your torch env active.
   error-ensemble   Residual ErrorEnsemble stages
   plot             History / loss / validation curves (no market reload for
                    history/loss; uses checkpoint artifacts)
-  report           Batch-export validation + history plots under _save/<name>/.
-                   Omit name → datetime folder YYYYMMDD_HHMMSS and git-commit
-                   all current changes with that message (use --no-commit to skip)
+  report           Batch-export validation + history plots under _save/<name>/,
+                   plus report.text with the active label's measure slots
+                   (val + test). Omit name → datetime folder YYYYMMDD_HHMMSS and
+                   git-commit all current changes with that message
+                   (use --no-commit to skip)
   search           Hyperparameter search (alias: sweep)
   tools            Rare utilities (compare, viz, yield-windows)
 
@@ -122,6 +125,8 @@ report
   report [DIR]               or: report --out DIR
                              omit DIR → _save/YYYYMMDD_HHMMSS/ + git commit
                              (message = folder name; same idea as error_ensemble_report)
+                             Always writes report.text from the active label's
+                             measure slots (validation + test sections).
   --ensemble                 export for every TelePred delay (ensemble-report)
   --no-commit                with bare report, skip the auto git commit
 

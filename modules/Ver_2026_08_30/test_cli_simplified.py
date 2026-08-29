@@ -61,6 +61,12 @@ def main() -> int:
     assert bare_nc.report_git_commit is False
     assert len(str(bare_nc.report)) == 15
 
+    # Footgun: ``train report`` → treat as ``report``
+    stacked = try_parse_simplified(cfg, ['train', 'report', '--no-commit'])
+    assert stacked.cli_command == 'report'
+    assert stacked.report is not None
+    assert stacked.report_git_commit is False
+
     i = try_parse_simplified(cfg, ['tools', 'viz-trend'])
     assert i.trend is True
 

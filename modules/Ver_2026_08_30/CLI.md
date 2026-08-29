@@ -23,7 +23,7 @@ python TRAIN.py train --label yield --set patch_size=15 --set num_layers=6
 | `ensemble` | TelePred delay bank |
 | `error-ensemble` | residual stages |
 | `plot` | `--history` / `--loss` / `--validation` |
-| `report` | export val+history under `_save/`; bare → datetime folder + git commit |
+| `report` | export val+history + `report.text` (label measures) under `_save/`; bare → datetime folder + git commit |
 | `search` | hparam search (`--with-delays` optional; alias: `sweep`) |
 | `tools` | `compare`, `viz-trend`, `viz-features`, `yield-windows` |
 

@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import torch
 
@@ -18,7 +19,51 @@ from labels import (
     latent_params_to_obs_space,
     resolve_latent_distribution,
     resolve_yield_target,
+    unpack_label_measures,
 )
+
+
+def compute_label_metrics(
+    label_mode: str,
+    preds: torch.Tensor,
+    y_truth: torch.Tensor,
+    *,
+    config: Optional[dict] = None,
+    dataset=None,
+    yield_target: Optional[str] = None,
+    latent_distribution: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Compute the active label's measure slots (no printing).
+
+    Returns an unpacked metrics dict (plus any extra diagnostic keys the
+    label packed, e.g. ``note`` for label=none).
+    """
+    cfg = dict(config or {})
+    cls = get_label_class(label_mode)
+    mode = cls.name
+    if yield_target is not None:
+        cfg['yield_target'] = yield_target
+    elif dataset is not None and getattr(dataset, 'yield_target', None):
+        cfg['yield_target'] = dataset.yield_target
+    if latent_distribution is not None:
+        cfg['latent_distribution'] = latent_distribution
+    elif dataset is not None and getattr(dataset, 'latent_distribution', None):
+        cfg['latent_distribution'] = dataset.latent_distribution
+
+    aux = cls.make_auxiliary(cfg)
+    packed = compute_label_measures(
+        mode,
+        preds,
+        y_truth,
+        auxiliary=aux,
+        dataset=dataset,
+        config=cfg,
+    )
+    metrics = unpack_label_measures(mode, packed)
+    for k, v in packed.items():
+        metrics.setdefault(k, v)
+    return metrics
 
 
 def report_test_metrics(
@@ -52,25 +97,19 @@ def report_test_metrics(
 
     yt = resolve_yield_target(cfg)
     ld = resolve_latent_distribution(cfg)
-    aux = cls.make_auxiliary(cfg)
 
     print("\n📊 Test Set Results:")
     print(f"  Measure slots:   {list(label_measure_slots(mode))}")
 
-    # Measures are packed by the hosting label (hidden from models).
-    packed = compute_label_measures(
+    metrics = compute_label_metrics(
         mode,
         preds,
         test_labels,
-        auxiliary=aux,
-        dataset=dataset,
         config=cfg,
+        dataset=dataset,
+        yield_target=yt,
+        latent_distribution=ld,
     )
-    from labels import unpack_label_measures
-    metrics = unpack_label_measures(mode, packed)
-    # Keep any extra diagnostic keys the label packed (e.g. note).
-    for k, v in packed.items():
-        metrics.setdefault(k, v)
     _print_measures(mode, metrics)
 
     if print_samples and mode != LABEL_NONE:
@@ -82,57 +121,131 @@ def report_test_metrics(
     return metrics
 
 
-def _print_measures(mode: str, metrics: dict) -> None:
+def format_measure_lines(mode: str, metrics: Mapping[str, Any]) -> List[str]:
+    """Human-readable lines for the label's declared measure slots."""
     if mode == 'rise_flag':
-        print(f"  BCE (logits):    {metrics.get('bce_with_logits', float('nan')):.4f}")
-        print(f"  Accuracy @thr:   {metrics.get('accuracy', float('nan')):.4f}"
-              f"  (thr={metrics.get('decision_threshold', 0.5)})")
-        print(
-            f"  Confusion:       TP={metrics.get('true_positive', 0)}  "
-            f"TN={metrics.get('true_negative', 0)}  "
-            f"FP={metrics.get('false_positive', 0)}  "
-            f"FN={metrics.get('false_negative', 0)}"
-        )
-        print(
-            f"  Rates:           TPR={metrics.get('tpr', float('nan')):.4f}  "
-            f"TNR={metrics.get('tnr', float('nan')):.4f}  "
-            f"FPR={metrics.get('fpr', float('nan')):.4f}  "
-            f"FNR={metrics.get('fnr', float('nan')):.4f}"
-        )
-        print(f"  Precision:       {metrics.get('precision', float('nan')):.4f}")
-        print(f"  Mean P(rise):    {metrics.get('mean_prob', float('nan')):.4f}")
-        print(f"  True pos rate:   {metrics.get('positive_rate_true', float('nan')):.4f}")
-        print(f"  Pred pos rate:   {metrics.get('positive_rate_pred', float('nan')):.4f}")
-        return
+        return [
+            f"  BCE (logits):    {metrics.get('bce_with_logits', float('nan')):.4f}",
+            (
+                f"  Accuracy @thr:   {metrics.get('accuracy', float('nan')):.4f}"
+                f"  (thr={metrics.get('decision_threshold', 0.5)})"
+            ),
+            (
+                f"  Confusion:       TP={metrics.get('true_positive', 0)}  "
+                f"TN={metrics.get('true_negative', 0)}  "
+                f"FP={metrics.get('false_positive', 0)}  "
+                f"FN={metrics.get('false_negative', 0)}"
+            ),
+            (
+                f"  Rates:           TPR={metrics.get('tpr', float('nan')):.4f}  "
+                f"TNR={metrics.get('tnr', float('nan')):.4f}  "
+                f"FPR={metrics.get('fpr', float('nan')):.4f}  "
+                f"FNR={metrics.get('fnr', float('nan')):.4f}"
+            ),
+            f"  Precision:       {metrics.get('precision', float('nan')):.4f}",
+            f"  Mean P(rise):    {metrics.get('mean_prob', float('nan')):.4f}",
+            f"  True pos rate:   {metrics.get('positive_rate_true', float('nan')):.4f}",
+            f"  Pred pos rate:   {metrics.get('positive_rate_pred', float('nan')):.4f}",
+        ]
     if mode == 'latent':
-        print(f"  NLL:             {metrics.get('nll', float('nan')):.4f}")
+        lines = [f"  NLL:             {metrics.get('nll', float('nan')):.4f}"]
         if 'location_mae' in metrics:
-            print(f"  Location MAE:    {metrics['location_mae']:.4f}")
-            print(f"  Location RMSE:   {metrics['location_rmse']:.4f}")
+            lines.append(f"  Location MAE:    {metrics['location_mae']:.4f}")
+            lines.append(f"  Location RMSE:   {metrics['location_rmse']:.4f}")
         if 'mean_pred_std' in metrics:
-            print(f"  Mean pred std:   {metrics['mean_pred_std']:.4f}")
+            lines.append(f"  Mean pred std:   {metrics['mean_pred_std']:.4f}")
         if 'mean_pred_df' in metrics:
-            print(f"  Mean pred df:    {metrics['mean_pred_df']:.2f}")
-        return
+            lines.append(f"  Mean pred df:    {metrics['mean_pred_df']:.2f}")
+        return lines
     if mode == 'yield':
+        lines = []
         if 'chance_mse' in metrics:
-            print(f"  Chance MSE:      {metrics['chance_mse']:.4f}")
+            lines.append(f"  Chance MSE:      {metrics['chance_mse']:.4f}")
         if 'near_mse' in metrics:
-            print(f"  Near MSE:        {metrics['near_mse']:.4f}")
-        return
+            lines.append(f"  Near MSE:        {metrics['near_mse']:.4f}")
+        return lines or [f"  {k}: {v}" for k, v in metrics.items()]
     if mode == 'trend':
+        lines = []
         if 'horizon_mse' in metrics:
-            print(f"  Horizon MSE:     {metrics['horizon_mse']:.4f}")
+            lines.append(f"  Horizon MSE:     {metrics['horizon_mse']:.4f}")
         if 'slope_mse' in metrics:
-            print(f"  Slope MSE:       {metrics['slope_mse']:.4f}")
+            lines.append(f"  Slope MSE:       {metrics['slope_mse']:.4f}")
         if 'intercept_mse' in metrics:
-            print(f"  Intercept MSE:   {metrics['intercept_mse']:.4f}")
-        return
+            lines.append(f"  Intercept MSE:   {metrics['intercept_mse']:.4f}")
+        return lines or [f"  {k}: {v}" for k, v in metrics.items()]
     if mode == 'none':
-        print("  (label=none — unsupervised; skipping supervised metrics)")
-        return
-    for k, v in metrics.items():
-        print(f"  {k}: {v}")
+        note = metrics.get('note')
+        if note:
+            return [f"  ({note})"]
+        return ["  (label=none — unsupervised; skipping supervised metrics)"]
+    return [f"  {k}: {v}" for k, v in metrics.items()]
+
+
+def _print_measures(mode: str, metrics: dict) -> None:
+    for line in format_measure_lines(mode, metrics):
+        print(line)
+
+
+def build_report_text(
+    *,
+    report_name: str,
+    label_mode: str,
+    model_type: str,
+    checkpoint_key: str,
+    checkpoint_path: str,
+    measure_slots: Sequence[str],
+    val_metrics: Optional[Mapping[str, Any]] = None,
+    test_metrics: Optional[Mapping[str, Any]] = None,
+    val_n: Optional[int] = None,
+    test_n: Optional[int] = None,
+    extra_header: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """
+    Plain-text report body for ``report.text``.
+
+    Measures come from the hosting label's ``measure_slots`` / pack_measures.
+    """
+    mode = get_label_class(label_mode).name
+    lines: List[str] = [
+        f"Report:           {report_name}",
+        f"Label:            {mode}",
+        f"Model:            {model_type}",
+        f"Checkpoint key:   {checkpoint_key}",
+        f"Checkpoint path:  {checkpoint_path}",
+        f"Measure slots:    {list(measure_slots)}",
+    ]
+    if extra_header:
+        for k, v in extra_header.items():
+            lines.append(f"{k}: {v}")
+    lines.append("")
+
+    def _section(title: str, metrics: Optional[Mapping[str, Any]], n: Optional[int]) -> None:
+        lines.append(f"=== {title} ===")
+        if n is not None:
+            lines.append(f"  n_samples:       {n}")
+        if metrics is None:
+            lines.append("  (not computed)")
+        else:
+            lines.extend(format_measure_lines(mode, metrics))
+        lines.append("")
+
+    _section("Validation", val_metrics, val_n)
+    _section("Test", test_metrics, test_n)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_report_text_file(
+    report_dir: Union[str, Path],
+    text: str,
+    *,
+    filename: str = "report.text",
+) -> Path:
+    """Write ``report.text`` under ``report_dir``; return the path."""
+    report_dir = Path(report_dir)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    path = report_dir / filename
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
 def _print_samples(mode, preds, test_labels, *, dataset, yield_target, latent_dist, n: int):
