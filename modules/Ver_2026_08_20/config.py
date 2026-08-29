@@ -108,17 +108,19 @@ config = {
     # LABEL FAMILY
     # ============================================================
     # Choose how supervised targets are built from the future price window:
-    #   'trend'   → (horizon, slope, intercept) via find_trend
-    #                        model may use output_dim 2 (m,b) or 3 (h,m,b)
-    #   'yield'   → (chance, near) via find_yield; model target selected by
-    #                        yield_target (cache always stores both)
-    #   'latent'  → density over a scalar observation (shares model head)
-    'label': 'yield',
+    #   'trend'      → (horizon, slope, intercept) via find_trend
+    #                           model may use output_dim 2 (m,b) or 3 (h,m,b)
+    #   'yield'      → (chance, near) via find_yield; model target selected by
+    #                           yield_target (cache always stores both)
+    #   'latent'     → density over a scalar observation (shares model head)
+    #   'rise_flag'  → binary {0,1} via Label_RiseFlag.find (refine that stub);
+    #                           output_dim=1; BCE-with-logits loss
+    'label': 'rise_flag',
 
     # ------------------------------------------------------------
     # YIELD (distribution of chance and near)
     # ------------------------------------------------------------
-    'min_yield_percent': 0.26,   #
+    'min_yield_percent': 0.26,   # also used as rise_flag threshold stub
     # Model target from full cache (chance, near):
     #   'both'   → output_dim=2  (chance, near)
     #   'chance' → output_dim=1  (chance,)
@@ -253,7 +255,7 @@ config = {
     # ============================================================
     # TRAINING CONFIGURATION
     # ============================================================
-    'epochs': 1,
+    'epochs': 12,
     'batch_size': 20,
     'learning_rate': 0.000_01, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
     'save_every_n_minutes': 5,
@@ -282,6 +284,8 @@ config = {
     # yield:
     'chance_loss_weight': 1.0,
     'near_loss_weight': 1.0,
+    # rise_flag:
+    'rise_flag_loss_weight': 1.0,
     'reconstruction_loss_weight': 1.0,
     'use_reconstruction': False,
 }

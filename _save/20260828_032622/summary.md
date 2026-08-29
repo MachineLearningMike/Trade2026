@@ -71,3 +71,8 @@ Invariant: loss(en_i, y) must not grow with i (retrain with --clean if it does).
 - `model_i/latest_epoch_loss.png` - partial/interrupted epoch curve
 - `model_i/validation_eXXX.png` - full val batch curves (`--report`)
 - `model_i/validation_eXXX_p0_30.png` - [0%, 30%] slice (`--report`)
+
+## Git
+
+- Commit: `115a757`
+- Message: `20260828_032622`

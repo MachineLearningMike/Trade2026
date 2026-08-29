@@ -31,10 +31,12 @@ from labels import (
     LABEL_TREND,
     LABEL_YIELD,
     LABEL_LATENT,
+    LABEL_RISE_FLAG,
     VALID_LABEL_MODES,
     LABEL_FULL_DIM_TREND,
     LABEL_FULL_DIM_YIELD,
     LABEL_FULL_DIM_LATENT,
+    LABEL_FULL_DIM_RISE_FLAG,
     HORIZON_SEARCH_LONGEST_LINEAR,
     HORIZON_SEARCH_SHORTEST_TO_THRESHOLD,
     VALID_HORIZON_SEARCH_MODES,
@@ -922,6 +924,19 @@ class TradingDataset(Dataset):
             self.latent_dim = forced_dim  # model head width
             # Cache is always the scalar observation (slice [0:1]).
             self._label_slice = label_target_slice(self.label_mode, self.output_dim)
+        elif self.label_mode == LABEL_RISE_FLAG:
+            from labels import Label_RiseFlag
+            self.yield_target = 'both'
+            forced_dim = Label_RiseFlag.resolve_output_dim(config)
+            cfg_dim = int(config.get('output_dim', forced_dim))
+            if cfg_dim != forced_dim:
+                print(
+                    f"⚠ label={LABEL_RISE_FLAG}: forcing output_dim "
+                    f"{cfg_dim} → {forced_dim}"
+                )
+            self.output_dim = forced_dim
+            self.latent_dim = forced_dim
+            self._label_slice = label_target_slice(self.label_mode, self.output_dim)
         else:
             self.yield_target = 'both'
             self.output_dim = int(config.get('output_dim', 3))
@@ -991,6 +1006,10 @@ class TradingDataset(Dataset):
         # Model-target stats (slice of full label vectors).
         self._label_stat_mean = self.stats['label']['mean'][self._label_slice]
         self._label_stat_std = self.stats['label']['std'][self._label_slice]
+        # Binary rise_flag targets stay in {0,1} for BCE — no z-score.
+        if self.label_mode == LABEL_RISE_FLAG:
+            self._label_stat_mean = torch.zeros_like(self._label_stat_mean)
+            self._label_stat_std = torch.ones_like(self._label_stat_std)
         
         # Cache local references for faster __getitem__
         self._mean_tensor = self.mean_tensor
@@ -1032,6 +1051,9 @@ class TradingDataset(Dataset):
             )
             print(f"  model output_dim (density params): {self.output_dim}")
             print(f"  label cache dim (observation): {LABEL_FULL_DIM_LATENT}")
+        elif self.label_mode == LABEL_RISE_FLAG:
+            print(f"  min_yield_percent (rise threshold stub): {self.min_yield_percent}")
+            print(f"  label cache dim (binary flag): {LABEL_FULL_DIM_RISE_FLAG}")
         else:
             print(f"  min_yield_percent: {self.min_yield_percent}")
             print(f"  yield_target: {self.yield_target}")
@@ -1059,6 +1081,8 @@ class TradingDataset(Dataset):
             full_names = ('horizon', 'slope', 'intercept')
         elif self.label_mode == LABEL_LATENT:
             full_names = ('y',)  # scalar observation in cache
+        elif self.label_mode == LABEL_RISE_FLAG:
+            full_names = ('rise_flag',)
         else:
             full_names = ('chance', 'near')
 
@@ -1225,6 +1249,18 @@ class TradingDataset(Dataset):
                 else:
                     chance, near = float(result[0]), float(result[1])
                 label = torch.tensor([chance, near], dtype=torch.float32)
+                h_past_list.append(0.0)
+            elif self.label_mode == LABEL_RISE_FLAG:
+                # Same TelePred contract as Yield: raw future vs p[t].
+                from labels import Label_RiseFlag
+                result = Label_RiseFlag.find(
+                    future_prices,
+                    current_price,
+                    min_yield_percent=self.min_yield_percent,
+                    max_hope_future_horizon=self.future_window,
+                )
+                flag = float(result[0] if isinstance(result, (tuple, list)) else result)
+                label = torch.tensor([flag], dtype=torch.float32)
                 h_past_list.append(0.0)
             elif self.label_mode == LABEL_LATENT:
                 # Realized next bar (future[0]) as one draw from the latent

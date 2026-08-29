@@ -4,7 +4,7 @@
 # Shared by data.py (label cache / dataset), model.py (objective), TRAIN, and INFER.
 #
 # Each label family is a class (find + loss). Bind Label_*.loss for training.
-# Families: Label_Trend, Label_Yield, Label_Latent (density NLL; shared model).
+# Families: Label_Trend, Label_Yield, Label_Latent, Label_RiseFlag.
 # Visualization helpers (formerly label_viz.py) live at the bottom.
 
 import random
@@ -27,13 +27,15 @@ LABEL_FITNESS_THRESHOLD = 0.75
 LABEL_TREND = 'trend'
 LABEL_YIELD = 'yield'
 LABEL_LATENT = 'latent'
-VALID_LABEL_MODES = (LABEL_TREND, LABEL_YIELD, LABEL_LATENT)
+LABEL_RISE_FLAG = 'rise_flag'
+VALID_LABEL_MODES = (LABEL_TREND, LABEL_YIELD, LABEL_LATENT, LABEL_RISE_FLAG)
 
 LABEL_FULL_DIM_TREND = 3
 LABEL_FULL_DIM_YIELD = 2
 LABEL_FULL_DIM_YIELD_SINGLE = 1  # chance-only or near-only head
 # Latent: scalar observation in the label cache; model head width from density mode.
 LABEL_FULL_DIM_LATENT = 1
+LABEL_FULL_DIM_RISE_FLAG = 1  # binary flag {0, 1}
 
 # Latent parametric density (config key ``latent_distribution``).
 # See Basic/Predict_normal_disttribution.py and Predict_student_t_disttribution.py.
@@ -633,6 +635,158 @@ class Label_Yield:
 
 
 # ═══════════════════════════════════════════════════════════
+# LABEL FAMILY: RISE FLAG (binary; refine find() as needed)
+# ═══════════════════════════════════════════════════════════
+
+class Label_RiseFlag:
+    """
+    Binary rise flag on raw prices (scaffold for refinement).
+
+    Config id: ``rise_flag``
+    Cache / model target: single scalar in {0.0, 1.0}.
+    Price space: raw (same TelePred contract as Yield):
+        Y(t) = find( p[t+1 : t+1+delta2], p[t] )
+
+    Initial ``find`` is a crude chance-like threshold stub — refine freely.
+    Loss: BCE-with-logits (``y_pred`` treated as logits; ``y_truth`` in {0,1}).
+    Do not z-score these targets in the dataset (identity label stats).
+    """
+
+    name = LABEL_RISE_FLAG
+
+    @classmethod
+    def full_cache_dim(cls) -> int:
+        return LABEL_FULL_DIM_RISE_FLAG
+
+    @classmethod
+    def full_dim(cls, **_kwargs) -> int:
+        return LABEL_FULL_DIM_RISE_FLAG
+
+    @classmethod
+    def resolve_future_window(cls, config: dict) -> int:
+        return int(config.get('future_window', 50))
+
+    @classmethod
+    def resolve_model_past_len(cls, config: dict) -> int:
+        return cls.resolve_future_window(config)
+
+    @classmethod
+    def resolve_output_dim(cls, config: Optional[dict] = None, **_kwargs) -> int:
+        return LABEL_FULL_DIM_RISE_FLAG
+
+    @classmethod
+    def target_slice(cls, output_dim: int, **_kwargs) -> slice:
+        if output_dim != LABEL_FULL_DIM_RISE_FLAG:
+            raise ValueError(
+                f"{cls.name}: output_dim must be {LABEL_FULL_DIM_RISE_FLAG}, "
+                f"got {output_dim}"
+            )
+        return slice(0, 1)
+
+    @classmethod
+    def target_names(cls, output_dim: int, **_kwargs) -> Tuple[str, ...]:
+        if output_dim != LABEL_FULL_DIM_RISE_FLAG:
+            raise ValueError(
+                f"{cls.name}: output_dim must be {LABEL_FULL_DIM_RISE_FLAG}, "
+                f"got {output_dim}"
+            )
+        return ('rise_flag',)
+
+    @staticmethod
+    def _as_1d_float64(x) -> np.ndarray:
+        if x is None:
+            return np.zeros(0, dtype=np.float64)
+        if torch.is_tensor(x):
+            arr = x.detach().reshape(-1).to(dtype=torch.float64).cpu().numpy()
+            return np.asarray(arr, dtype=np.float64)
+        return np.asarray(x, dtype=np.float64).reshape(-1)
+
+    @classmethod
+    def find(
+        cls,
+        future,
+        current,
+        min_yield_percent: float = 0.26,
+        max_hope_future_horizon: Optional[int] = None,
+        **_kwargs,
+    ):
+        """
+        Binary rise flag stub (REFINE THIS).
+
+        Current rule (chance-like, hard threshold — replace as needed):
+          1.0 if any bar in ``future`` has percent rise vs ``current``
+              >= ``min_yield_percent``, else 0.0.
+
+        TelePred signature (same as Yield):
+            Y(t) = find( p[t+1 : t+1+delta2], p[t] )
+        """
+        fut = cls._as_1d_float64(future)
+        cur = cls._as_1d_float64(current)
+        if cur.size == 0:
+            current_px = float('nan')
+        else:
+            current_px = float(cur[-1])
+
+        n = int(fut.shape[0])
+        if max_hope_future_horizon is not None:
+            n = min(n, max(0, int(max_hope_future_horizon)))
+
+        flag = 0.0
+        if n > 0 and np.isfinite(current_px):
+            eps = 1e-8
+            denom = current_px if abs(current_px) > eps else (
+                current_px + eps if current_px >= 0.0 else current_px - eps
+            )
+            pct = (fut[:n] - current_px) / denom * 100.0
+            thr = float(min_yield_percent)
+            # STUB: hard OR over the future window. Refine freely.
+            if np.any(np.isfinite(pct) & (pct >= thr)):
+                flag = 1.0
+
+        return (float(flag),)
+
+    @classmethod
+    def make_auxiliary(cls, config: Optional[dict] = None, **overrides) -> dict:
+        """
+        Class-private loss knobs for rise_flag.
+
+        Keys: rise_flag_weight (optional scale on BCE)
+        """
+        cfg = dict(config or {})
+        cfg.update({k: v for k, v in overrides.items() if v is not None})
+        aux = {
+            'rise_flag_weight': float(cfg.get('rise_flag_loss_weight', 1.0)),
+        }
+        return aux
+
+    @classmethod
+    def loss(
+        cls,
+        x: torch.Tensor,
+        y_pred: torch.Tensor,
+        y_truth: torch.Tensor,
+        auxiliary: Optional[dict] = None,
+    ) -> torch.Tensor:
+        """
+        Uniform signature: loss(x, y_pred, y_truth, auxiliary).
+
+        BCE-with-logits: ``y_pred`` are logits, ``y_truth`` in {0,1}.
+        ``x`` unused (API uniformity).
+        """
+        aux = auxiliary or {}
+        w = float(aux.get('rise_flag_weight', 1.0))
+        if y_pred.shape[-1] != 1 or y_truth.shape[-1] != 1:
+            raise ValueError(
+                f"{cls.name} loss expects pred/truth last dim 1, "
+                f"got pred={tuple(y_pred.shape)} truth={tuple(y_truth.shape)}"
+            )
+        # Flatten to (B,) for binary BCE.
+        logits = y_pred[:, 0]
+        target = y_truth[:, 0].clamp(0.0, 1.0)
+        return w * F.binary_cross_entropy_with_logits(logits, target)
+
+
+# ═══════════════════════════════════════════════════════════
 # LATENT DISTRIBUTION RESOLUTION
 # ═══════════════════════════════════════════════════════════
 
@@ -1051,10 +1205,13 @@ LABEL_CLASSES: dict[str, Type] = {
     LABEL_TREND: Label_Trend,
     LABEL_YIELD: Label_Yield,
     LABEL_LATENT: Label_Latent,
-    # legacy aliases (pre-rename configs / caches)
+    LABEL_RISE_FLAG: Label_RiseFlag,
+    # legacy / shorthand aliases
     'linear_regime': Label_Trend,
     'linear_trend': Label_Trend,
     'scattered_hope': Label_Yield,
+    'riseflag': Label_RiseFlag,
+    'rise': Label_RiseFlag,
 }
 
 
@@ -1113,9 +1270,10 @@ def sync_output_dim(config: dict) -> int:
     """
     Force ``config['output_dim']`` from the active label family where required.
 
-    - yield   → from ``yield_target`` (always)
-    - latent  → from ``latent_distribution`` (always)
-    - trend   → leave ``config['output_dim']`` unchanged (2 or 3)
+    - yield      → from ``yield_target`` (always)
+    - latent     → from ``latent_distribution`` (always)
+    - rise_flag  → always 1
+    - trend      → leave ``config['output_dim']`` unchanged (2 or 3)
 
     Returns the resulting ``output_dim``. Used so CLI modes and training
     share one checkpoint-key / head-width path.
@@ -1127,6 +1285,8 @@ def sync_output_dim(config: dict) -> int:
         )
     elif cls is Label_Latent:
         config['output_dim'] = Label_Latent.resolve_output_dim(config)
+    elif cls is Label_RiseFlag:
+        config['output_dim'] = Label_RiseFlag.resolve_output_dim(config)
     return int(config.get('output_dim', LABEL_FULL_DIM_TREND))
 
 
@@ -1143,6 +1303,11 @@ def find_yield(future, current, *args, **kwargs):
 
 def find_latent(*args, **kwargs):
     return Label_Latent.find(*args, **kwargs)
+
+
+def find_rise_flag(future, current, *args, **kwargs):
+    """Y(t) = label(p[t+1:t+1+delta2], p[t]) → binary rise flag (refine find)."""
+    return Label_RiseFlag.find(future, current, *args, **kwargs)
 
 
 # Legacy names

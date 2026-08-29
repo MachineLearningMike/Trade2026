@@ -123,12 +123,8 @@ def main(config):
     )
     parser.add_argument(
         '--clean', action='store_true',
-        help=(
-            'Delete checkpoints for the current run identity, then train fresh. '
-            'Single-model: one checkpoint key. '
-            'With --error-ensemble: all stage keys model_0..model_{n-1}. '
-            'Other key folders under checkpoint_dir are preserved.'
-        ),
+        help='Delete checkpoints for the current checkpoint key only '
+             '(other key folders under checkpoint_dir are preserved)',
     )
     parser.add_argument(
         '--extend', type=float, default=None,
@@ -171,6 +167,7 @@ def main(config):
         ),
     )
     parser.add_argument(
+        
         '--report', type=str, default=None, metavar='DIR_NAME',
         help=(
             "Batch-export validation loss plots for every saved epoch under the "
@@ -270,33 +267,6 @@ def main(config):
         help=(
             'Hyperparameter scout: outer patch_size×num_layers; '
             'each trial trains the full TelePred delay bank'
-        ),
-    )
-    parser.add_argument(
-        '--error-ensemble', action='store_true', default=False,
-        help=(
-            'Train ErrorEnsemble residual stages sequentially: '
-            'model_0 fits y; model_i fits e_{i-1}=e_{i-2}-y_{i-1} '
-            '(e_{-1}:=y). One checkpoint key per stage. '
-            'Uses current telepred_delay / label / model_type=regression. '
-            'Pair with --clean to wipe all stage keys and start over.'
-        ),
-    )
-    parser.add_argument(
-        '--error-ensemble-n', type=int, default=None, metavar='N',
-        help=(
-            'Number of ErrorEnsemble stages/models (model_0..model_{N-1}). '
-            f"Default: config error_ensemble_n "
-            f"({int(config.get('error_ensemble_n', 3))})."
-        ),
-    )
-    parser.add_argument(
-        '--error-ensemble-extend', type=int, default=None, metavar='N',
-        help=(
-            'Append N more ErrorEnsemble stages after the last finished stage '
-            'already on disk (model_0..model_{k-1} kept; train model_k..'
-            'model_{k+N-1}). Implies ErrorEnsemble training. '
-            'Cannot be combined with --clean.'
         ),
     )
     parser.add_argument(
@@ -487,25 +457,6 @@ def main(config):
         config['telepred_delays'] = parse_delay_list(
             config.get('telepred_delays', [config['telepred_delay']])
         )
-    if getattr(args, 'error_ensemble_n', None) is not None:
-        config['error_ensemble_n'] = max(1, int(args.error_ensemble_n))
-    else:
-        config['error_ensemble_n'] = max(
-            1, int(config.get('error_ensemble_n', 3) or 3)
-        )
-    if getattr(args, 'error_ensemble_extend', None) is not None:
-        if int(args.error_ensemble_extend) < 1:
-            raise SystemExit('⚠ --error-ensemble-extend N requires N >= 1')
-        if config.get('clean'):
-            raise SystemExit(
-                '⚠ --error-ensemble-extend cannot be combined with --clean '
-                '(extend keeps existing finished stages).'
-            )
-        # Extending implies ErrorEnsemble mode.
-        args.error_ensemble = True
-        config['error_ensemble_extend'] = int(args.error_ensemble_extend)
-    else:
-        config['error_ensemble_extend'] = None
 
     if args.no_normalize_window:
         config['normalize_window'] = False
@@ -1125,30 +1076,19 @@ def main(config):
     # ============================================================
     # STEP 3: Handle --clean flag
     # ============================================================
-    # Only remove this config's key folder(s). Sibling checkpoint keys stay intact.
+    # Only remove this config's key folder. Sibling checkpoint keys stay intact.
     checkpoint_dir = Path(config['checkpoint_dir'])
     if config['clean']:
-        if getattr(args, 'error_ensemble', False):
-            # Stage keys include error_ensemble_stage; the bare (non-stage) key
-            # from resolve_checkpoint_identity does NOT match those folders.
-            from error_ensemble import clean_error_ensemble_checkpoints
-            clean_error_ensemble_checkpoints(
-                config, n=int(config.get('error_ensemble_n', 3))
-            )
-            # Force a fresh start even if a stub dir is recreated later.
-            config['resume'] = False
+        # Match ResumableTrainer key (signature + synced output_dim).
+        dataset_signature, current_key, key_dir = resolve_checkpoint_identity(config)
+        if key_dir.exists():
+            shutil.rmtree(key_dir)
+            print(f"✓ Cleaned checkpoints for key: {current_key}")
+            print(f"  Removed: {key_dir}")
+            print(f"  Other keys under {checkpoint_dir}/ were left untouched.\n")
         else:
-            # Match ResumableTrainer key (signature + synced output_dim).
-            dataset_signature, current_key, key_dir = resolve_checkpoint_identity(config)
-            if key_dir.exists():
-                shutil.rmtree(key_dir)
-                print(f"✓ Cleaned checkpoints for key: {current_key}")
-                print(f"  Removed: {key_dir}")
-                print(f"  Other keys under {checkpoint_dir}/ were left untouched.\n")
-            else:
-                print(f"✓ No checkpoints to clean for key: {current_key}")
-                print(f"  Looked in: {key_dir}\n")
-            config['resume'] = False
+            print(f"✓ No checkpoints to clean for key: {current_key}")
+            print(f"  Looked in: {key_dir}\n")
 
     # ============================================================
     # STEP : Handle --features flag (visualize total_features only, no training)
@@ -1358,49 +1298,6 @@ def main(config):
 
     # Single-element path (and legacy --sweep on one delay's dataset)
     dataset, total_features = get_dataset(config)
-
-    if getattr(args, 'error_ensemble', False):
-        from error_ensemble import (
-            count_finished_error_ensemble_stages,
-            run_error_ensemble_train,
-        )
-        start_stage = 0
-        n_total = int(config.get('error_ensemble_n', 3))
-        add_n = config.get('error_ensemble_extend')
-        if add_n is not None:
-            n_done = count_finished_error_ensemble_stages(config, dataset)
-            if n_done <= 0:
-                raise SystemExit(
-                    '⚠ --error-ensemble-extend requires at least one finished '
-                    'stage (model_0) on disk. Train with --error-ensemble first.'
-                )
-            start_stage = n_done
-            n_total = n_done + int(add_n)
-            config['error_ensemble_n'] = n_total
-            print(
-                f"ErrorEnsemble extend: keeping model_0..model_{n_done - 1}; "
-                f"training model_{start_stage}..model_{n_total - 1} "
-                f"(+{int(add_n)} stages → n={n_total})"
-            )
-        # --clean already wiped stage folders and set resume=False.
-        outcome = run_error_ensemble_train(
-            config,
-            dataset,
-            total_features,
-            n=n_total,
-            start_stage=start_stage,
-            num_epochs=float(config['epochs']),
-            resume=False if config.get('clean') else config.get('resume', True),
-            extend=(args.extend is not None and args.extend != 0),
-            extend_epochs=args.extend if args.extend is not None else 0.0,
-            probe_weights=True,
-        )
-        print(
-            f"\n✅ ErrorEnsemble training completed: "
-            f"{outcome['n_ok']}/{outcome.get('n_attempted', outcome['n'])} "
-            f"new stages ok (total n={outcome['n']})"
-        )
-        return
 
     if getattr(args, 'sweep', False) or getattr(args, 'vae_sweep', False):
         from vae_sweep import run_hparam_sweep
