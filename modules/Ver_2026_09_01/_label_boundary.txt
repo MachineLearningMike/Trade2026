@@ -1,0 +1,28 @@
+Task boundary (Ver_2026_09_01)
+=============================
+
+Ownership
+---------
+  TRAIN / INFER
+      - Read config; create principal task = get_task_class(config['label'])
+      - Pass task= into TradingDataset and ResumableTrainer
+      - Call task.* polymorphically (no Task_* imports, no label if-ladders)
+
+  data.TradingDataset / trainer.ResumableTrainer
+      - Hold self.task (injected); call self.task.* directly for task logic
+      - Must not call get_task_class
+      - Keep normalize_y / denormalize_y only: they bind dataset-owned
+        train-set label stats (_label_stat_mean/std). Not pure passthrough.
+
+  Task_*.py
+      - All task-specific knowledge
+
+  task_base.py
+      - Task base, WindowContext, shared math, get_task_class, COMPAT
+      - No string-mode label_* routers / report orchestration (being removed)
+
+Construction
+------------
+  task = get_task_class(config['label'])
+  dataset = TradingDataset(..., task=task, runtime_config=config)
+  trainer = ResumableTrainer(..., task=task, loss_fn=bind_task_loss(task, config), ...)

@@ -1,0 +1,12 @@
+Task hierarchy (Ver_2026_08_31)
+===============================
+
+  task_base.Task
+      ├── Task_Trend   (Task_Trend.py)   config: trend   (+ visualize)
+      ├── Task_Yield   (Task_Yield.py)   config: yield   (+ visualize)
+      ├── Task_Latent  (Task_Latent.py)  config: latent  (+ visualize)
+      ├── Task_Rise    (Task_Rise.py)    config: rise_flag
+      └── Task_None    (Task_None.py)    config: none
+
+Shared helpers / constants / registry / dispatch: task_base.py
+labels.py deleted.

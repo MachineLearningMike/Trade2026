@@ -1,0 +1,320 @@
+================================================================================
+DATA PIPELINE REPORT — generation, storage, keys, config consistency
+Module: modules/Ver_2026_08_20
+Date: 2026-08-24
+================================================================================
+
+Goal of this report
+-------------------
+Describe how market + macro data flow from download through training
+checkpoints, how each on-disk artifact is keyed, and whether the chain
+keeps artifacts consistent with the *current* run config.
+
+
+--------------------------------------------------------------------------------
+1. PIPELINE OVERVIEW (staged)
+--------------------------------------------------------------------------------
+
+  [A] Offline macro catalog + raw series     (manual / periodic)
+        macro_dictionary.FEATURES
+           → fsv_01_downloader (+ FRED / TwelveData clients)
+           → dataset_cache/macro_raw.csv
+           → fsv_02_find_value_intervals
+           → dataset_cache/macro_value_intervals.csv
+
+  [B] Minute macro grid (on TRAIN / get_dataset)
+        fsv_03_query_value_age.get_value_age_array(config)
+           → dataset_cache/macro_value_decay_<8hex>.npy
+              (+ matching _meta.json)
+
+  [C] Binance market series (on TRAIN / get_dataset)
+        data.get_binance_data(config)
+           → Vision zip/CSV under STORE_DIRECTORY (Binance.py)
+           → dataset_cache/binance/candles_<8hex>.npy (+ _meta.json)
+
+  [D] Assemble features (dataset_build.get_dataset)
+        market (F_m, T) ‖ macro value/decay (2·n_macro, T)
+           → time-align T = min(market_T, macro_T)
+           → TradingDataset(...)
+
+  [E] Labels + per-window norms (TradingDataset)
+           → dataset_cache/labels_<12hex>.pkl
+
+  [F] Model weights + train state (ResumableTrainer)
+           → trading_checkpoints/<16hex>/
+                checkpoint_*.pt, best_val.pt, training_state.json,
+                latest_epoch_loss.json, validation_loss_epoch_*.json
+
+
+TelePred indexing (config windows):
+  past_window  = delta1   (model input length)
+  future_window = delta2  (label future length)
+  telepred_delay = d      (input ends at bot_time - d)
+
+
+--------------------------------------------------------------------------------
+2. ARTIFACT KEYS (what is hashed / validated)
+--------------------------------------------------------------------------------
+
+KEY LENGTH (uniform): all pipeline ids use MD5 truncated to **8 hex** chars
+  (Binance folder, labels_*.pkl, macro_value_decay_*.npy, checkpoint folder,
+   intervals file_fingerprint).
+
+(2.1) FSV intervals CSV — CONFIG-INDEPENDENT content artifact
+  Path: dataset_cache/macro_value_intervals.csv (or $MACRO_DATA_DIR (or legacy $FSV_DATA_DIR))
+  Built by macro_02 from macro_raw.csv + **core** macro_dictionary FEATURES only
+  (get_features(None); no include/exclude, no macro_features_extra).
+  Training config must NOT reshape this file; TRAIN only *selects* columns
+  when materializing the minute grid in fsv_03.
+  Content fingerprint: file_fingerprint → 8-hex MD5 of file bytes.
+
+(2.2) FSV minute grid — macro_value_decay_<8hex>.npy
+  Hash inputs (generate_cache_filename) — **follows config**:
+    - ordered feature list (after include/exclude)
+    - macros_to_exclude
+    - binance_start_date / binance_end_date (UTC grid)
+    - is_utc flag + clock=UTC marker
+    - intervals_fingerprint  ← join to config-free upstream
+  On load: meta.intervals_fingerprint must match current CSV fingerprint
+  or the array is recomputed.
+  Layout: channels interleaved value/decay → (2·n, T).
+
+(2.3) Binance market cache — flat keyed files under dataset_cache/binance/
+  Payload: **candles_<8hex>.npy** (cache_version=4)
+  Sidecar: **candles_<8hex>_meta.json** (REQUIRED — see §8)
+  generate_binance_data_key ← MD5[:8] of:
+    cache_version (BINANCE_CACHE_VERSION = 4)
+    binance_datatype, binance_interval
+    binance_start_date, binance_end_date
+    binance_symbols (ordered symbol → columns)
+    prediction_target
+  Intentionally OMITTED: past_window, labels, splits, macros, model.
+  On load: meta.key_params and cache_version must match exactly;
+  shape (F, T) checked. (No force-recompute flag — delete the folder to refetch.)
+
+(2.4) Dataset / label-cache signature — labels_<8hex>.pkl
+  generate_dataset_signature(config) ← MD5[:8] of a large key_params map:
+
+  Data identity
+    use_binance_data, binance_*, dates, symbols, prediction_target
+    total_synthetic_days (if synthetic)
+    macros_to_include / exclude, derived feature_names, F, price_feature_idx
+    nominal T = estimate_T_from_config(config)
+    num_shapes
+
+  Windows / sampling
+    past_window, future_window, step
+    telepred_delay          (only if != 0)
+    telepred_definition_id  (only if != telepred_v1)
+
+  Label algorithm / targets
+    label, min_yield_percent, yield_target
+    min_trend_horizon, regime_use_past, fitness_threshold, horizon_search
+    latent_distribution, output_dim, normalize
+
+  Splits
+    train_ratio, val_ratio, shuffle_split
+
+  NOT hashed (by design)
+    LABEL_CACHE_ALGO_VERSION — validated inside the pickle on load
+    learning_rate, dropout, loss weights, batch_size, epochs
+    model patch_size / num_layers (those go in checkpoint key)
+
+  TradingDataset.cache_key = generate_dataset_signature(runtime_config)
+  File: <data_dir>/labels_<cache_key>.pkl
+  On load: checks num_samples, F, T, past_window, future_window,
+           label_algo_version == LABEL_CACHE_ALGO_VERSION (currently 6).
+  Delete labels_*.pkl (or change signature) to rebuild labels.
+
+(2.5) Checkpoint key — trading_checkpoints/<8hex>/
+  generate_checkpoint_key(config, dataset_signature) ← MD5[:8] of:
+    dataset_signature   (entire data/label identity above)
+    model_type, patch_size, num_layers, num_heads
+    n_latent_macros, ff_dim_multiplier, head_hidden_dim_multiplier
+    output_dim, causal, use_reconstruction, look_price
+    (+ vae_latent_dim if model_type=vae)
+
+  resolve_checkpoint_identity(config):
+    sync_output_dim(config) → then signature → key → key_dir
+
+  IMPORTANT: ResumableTrainer must be given checkpoint_key= explicitly
+  (train_run / vae_sweep do this) so sweeps do not collapse onto get_config().
+
+
+--------------------------------------------------------------------------------
+3. RUNTIME ASSEMBLY (get_dataset → TradingDataset)
+--------------------------------------------------------------------------------
+
+  1. get_binance_data(config) or synthetic series → market (F_m, T_m)
+  2. get_value_age_array(config) → macro (2·n, T_macro) + base names
+  3. Align T = min(T_m, T_macro); truncate both
+  4. Require T >= past_window + future_window (+ delay handled in valid_t)
+  5. TradingDataset(..., runtime_config=config)
+       - reads label mode, windows, telepred_delay from runtime_config
+         (not a stale module get_config() copy)
+       - valid_t = TelePred bot times; input/label slices from telepred.py
+       - builds or loads labels_<sig>.pkl
+       - train/val/test splits; train-split stats for label/mean/std/shape
+
+Batch tensors: (x, p, mean, std, shape, y) with x from delayed input window;
+yield labels anchored at p[t] (label history ends at bot_time).
+
+
+--------------------------------------------------------------------------------
+4. CONSISTENCY ANALYSIS — does current config always rule?
+--------------------------------------------------------------------------------
+
+What works well
+  - Layered keys: raw market cache ⊥ macros ⊥ labels ⊥ weights.
+  - Changing dates/symbols → new Binance + FSV minute keys.
+  - Changing windows / label / delay / filters → new label signature
+    (and thus new checkpoint key via dataset_signature).
+  - Changing architecture → new checkpoint key; same label cache reusable.
+  - Label pickle validates geometry + LABEL_CACHE_ALGO_VERSION.
+  - Binance meta validates key_params + version.
+  - FSV minute meta validates intervals fingerprint.
+  - runtime_config on TradingDataset keeps ensemble per-d delays consistent.
+  - update_config(config) after TRAIN argparse syncs module defaults for
+    any leftover get_config() callers.
+
+Known gaps / caveats (not always bugs, but operators must know)
+
+  G1. Nominal T vs real T
+      Signature hashes estimate_T_from_config (from date range ÷ interval).
+      Real download T can differ slightly; pickle compares real dataset.T.
+      Miss → recompute labels (safe). Signature string can stay the same
+      across small T drift until something else in key_params changes.
+
+  G2. Market↔macro align uses min(T)
+      If caches disagree in length, silent truncate to shorter T.
+      Both still come from the same configured date range intent.
+
+  G3. Offline FSV raw/intervals (stages A)
+      Not re-downloaded by TRAIN. Consistency depends on intervals CSV
+      fingerprint. If catalog filters change but CSV is stale, feature
+      list in signature vs available intervals can disagree until 01/02
+      are re-run. Minute cache will recompute when fingerprint/filters
+      change; empty/missing macros can yield zero macro channels with
+      a warning.
+
+  G4. Hyperparams omitted from checkpoint key
+      Same folder resumes if only LR/loss weights change — intentional.
+      Do not expect a new key for LR tweaks.
+
+  G5. Old checkpoint folders after window rename
+      past_hours / max_hope_* / max_trend_* / max_latent_* removed from
+      config and signature (clean break). Prior keys remain on disk but
+      will not match current config until retrained.
+
+  G6. Vision STORE_DIRECTORY
+      Binance zip/CSV under D:/trading_data (or STORE_DIRECTORY) is shared
+      across experiments; keyed by symbol/interval/date files, not by the
+      dataset_cache binance hash. Safe as long as get_binance_data still
+      clips to configured dates.
+
+
+--------------------------------------------------------------------------------
+5. CONSISTENCY CHECKLIST (operator)
+--------------------------------------------------------------------------------
+
+  [ ] Config dates match the intended experiment
+  [ ] macros_to_include / exclude match FSV catalog expectations
+  [ ] macro_value_intervals.csv up to date if macros matter
+  [ ] past_window / future_window / telepred_delay as intended
+  [ ] label / yield_target / latent_distribution match the head
+  [ ] After CLI overrides: update_config path ran (TRAIN does this)
+  [ ] For sweeps: each trial uses explicit checkpoint_key (fixed)
+
+
+--------------------------------------------------------------------------------
+6. QUICK DIAGRAM
+--------------------------------------------------------------------------------
+
+  FRED/TD ──► macro_raw.csv ──► macro_value_intervals.csv  (config-free core catalog)
+                                      │
+                                      ▼ fingerprint 8-hex
+                              macro_value_decay_<8>.npy   (config selects features/dates)
+                                      │
+  Binance Vision ──► binance/candles_<8>.npy (+ candles_<8>_meta.json)
+                                      │
+                                      ▼ concat + align T
+                              TradingDataset(runtime_config)
+                                      │
+                                      ▼ signature 8-hex
+                              labels_<8>.pkl
+                                      │
+                                      ▼ signature ⊂ arch hash 8-hex
+                              trading_checkpoints/<8>/…
+
+
+--------------------------------------------------------------------------------
+8. meta.json — is it required?
+--------------------------------------------------------------------------------
+
+  Yes — keep meta.json for the Binance cache (and FSV *_meta.json).
+
+  candles.npy alone is a bare float array (F, T). It does **not** store:
+    - target_feature_id (which row is the prediction price)
+    - feature_names (column semantics / join order)
+    - nForget
+    - key_params / cache_version (prove the folder matches *this* config)
+
+  Folder name (8-hex) is only a hash of key_params; meta.json re-stores those
+  params so a hash collision or hand-copied npy cannot silently load wrong
+  data. Load path refuses the cache if meta is missing or mismatches.
+
+  FSV minute *_meta.json plays the same role for intervals_fingerprint.
+
+
+--------------------------------------------------------------------------------
+9. Do we need content fingerprints to join the next (config-shaped) stage?
+--------------------------------------------------------------------------------
+
+  Pattern in this pipeline:
+
+    Upstream artifact (config-light / config-free)
+        → content fingerprint (or exact key_params hash)
+        → Downstream artifact (follows config) includes that fingerprint
+          in *its* key
+
+  Concrete joins today:
+    macro_value_intervals.csv  --fingerprint-->  macro_value_decay_<8>.npy key
+    binance key_params hash  --folder id---->  candles.npy + meta.json
+    dataset signature (config + layout + dates + …)
+         --embedded in-->  checkpoint key
+
+  Recommendation:
+    - Config-free / shared raw stages (intervals CSV, Vision zips): fingerprint
+      content; do not bake TRAIN filters into them.
+    - Config-shaped stages (minute FSV, labels, checkpoints): hash **config
+      fields that define the payload** + **upstream fingerprint/key** so a
+      change upstream or in config misses the cache.
+    - Optional hardening (not required for correctness if meta.key_params
+      matches): also store MD5 of candles.npy bytes in meta for bit-rot
+      detection. Current design trusts key_params + version + shape.
+
+  You do **not** need to fingerprint the next stage backward into the
+  intervals CSV. Joins are one-way: upstream id ⊂ downstream key.
+
+
+--------------------------------------------------------------------------------
+7. VERDICT
+--------------------------------------------------------------------------------
+
+The pipeline is intentionally layered and, for on-line TRAIN paths, keyed
+so that **data that affects labels or weights is bound to config-derived
+hashes**, with load-time validation (Binance meta, FSV fingerprint, label
+algo version + shapes).
+
+Remaining consistency risks are mainly:
+  - offline FSV raw/intervals freshness (A),
+  - nominal vs real T,
+  - delete cache files/folders to rebuild (no force flag),
+  - intentional omission of train hyperparams from checkpoint keys.
+
+max_latent_future_horizon was later unified into future_window (removed
+from config and dataset signature).
+
+================================================================================
+END OF _data_pipeline_report.txt
+================================================================================

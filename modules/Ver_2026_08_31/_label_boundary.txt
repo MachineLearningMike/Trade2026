@@ -1,0 +1,16 @@
+Task boundary (Ver_2026_08_31)
+=============================
+
+Canonical locations
+-------------------
+  data.py          — dataset, loader, sample/batch ABI, label cache pickle
+  task_base.py     — Task base, shared helpers, registry/dispatch, metrics orchestration
+  Task_*.py        — task logic, visualize, print_prediction_samples, metrics slots
+
+Deleted: labels.py, label_cache.py, label_metrics.py, sample_batch.py,
+         registry.py, compat.py, smoke_util.py
+
+Product (model, task) COMPAT / assert_compatible live in task_base.py.
+Smoke helpers live in test_phase1_smoke.py.
+
+data.py may know task ids and call Task / task_base APIs only.

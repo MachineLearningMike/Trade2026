@@ -1,0 +1,48 @@
+    @classmethod
+    def visualize_inference(cls, *args, **kwargs):
+        """INFER viz entry; default forwards to visualize if present."""
+        viz = getattr(cls, 'visualize', None)
+        if viz is None:
+            print(f"⚠ {cls.name}: no visualize() for inference plots")
+            return None
+        return viz(*args, **kwargs)
+
+==== Task_Yield ====
+    @classmethod
+    def visualize_inference(cls, *args, **kwargs):
+        """INFER viz entry; default forwards to visualize if present."""
+        viz = getattr(cls, 'visualize', None)
+        if viz is None:
+            print(f"⚠ {cls.name}: no visualize() for inference plots")
+            return None
+        return viz(*args, **kwargs)
+
+==== Task_Trend ====
+    @classmethod
+    def visualize_inference(cls, *args, **kwargs):
+        """INFER viz entry; default forwards to visualize if present."""
+        viz = getattr(cls, 'visualize', None)
+        if viz is None:
+            print(f"⚠ {cls.name}: no visualize() for inference plots")
+            return None
+        return viz(*args, **kwargs)
+
+==== Task_Rise ====
+    @classmethod
+    def visualize_inference(cls, *args, **kwargs):
+        """INFER viz entry; default forwards to visualize if present."""
+        viz = getattr(cls, 'visualize', None)
+        if viz is None:
+            print(f"⚠ {cls.name}: no visualize() for inference plots")
+            return None
+        return viz(*args, **kwargs)
+
+==== Task_Latent ====
+    @classmethod
+    def visualize_inference(cls, *args, **kwargs):
+        """INFER viz entry; default forwards to visualize if present."""
+        viz = getattr(cls, 'visualize', None)
+        if viz is None:
+            print(f"⚠ {cls.name}: no visualize() for inference plots")
+            return None
+        return viz(*args, **kwargs)
