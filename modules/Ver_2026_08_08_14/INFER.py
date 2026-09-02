@@ -13,6 +13,7 @@ from typing import Optional, Tuple, List
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 from config import get_config
 from model import MarketTransformerWithHeads
@@ -106,6 +107,72 @@ def find_checkpoint_by_key(
     latest, key = max(all_checkpoints, key=lambda p: p[0].stat().st_mtime)
     print(f"✓ Found latest checkpoint: {latest} (Key: {key})")
     return str(latest), key
+
+
+def find_latest_checkpoint_by_key(
+    checkpoint_dir: str = 'trading_checkpoints',
+    key: Optional[str] = None,
+) -> Optional[Tuple[str, str]]:
+    """
+    Checkpoint lookup for --last-validate: newest available weights, not best_val.
+
+    Preference order within a key directory:
+      1. training_state.json → latest_checkpoint (if the file still exists)
+      2. newest *.pt by mtime (rolling / emergency / finished / best_val)
+
+    When ``key`` is None, picks the newest such file across all key folders.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+
+    if not checkpoint_dir.exists():
+        print(f"⚠ Checkpoint directory not found: {checkpoint_dir}")
+        return None
+
+    def _latest_in_dir(key_dir: Path, key_name: str) -> Optional[Tuple[str, str]]:
+        state_file = key_dir / 'training_state.json'
+        if state_file.exists():
+            try:
+                with open(state_file, 'r') as f:
+                    state = json.load(f)
+                latest = state.get('latest_checkpoint')
+                if latest and Path(latest).exists():
+                    print(f"✓ Using latest checkpoint: {latest} (Key: {key_name})")
+                    return str(latest), key_name
+            except Exception:
+                pass
+
+        checkpoints = list(key_dir.glob('*.pt'))
+        if not checkpoints:
+            return None
+        newest = max(checkpoints, key=lambda p: p.stat().st_mtime)
+        print(f"✓ Using newest checkpoint: {newest} (Key: {key_name})")
+        return str(newest), key_name
+
+    if key is not None:
+        key_dir = checkpoint_dir / key
+        if not key_dir.exists():
+            print(f"⚠ Checkpoint key directory not found: {key_dir}")
+            return None
+        result = _latest_in_dir(key_dir, key)
+        if result is None:
+            print(f"⚠ No checkpoint files found in {key_dir}")
+        return result
+
+    candidates = []
+    for subdir in checkpoint_dir.iterdir():
+        if not subdir.is_dir():
+            continue
+        result = _latest_in_dir(subdir, subdir.name)
+        if result is not None:
+            candidates.append((Path(result[0]), result[1]))
+
+    if not candidates:
+        print(f"⚠ No checkpoint files found in {checkpoint_dir}")
+        return None
+
+    newest_path, newest_key = max(candidates, key=lambda p: p[0].stat().st_mtime)
+    print(f"✓ Using newest checkpoint across keys: {newest_path} (Key: {newest_key})")
+    return str(newest_path), newest_key
 
 
 def load_model(
@@ -992,6 +1059,228 @@ def run_test(
         'output_dim': out_dim,
         'checkpoint_path': checkpoint_path,
         'checkpoint_key': checkpoint_key,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# BEST-CHECKPOINT VALIDATION (--validate [V [V2]])
+# ═══════════════════════════════════════════════════════════
+
+def run_validate(
+    config: dict,
+    percent_hi: float = 100.0,
+    percent_lo: float = 0.0,
+):
+    """
+    Load the best checkpoint for ``config``, evaluate a percent slice of
+    sorted validation samples, print mean val loss, and plot the same
+    legend series as ``--validation`` (batch / moving avg / running loss).
+    Does not write any files.
+
+    Args:
+        config: Full training/inference config (same as TRAIN).
+        percent_hi: End of the slice in percent of the val split, in
+                    (percent_lo, 100].
+        percent_lo: Start of the slice in percent, in [0, percent_hi).
+                    ``--validate``        → percent_lo=0, percent_hi=100
+                    ``--validate V``      → percent_lo=0, percent_hi=V
+                    ``--validate V1 V2``  → percent_lo=V1, percent_hi=V2
+
+    Samples are taken from ``sorted(dataset.val_indices)[start:end]``.
+
+    Returns:
+        dict with avg_loss, n_used, n_val_total, percent_lo, percent_hi,
+        checkpoint_path, checkpoint_key, used_indices
+    """
+    from labels import bind_label_loss
+    from trainer import ValidationEpochLoss
+
+    percent_lo = float(percent_lo)
+    percent_hi = float(percent_hi)
+    if not (0.0 <= percent_lo < percent_hi <= 100.0):
+        raise ValueError(
+            f"--validate requires 0 <= V1 < V2 <= 100 "
+            f"(got V1={percent_lo}, V2={percent_hi})"
+        )
+
+    device = config['device']
+    batch_size = config.get(
+        'validate_batch_size',
+        config.get('test_batch_size', config.get('batch_size', 8)),
+    )
+
+    print("\nLoading dataset (same path as TRAIN)...", flush=True)
+    dataset, _total_features = get_dataset(config)
+    config['output_dim'] = dataset.output_dim
+    if getattr(dataset, 'label_mode', None) == 'yield':
+        config['yield_target'] = getattr(dataset, 'yield_target', 'both')
+    if getattr(dataset, 'label_mode', None) == 'latent':
+        config['latent_distribution'] = getattr(
+            dataset, 'latent_distribution', config.get('latent_distribution', 'normal')
+        )
+
+    checkpoint_key = generate_checkpoint_key(config, dataset.cache_key)
+    print(f"🔑 Generated Checkpoint Key: {checkpoint_key}", flush=True)
+
+    result = find_checkpoint_by_key(
+        config.get('checkpoint_dir', 'trading_checkpoints'), checkpoint_key
+    )
+    if result is None:
+        print(f"⚠ No checkpoint found for key: {checkpoint_key}")
+        print("  Looking for latest best-val checkpoint instead...")
+        result = find_checkpoint_by_key(
+            config.get('checkpoint_dir', 'trading_checkpoints'), None
+        )
+        if result is None:
+            print("No checkpoint found. Exiting.")
+            raise SystemExit(1)
+
+    checkpoint_path, checkpoint_key = result
+    if Path(checkpoint_path).name != 'best_val.pt':
+        print(
+            f"⚠ Preferred best_val.pt was not found; using: {checkpoint_path}",
+            flush=True,
+        )
+
+    # 1-based epoch of the loaded best checkpoint (same numbering as --validation).
+    best_epoch = None
+    state_path = Path(checkpoint_path).parent / 'training_state.json'
+    if state_path.exists():
+        try:
+            with open(state_path, 'r') as f:
+                state = json.load(f)
+            if state.get('best_epoch') is not None:
+                best_epoch = int(state['best_epoch'])
+        except Exception:
+            best_epoch = None
+    if best_epoch is None:
+        try:
+            ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+            if ckpt.get('epoch') is not None:
+                # Checkpoints store 0-based epoch; history / --validation use 1-based.
+                best_epoch = int(ckpt['epoch']) + 1
+        except Exception:
+            best_epoch = None
+
+    val_sorted = sorted(dataset.val_indices)
+    n_total = len(val_sorted)
+    if n_total == 0:
+        raise RuntimeError("No validation samples available.")
+
+    start = int(n_total * percent_lo / 100.0)
+    if percent_hi >= 100.0:
+        end = n_total
+    else:
+        end = int(n_total * percent_hi / 100.0)
+    start = max(0, min(n_total, start))
+    end = max(0, min(n_total, end))
+    used_indices = val_sorted[start:end]
+    n_take = len(used_indices)
+    if n_take == 0:
+        raise RuntimeError(
+            f"Percent slice [{percent_lo:g}%, {percent_hi:g}%] selected 0 of "
+            f"{n_total} validation samples (start={start}, end={end})."
+        )
+
+    print(f"\nLoading model from: {checkpoint_path}", flush=True)
+    print(f"Checkpoint Key: {checkpoint_key}", flush=True)
+    print(
+        f"Val samples: indices [{start}:{end}) → {n_take} / {n_total} "
+        f"([{percent_lo:g}%, {percent_hi:g}%] of sorted val split)",
+        flush=True,
+    )
+
+    model = load_model(checkpoint_path, config, dataset, device)
+    print("✓ Model loaded successfully", flush=True)
+
+    loss_fn = bind_label_loss(
+        getattr(dataset, 'label_mode', config.get('label', 'trend')),
+        config,
+        yield_target=getattr(dataset, 'yield_target', config.get('yield_target', 'both')),
+        latent_distribution=getattr(
+            dataset, 'latent_distribution', config.get('latent_distribution', 'normal')
+        ),
+    )
+
+    model.eval()
+    weighted_loss_sum = 0.0
+    n_seen = 0
+    n_batches = (n_take + batch_size - 1) // batch_size
+    val_curve = ValidationEpochLoss()
+    # Use best-ckpt epoch so the plot title matches --validation numbering.
+    val_curve.reset(epoch=int(best_epoch) if best_epoch is not None else 0)
+    if best_epoch is not None:
+        print(f"Best checkpoint epoch: {best_epoch}", flush=True)
+
+    with torch.no_grad():
+        pbar = tqdm(
+            total=n_batches,
+            desc=(
+                f"Validate [{percent_lo:g}%, {percent_hi:g}%] "
+                f"({n_take} samples)"
+            ),
+            mininterval=0.5,
+            miniters=1,
+            smoothing=0.1,
+            dynamic_ncols=True,
+            bar_format=(
+                '{l_bar}{bar}| {n_fmt}/{total_fmt} '
+                '[{elapsed}<{remaining}, {rate_fmt}{postfix}]'
+            ),
+        )
+        for b in range(n_batches):
+            batch_start = b * batch_size
+            batch_end = min(batch_start + batch_size, n_take)
+            batch_idx = used_indices[batch_start:batch_end]
+            bs = batch_end - batch_start
+
+            x, p, y, mean, std, shape = _collate_batch(dataset, batch_idx)
+            x = x.to(device, non_blocking=True)
+            p = p.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            mean = mean.to(device, non_blocking=True)
+            std = std.to(device, non_blocking=True)
+            shape = shape.to(device, non_blocking=True)
+
+            pred = model(x, p, mean, std, shape)
+            loss = loss_fn(x, pred, y)
+            batch_loss = float(loss.item())
+            weighted_loss_sum += batch_loss * bs
+            n_seen += bs
+            val_curve.add_batch(b + 1, batch_loss)
+
+            avg_so_far = weighted_loss_sum / max(n_seen, 1)
+            pbar.update(1)
+            pbar.set_postfix_str(f'loss={avg_so_far:.4f}', refresh=False)
+
+            del x, p, y, mean, std, shape, pred, loss
+
+        pbar.close()
+
+    val_curve.mark_complete()
+    avg_loss = weighted_loss_sum / max(n_seen, 1)
+    # No files written — print mean and show the same series as --validation.
+    print(f"Mean val loss: {avg_loss:.6f}", flush=True)
+    val_curve.print_summary()
+    epoch_label = best_epoch if best_epoch is not None else '?'
+    val_curve.plot(
+        title=(
+            f'Validation Loss — epoch {epoch_label} '
+            f'(validate [{percent_lo:g}%, {percent_hi:g}%], '
+            f'n={len(val_curve.batch_losses)} batches)'
+        ),
+    )
+
+    return {
+        'avg_loss': avg_loss,
+        'n_used': n_seen,
+        'n_val_total': n_total,
+        'percent_lo': percent_lo,
+        'percent_hi': percent_hi,
+        'best_epoch': best_epoch,
+        'checkpoint_path': checkpoint_path,
+        'checkpoint_key': checkpoint_key,
+        'used_indices': used_indices,
     }
 
 

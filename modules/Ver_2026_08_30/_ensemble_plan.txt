@@ -1,0 +1,292 @@
+================================================================================
+ENSEMBLE / TELEPRED PLAN
+Platform: Trade2026 — trading bot + trading AI
+Working tree for element models: modules/Ver_2026_08_20/
+Written: 2026-08-24
+Purpose: Persist the ensemble idea and agreed TelePred contract so a renewed
+         session can reload this file and continue without re-deriving context.
+================================================================================
+
+--------------------------------------------------------------------------------
+0. GOAL (PRODUCT)
+--------------------------------------------------------------------------------
+
+Run a trading bot on this platform.
+
+The trading AI that feeds the bot is planned as an ENSEMBLE of AI models so that
+member diversity helps cancel noise in price movement.
+
+Element models of that ensemble must be developed one by one.
+
+The first element family in focus:
+  - Yield (chance, near) with Transformer
+  - Generalized as TelePred(d) (see below)
+
+Ensemble usage of the yield / TelePred bank (agreed):
+  - SIGNAL PROVIDER ONLY
+  - Models output scores (e.g. chance, near); they do NOT choose side, size,
+    or place orders.
+  - A separate combiner / strategy / portfolio layer decides actions later.
+  - Do NOT simply average element predictions.
+
+
+--------------------------------------------------------------------------------
+1. USER PROMPT — ORIGINAL ENSEMBLE IDEA (paraphrase + intent)
+--------------------------------------------------------------------------------
+
+From the user's framing in conversation:
+
+  "My goal is to run a trading bot on this platform.
+   I am now developing the trading AI for the trading bot.
+   From what I feel about the price movement, I plan the trading AI to be an
+   ensemble of AI models, which would contribute to cancel noises.
+   I have to develop the element models of the ensemble.
+   The yield (chance, near) with transformer will be the element model."
+
+Later refinement — generalize Yield Transformer (and Regime) to TelePred.
+
+  Indexing note (IMPORTANT):
+    All slices below use Python semantics:  a[i:j] includes i .. j-1 (end exclusive).
+    t is bot_time; price p[t] is known at decision time.
+
+  Denote market data by X, with X.shape = (T, F).
+
+  X(t, d) = X[ t + 1 - d - delta1  :  t + 1 - d ]
+
+  Y(t) = label( p[ t + 1 : t + 1 + delta2 ], p[t] )
+
+  TelePred(d):  X(t, d)  ->  Y_hat(t)
+
+  Consequence of Python end-exclusivity:
+    - Input X(t,d) includes bars (t+1-d-delta1) .. (t-d)   inclusive
+      → length delta1; last included bar index = t - d
+    - Label future p[t+1 : t+1+delta2] includes (t+1) .. (t+delta2) inclusive
+      → length delta2; anchor / last-known price for the label is p[t]
+
+  The current Yield Transformer is nothing but:
+
+      TelePred(0) with
+        label   = yield
+        delta1  = past_window
+        delta2  = 50
+      i.e. X(t,0) = X[t+1-delta1 : t+1]  (bars t+1-delta1 .. t inclusive)
+           Y(t)   = label( p[t+1 : t+1+delta2], p[t] )
+
+  Train TelePred(d) for d in (0, d1, d2, ..., dn).
+
+  Element bank:
+      TelePreds = ( TelePred(d) for d in (0, d1, ..., dn) )
+
+  Do NOT simply average the element models.
+
+  Later: more ensembles / banks by changing label to regime and vae
+  (same delay idea, other label families).
+
+  Indexing correction (2026-08-24, user):
+    Earlier draft used X[t-d-delta1:t-d] and label(..., p[t-1]) without spelling
+    Python end-exclusivity / bot_time. Replaced by the formulas above.
+
+
+--------------------------------------------------------------------------------
+2. UNDERSTANDING (ASSISTANT) — DETAILED
+--------------------------------------------------------------------------------
+
+2.1 Role of the yield transformer today (pre-TelePred naming)
+
+  In Ver_2026_08_20:
+    - config label='yield', model_type='regression'
+    - targets (chance, near) via Label_Yield / find_yield
+    - input window length past_window (delta1; bars)
+    - future horizon future_window (delta2; e.g. 50)
+    - TRAIN / INFER / TradingDataset / labels.py / model.py path
+
+  As an ensemble *element*, this model is a specialized forecaster:
+    inputs  -> window (x, p, mean, std, shape)
+    outputs -> (chance, near) [and optional metadata]
+    NOT     -> trades, position sizing, or execution
+
+  Bot / combiner consumes signals; portfolio / strategy stay outside the element.
+
+
+2.2 Why an ensemble (noise cancellation)
+
+  Price is noisy; a single head overfits local artifacts.
+  Ensemble helps when members are:
+    (1) Diverse (different targets, horizons, OR — here — information delay d)
+    (2) Combined with structure (agreement, veto, learned meta) — not blind mean
+    (3) Aligned on a common decision clock (same bar grid / same "now")
+
+  TelePred bank diversity axis = "how stale is the evidence for the same Y(t)?"
+  That is a real inductive difference: edge noise at t hits TelePred(0) hard;
+  TelePred(d>0) never saw that edge.
+
+
+2.3 TelePred mathematics (shared reading; Python slice indexing)
+
+  X : (T, F) market (+ macros as engineered in dataset_build / data pipeline)
+
+  Convention:
+    - t = bot_time (decision index); p[t] is known
+    - slices use Python rules: [start:end) end-exclusive
+
+  Input at delay d (length delta1; last *included* bar index = t - d):
+
+      X(t, d) = X[ t + 1 - d - delta1  :  t + 1 - d ]
+      # includes indices (t+1-d-delta1) .. (t-d) inclusive
+
+  Target at time t (label family-specific; yield uses chance/near):
+
+      Y(t) = label( p[ t + 1 : t + 1 + delta2 ], p[t] )
+      # future includes (t+1) .. (t+delta2); anchor / known price is p[t]
+
+  Model:
+
+      TelePred(d) : X(t, d)  |->  Y_hat(t)
+
+  Special case d = 0:
+
+      TelePred(0) = current Yield Transformer intent
+        X(t, 0) = X[t+1-delta1 : t+1]     # bars .. through t (known)
+        Y(t)    = label(p[t+1:t+1+delta2], p[t])
+        delta1  = past_window, delta2 = future_window, label=yield
+
+
+  Timeline sketch (indices = included bars; Python end shown in parens):
+
+      start=t+1-d-delta1 .... last=t-d   t   t+1 .... t+delta2
+      |<---- input X(t,d) ---->|         |     |<- label future ->|
+               ^                 ^       ^
+          last input bar      bot_time  first future bar
+          (= t-d)             p[t] known
+
+
+2.4 Same target, delayed input ONLY (AGREED)
+
+  For a fixed t, ALL TelePred(d) share the EXACT SAME target Y(t).
+  Only the input window slides back by d
+  (last included input bar moves from t down to t-d).
+
+  Confirmed by user: "Yes — same Y(t), delayed X only"
+
+
+2.5 Live / bot query rule (AGREED)
+
+  At live bot time t (= t_now), with p[t] known:
+
+    - TelePred(d) receives X(t, d) = X[t+1-d-delta1 : t+1-d]
+      (last included bar = t-d; no bars after t-d)
+    - Every head predicts the same Y(t) = label(p[t+1:t+1+delta2], p[t])
+    - Larger d => staler evidence for that same now-label
+
+  Confirmed intent: predict Y(t_now) from a window whose last bar is t_now - d
+  (Python form: slice end = t_now + 1 - d).
+
+  NOT the alternate reading where all heads use the latest window and d shifts
+  the label into the future (Y(t_now+d)). That alternate was rejected.
+
+
+2.6 Ensemble usage mode (AGREED)
+
+  Yield / TelePred bank = SIGNAL PROVIDER ONLY.
+
+  Combiner must NOT be a simple average of element outputs.
+  Prefer e.g.:
+    - agreement / veto across delays
+    - trust TelePred(0) more when aligned with {d_i}
+    - learned meta-map (Y_hat_d=0, Y_hat_d1, ...) -> bot features
+  Combiner / strategy / portfolio decide side, size, orders later.
+
+
+2.7 Later expansion (INTENT, not built yet)
+
+  Additional banks by changing label (and possibly model_type), same delay axis:
+    - regime / trend  (existing label='trend' path)
+    - vae             (model_type='vae'; often recon/KL signal rather than yield loss)
+
+  Naming: "TelePred" can denote the delay-generalized element; banks differ by
+  label / backbone.
+
+
+2.8 Practical constraints (assistant notes; not all locked as product decisions)
+
+  Causality (Python-precise):
+    - Last included input index is t-d; forbidden inputs are indices > t-d
+      (i.e. no features from t-d+1 .. t for that head; TelePred(0) may use t).
+    - Any look_price / recent-p path must use the same last index t-d.
+
+  Sample validity (inclusive extremes under Python slices):
+    - Need (t + 1 - d - delta1) >= 0
+    - Need (t + delta2) < T     # last future index included by p[t+1:t+1+delta2]
+    - Larger d slightly shortens usable sample range
+
+  Identity / checkpoints:
+    - Dataset signature and checkpoint key must include d (and label family)
+      or runs will collide / resume wrong weights
+    - Recent hygiene pass (dataset_build, sync_output_dim, resolve_checkpoint_identity)
+      did NOT yet add d; TelePred(d) implementation must extend identity
+
+  Training order suggestion:
+    - Harden TelePred(0) / yield transformer first
+    - Then train selected d > 0 with the SAME label hyperparameters so heads
+      are comparable
+    - Freeze a thin runtime adapter: load checkpoint -> (chance, near) [+ meta]
+      before building a fancy combiner
+
+  Existing code map (TelePred(0) today):
+    TRAIN.py / dataset_build.py / data.py / labels.py / model.py / model_vae.py
+    trainer.py / INFER.py / config.py
+    Default config often: label=yield, model_type=regression
+
+
+--------------------------------------------------------------------------------
+3. AGREEMENTS CHECKLIST (QUICK)
+--------------------------------------------------------------------------------
+
+  [x] Trading AI is an ensemble of element models (noise cancellation via diversity)
+  [x] First element family: yield (chance, near) + Transformer
+  [x] Generalize to TelePred(d); TelePred(0) = current yield transformer
+  [x] Same Y(t) for all d; only input window delayed by d
+  [x] Indexing (Python): X(t,d)=X[t+1-d-delta1:t+1-d];
+      Y(t)=label(p[t+1:t+1+delta2], p[t]); t=bot_time, p[t] known
+  [x] Live: predict Y(t) from window whose last included bar is t-d
+  [x] Element role: signal provider only (not execution)
+  [x] Do not simply average TelePred outputs
+  [x] Later: more banks via regime / vae (and similar)
+  [x] Storage: one checkpoint + dataset identity per d
+  [x] Ensemble training CLI: TRAIN.py --ensemble (orchestrates all d)
+  [x] Hparam iterations: --ensemble-sweep (outer patch×layers, inner full bank)
+  [x] Evolvable definition: telepred.py owns X(t,d)/Y(t) indexing (definition_id)
+  [ ] Default concrete {d_i} list — suggested [0,5,15,30], still tunable via CLI
+  [ ] Combiner v1 design (rules vs meta-model) — NOT locked
+  [x] Implementation landed: telepred.py, dataset delay, TRAIN --ensemble /
+      --ensemble-sweep, train_run.train_one_run (yield bank first)
+  [x] TradingDataset takes runtime_config so per-delay ensemble overrides apply
+      (not only module get_config() defaults)
+  [ ] Regime/VAE banks on same delay axis — later
+  [ ] Bot runtime adapter — later
+
+
+--------------------------------------------------------------------------------
+4. OPEN QUESTIONS (FOR A RENEWED SESSION)
+--------------------------------------------------------------------------------
+
+  1. Final default telepred_delays list for --ensemble?
+  2. Combiner v1: rules (agreement/veto) vs small learned meta-model?
+  3. Should regime/VAE banks share the exact same {d_i} grid?
+  4. Output contract for the bot adapter (field names, normalized vs raw scale)?
+  5. Ensemble fail policy: abort all delays on first failure vs continue?
+
+
+--------------------------------------------------------------------------------
+5. HOW TO RELOAD THIS CONTEXT LATER
+--------------------------------------------------------------------------------
+
+  Read this file:
+    modules/Ver_2026_08_20/ensemble_plan.txt  (08_20 baseline; this folder uses _ensemble_plan.txt)
+
+  Then continue from section 3–4: implement TelePred(d) and/or lock open questions.
+  Do not re-litigate agreed items in section 3 unless the user explicitly changes them.
+
+================================================================================
+END OF _ensemble_plan.txt
+================================================================================

@@ -1,0 +1,1116 @@
+================================================================================
+REFACTOR PLAN — Ver_2026_08_20 → Ver_2026_08_30
+Generic (model, label) TRAIN / INFER framework
+Draft: 2026-08-29
+================================================================================
+
+GOAL
+----
+Make TRAIN and INFER a framework that is *generic over declared (model, label)
+tuples* (and ensembles of those tuples), without label-specific CLI sprawl,
+inconsistent option sets, or silent no-ops when a pair is incompatible.
+
+Prove that genericity by accommodating as many *existing* models and labels
+as practical in the first cut (see §0). Breadth is intentional: every pair
+we host early is a stress test; skipping pairs leaves untested assumptions
+and raises the chance the framework is not actually generic enough.
+
+This is NOT a claim of total domain generality. data.py intentionally assumes
+crypto / market windowed time series and a small set of fixed normalization
+modes (see §2.6): **two-layer** (intra- then inter-window) and **one-layer**
+(global). Genericity stops at the (model, label) product and sample
+pack/unpack contracts — not at arbitrary ML data modalities.
+
+New code lives in:  modules/Ver_2026_08_30/
+This file is the working plan; freeze Ver_2026_08_20 as the known-good baseline.
+
+
+================================================================================
+0. ACCOMMODATED MODELS & LABELS (Ver_2026_08_30 first cut)
+================================================================================
+
+Design principle — accommodate broadly on purpose:
+  Host *as many existing models and labels as practical* in the first cut.
+  Each real pair (trend/yield/latent/rise_flag × regression, vae×none,
+  TelePred, ErrorEnsemble) is a stress test of genericity. If the framework
+  only ever ran one happy path (e.g. regression×yield), hidden assumptions
+  would remain and “generic (model, label)” would be a slogan. Breadth now
+  reduces the chance the new design is not generic enough.
+
+  Still bounded: first cut = the inventory below (existing pieces + small
+  NEW stubs). Further models/labels later = register + COMPAT row only —
+  that path must stay cheap *because* §0 already forced the seams open.
+
+0.1 Atomic models (ModelSpec)
+-----------------------------
+  Id            Implementation today              Role
+  ------------  --------------------------------  ----------------------------
+  regression    model.MarketTransformerWithHeads  supervised head over windows
+  vae           model_vae.MarketVAEWithHeads      unsupervised recon + KL
+  ensemble      NEW EnsembleModelSpec             bag of atomic (model, label)
+                                                  members + FusionSpec
+                                                  (not an atomic net)
+
+0.2 True labels (LabelSpec)
+---------------------------
+  Id          Class today       Target / loss                         Notes
+  ----------  ----------------  ------------------------------------  ------
+  trend       Label_Trend       (h,m,b) or (m,b); MSE                 output_dim 2|3
+  yield       Label_Yield       chance/near; MSE                      yield_target:
+                                                                      both|chance|near
+  latent      Label_Latent      density params; NLL                   latent_distribution:
+                                                                      normal|student
+                                                                      (head 2|3; cache 1)
+  rise_flag   Label_RiseFlag    binary {0,1}; BCE-with-logits         output_dim 1
+  none        NEW NoneLabel     no supervised y                       for (vae, none) only
+
+  Label variants (same LabelSpec, config knobs — not separate registry ids):
+    yield:   yield_target ∈ {both, chance, near}
+    latent:  latent_distribution ∈ {normal, student}
+    trend:   output_dim ∈ {2, 3} (and horizon_search / fitness knobs)
+
+0.3 Atomic COMPAT pairs (must train + infer)
+--------------------------------------------
+  (regression, trend)
+  (regression, yield)      # incl. both/chance/near via yield_target
+  (regression, latent)     # incl. normal/student via latent_distribution
+  (regression, rise_flag)  # Phase 1 must make CLI/INFER work end-to-end
+  (vae,        none)       # replaces today's false "vae + supervised label"
+
+  Explicitly NOT first-cut COMPAT (unless later declared and implemented):
+  (vae, trend|yield|latent|rise_flag)  — today VAE drops label loss; do not
+                                         pretend these are product cells.
+
+0.4 Ensemble kinds (reuse atomic pairs; ensemble_label = collection)
+--------------------------------------------------------------------
+  Kind       Members                              Fusion / notes
+  ---------  -----------------------------------  ---------------------------
+  telepred   repeat one atomic (model, label)     delay bank (TelePred d)
+             over telepred_delays
+  error      repeat (regression, L) over stages   residual sum in y-space
+             L ∈ {trend, yield, rise_flag}        (not latent; not vae)
+  stack      NEW list of atomic pairs             user FusionSpec; infer-first
+             (may be heterogeneous labels)
+
+0.5 FeaturePrep modes (data.py — not model/label ids)
+-----------------------------------------------------
+  "normalization": "one-layer" | "two-layer"   (default "two-layer")
+  Shared by every accommodated pair above.
+
+0.6 Summary checklist — “accommodated means”
+--------------------------------------------
+  [x] registry lists every id in 0.1–0.2
+  [x] COMPAT lists every pair in 0.3; assert_compatible enforces it
+  [x] ENSEMBLE_KINDS covers telepred + error; stack stub OK
+  [ ] TRAIN/INFER/data paths exercise regression×{trend,yield,latent,rise_flag}
+      and vae×none without label if-ladders outside LabelSpec
+  [ ] TelePred + ErrorEnsemble expressed as ensemble kinds over those pairs
+
+
+================================================================================
+1. CURRENT STATE (what actually works today)
+================================================================================
+
+1.1 Working (model, label) matrix
+---------------------------------
+                  trend     yield(both/chance/near)   latent(normal/student)   rise_flag
+regression        WORKS     PRIMARY PATH              WORKS (NLL; special)     BROKEN at CLI/INFER
+vae               trains but label ignored (recon+KL only; head kept with *0)
+
+Notes:
+- rise_flag: Label_RiseFlag + data cache + sync_output_dim exist, but TRAIN
+  --label choices omit it; config default is already 'rise_flag'; INFER --test
+  crashes on out_dim==1 (falls into trend branches).
+- VAE + any supervised label looks like a product cell but is not: wrap_model_loss
+  drops label loss entirely.
+- TelePred --ensemble / --ensemble-sweep: mostly model/label-agnostic delay loop
+  over train_one_run (CSV named ensemble_<label>_<model_type>).
+- ErrorEnsemble: regression-only; rejects vae and latent; residual math assumes
+  point targets in a shared vector space. Implemented in error_ensemble.py but
+  NOT wired into TRAIN.py despite config.py documenting TRAIN.py --error-ensemble.
+- INFER.py has no real argparse CLI; TRAIN.py proxies --test / --validate / etc.
+
+
+1.2 Partial good bones (KEEP)
+-----------------------------
+- labels.py Label_* class API: find / loss / make_auxiliary / target_slice /
+  target_names / resolve_* / sync_output_dim / bind_label_loss / LABEL_CLASSES
+- train_run.train_one_run — shared single-element train primitive
+- model_vae.build_market_model + forward contract (predictions, patch_map, recon)
+- ResumableTrainer + generate_checkpoint_key / resolve_checkpoint_identity
+- TelePred delay semantics (telepred.py, ensemble_plan.txt)
+- ErrorEnsemble residual math in y-normalized space (error_ensemble_logic.txt)
+  for point-label regression stages
+
+
+1.3 Structural flaws (FIX)
+--------------------------
+A. CLI / entry-point inconsistency
+   - TRAIN.py is a god CLI (~1300 lines): train + history/loss/validation/report
+     + ensemble + sweep + validate/test + vae-compare + trend/features viz.
+   - --label choices ['trend','yield','latent'] omit rise_flag while
+     VALID_LABEL_MODES / LABEL_CLASSES / config['label'] include it.
+   - No --yield-target CLI (only config).
+   - Loss-weight CLI is trend/recon-centric (--slope-weight, --intercept-weight,
+     --recon-weight); no --chance-weight / --near-weight / --rise-flag-weight /
+     --vae-kl-weight.
+   - --vae-sweep is a legacy alias for --sweep --model-type vae (redundant).
+   - --validate-yield is label-specific and can force label='yield'; no generic
+     --validate-report for other labels.
+   - --vae-compare hard-codes the pair (VAE, yield-regression).
+   - Documented --error-ensemble does not exist on TRAIN.py.
+   - INFER has no CLI; two mental entry points for one pipeline.
+
+B. Label-specific branches outside the label registry
+   - TradingDataset.__init__ repeats if yield / elif latent / elif rise_flag /
+     else trend for dim/slice (data.py ~889–948).
+   - Label cache build duplicates the same four-way branch instead of
+     Label.find(...) + shared packing.
+   - INFER metrics / sample print / viz are huge if label_mode trees; rise_flag
+     falls into trend out_dim branches and crashes on dim 1.
+   - Denormalization policy special-cased for latent in run_inference_on_indices;
+     belongs on the label (PredictionSemantics).
+
+C. Model-type branching / false product
+   - Factory is fine, but loss composition is wrong for a product matrix:
+     VAE always drops label loss.
+   - use_reconstruction on regression affects architecture/checkpoint key and
+     returned recon, but regression train loss never adds recon MSE — only VAE
+     does. Flag name suggests supervised+recon; behavior is “maybe emit recon”.
+   - PredictionHead / MarketTransformerWithHeads hard-limit output_dim ∈ {1,2,3}
+     — blocks future wider labels.
+   - Checkpoint key hashes model_type + output_dim but not label directly;
+     label enters via dataset_signature. VAE runs with different labels still
+     churn data caches for an unused y.
+
+D. Config coupling
+   - Flat config mixes shared / label-specific / model-specific / orphan knobs.
+   - error_ensemble_* documented but unwired; default label='rise_flag' vs CLI
+     choices mismatch; API keys in same bag.
+   - update_config mutates a process-global dict — ensemble/sweep/TRAIN side
+     effects leak across “one config object”.
+
+E. Ensemble special-casing
+   - ensemble_train.py mostly clean; defaults bias toward label='yield' in CSV
+     helpers.
+   - error_ensemble.py is a parallel universe (own report CLI, not TRAIN).
+   - Capability matrix exists informally (rejects vae/latent) but is not a
+     single declared compat table.
+
+F. Redundant / divergent paths
+   - Train: TRAIN → train_one_run vs ensemble_train → train_one_run vs
+     error_ensemble → train_one_run (good) vs orphaned report scripts.
+   - Eval: INFER.run_test / run_validate / run_validate_yield / run_vae_compare
+     with copy-pasted dataset load + key + metrics.
+   - Labels: class API exists but data/INFER/TRAIN still reimplement dispatch.
+
+
+================================================================================
+2. TARGET ARCHITECTURE
+================================================================================
+
+2.1 Layering
+------------
+
+                    ┌─────────────────┐
+   CLI (argparse)   │  commands/      │  train | infer | ensemble | sweep | report
+                    └────────┬────────┘
+                             ▼
+                    ┌─────────────────┐
+                    │  Experiment     │  resolved Config + registries + compat
+                    └────────┬────────┘
+            ┌────────────────┼────────────────┐
+            ▼                ▼                ▼
+      LabelSpec         ModelSpec        TrainLoop
+   (find, cache,        (build,          (train_one_run /
+    loss, metrics,       forward,         telepred bank /
+    viz, semantics)      loss_wrap)       error stages)
+            └────────────────┼────────────────┘
+                             ▼
+                      TradingDataset  ← LabelSpec.build_row only
+                             ▼
+                      ResumableTrainer / checkpoint key
+
+
+2.2 Explicit registries (product, not accidental)
+-------------------------------------------------
+Source of truth for *what* must be hosted: §0 ACCOMMODATED MODELS & LABELS.
+Registries below are the code shape for that inventory.
+
+LABELS = {
+  "trend":     TrendLabel,      # Label_Trend; cache_dim=3, head 2|3, mse
+  "yield":     YieldLabel,      # Label_Yield; yield_target both|chance|near
+  "latent":    LatentLabel,     # Label_Latent; normal|student NLL
+  "rise_flag": RiseFlagLabel,   # Label_RiseFlag; BCE-with-logits
+  "none":      NoneLabel,       # NEW — unsupervised / (vae, none)
+  # ensemble_label is LabelCollection (bag), NOT a true LABELS entry — §2.7
+}
+
+MODELS = {
+  "regression": RegressionTransformer,  # MarketTransformerWithHeads
+  "vae":        MarketVAE,              # MarketVAEWithHeads
+  "ensemble":   EnsembleModel,          # NEW — members + FusionSpec
+}
+
+# Atomic pairs — must match §0.3; fail fast instead of silent no-op
+COMPAT = {
+  ("regression", "trend"):     "supervised",
+  ("regression", "yield"):     "supervised",
+  ("regression", "latent"):    "supervised",
+  ("regression", "rise_flag"): "supervised",
+  ("vae",        "none"):      "unsupervised",
+}
+
+# Ensemble kinds — must match §0.4; reuse atomic COMPAT members
+ENSEMBLE_KINDS = {
+  "telepred": {
+      "members": "repeat_atomic",
+      "label_relation": "identical",
+      "fusion": "delay_bank",
+  },
+  "error": {
+      "members": "repeat_atomic",
+      "label_relation": "identical",
+      "fusion": "sum_residuals_y_space",
+      "atomic_subset": ("regression", {"trend", "yield", "rise_flag"}),
+  },
+  "stack": {
+      "members": "list_of_atomic",
+      "label_relation": "collection",
+      "fusion": "FusionSpec",
+  },
+}
+
+
+2.3 Contracts
+-------------
+
+LabelSpec (extend existing Label_* classes; do not invent a parallel hierarchy):
+  - resolve_dims(cfg) / sync_output_dim
+  - build_cache_row(...)           → raw target row for dataset cache
+  - pack_sample(raw_window_ctx) → dict sample (FULL schema; see §2.5)
+  - unpack_target(sample)       → tensors needed by loss / metrics / denorm
+  - collate(samples)            → batched dict (or default_collate on tensors)
+  - slice_for_model / target_names
+  - loss / make_auxiliary
+  - normalize_policy / denorm_pred / denorm_target
+  - postprocess_infer(sample, pred) / metrics / visualize / report_series
+  - cli_options()
+
+ModelSpec:
+  - build(cfg, shapes)
+  - unpack_input(sample) → kwargs (or tuple) for forward ONLY
+      e.g. model(**ModelSpec.unpack_input(sample))
+    Reads keys the architecture needs; does not own the schema.
+  - forward(...) → (predictions, patch_map, recon)
+  - wrap_loss(label_loss | None)
+  - seq_len / architecture_key_params
+
+Trainer / TRAIN / INFER:
+  - See ONLY an opaque sample dict (and model outputs).
+  - NEVER destructure (x, p, mean, std, shape, y) themselves.
+  - Train step sketch:
+        sample = batch                                  # dict
+        pred   = model(**model_spec.unpack_input(sample))
+        loss   = loss_fn(sample, pred)                  # label unpacks inside
+  - Infer step sketch:
+        pred   = model(**model_spec.unpack_input(sample))
+        out    = label.postprocess_infer(sample, pred)
+
+Config:
+  - nested or clearly prefixed sections: data.*, label.*, model.*, train.*,
+    ensemble.*
+  - stop one flat bag + global update_config as the primary override path
+  - get_config() returns an isolated copy; mutations stay local to the run
+
+
+2.4 Use dependency (arrows mean "imports / calls")
+--------------------------------------------------
+
+Answer in one line:
+  data.py is SHARED across all labels.
+  Dependency is NOT  model → label → data.
+  It is:  data → labels ;  model ⟂ labels ;  compose → (model, label, data) ;
+          TRAIN → compose(train) ;  INFER → compose(infer).
+
+ASCII (A → B means A uses B):
+
+                    config / registry / compat
+                              ▲
+              ┌───────────────┼───────────────┐
+              │               │               │
+           labels          models           data
+         (LabelSpec)     (ModelSpec)   (TradingDataset)
+              ▲               ▲               │
+              │               │               │
+              │               │               └──→ labels
+              │               │                     (build_cache_row +
+              │               │                      pack_sample)
+              │               │
+              └───────┬───────┘
+                      │
+                 compose layer
+              (train_run / infer lib /
+               ensemble / error_ensemble)
+                      ▲
+           ┌──────────┴──────────┐
+           │                     │
+         TRAIN                 INFER
+      (train / ensemble /    (test / validate /
+       sweep / error-ens)     report_series)
+
+Layer rules (hard):
+
+  1. labels  — LEAF for domain logic + SAMPLE SCHEMA.
+     Owns: find(targets), loss, dims, normalize_policy, metrics, viz,
+           pack_sample / unpack_target / collate (dict schema).
+     Must NOT import data.py or model.py.
+     (Today labels.py is almost a leaf; pack/unpack is new surface.)
+
+  2. data    — ONE shared module for every label.
+     Owns: market/macro windows, TelePred slicing, raw caches, DataLoader,
+           dataset_signature, calling into LabelSpec for pack.
+     Uses labels as plugin:
+           raw = LabelSpec.build_cache_row(...)
+           sample = LabelSpec.pack_sample(window_ctx, raw, stats, ...)
+     Returns sample dicts from __getitem__ (not bare tuples).
+     Must NOT import model.py.
+     Must NOT contain per-label if-ladders after Phase 3.
+
+  3. model / model_vae — architecture only.
+     Owns: build net from shapes, forward, wrap_loss,
+           unpack_input(sample) → forward kwargs.
+     Must NOT import data.py.
+     Must NOT import Label_* for objectives or for knowing mean/std/shape
+     layout beyond the keys unpack_input reads.
+     Must NOT branch on label name.
+     Cleanup vs today: remove Label_Trend / resolve_model_past_len from
+     model library surface; resolve shapes in compose.
+
+  4. compose (train_run, infer library, ensemble_*, error_ensemble)
+     Owns the (model, label) PRODUCT:
+       - assert_compatible(model_id, label_id [, ensemble_kind])
+       - resolve shapes from LabelSpec + config
+       - build ModelSpec with those shapes
+       - build TradingDataset (shared data.py) with active LabelSpec
+       - loss_fn(sample, pred) closes over LabelSpec.unpack_target + loss
+         and ModelSpec.wrap_loss
+       - trainer/infer loops pass opaque sample dicts only
+     This is the only layer allowed to know both model and label by name.
+
+  5. TRAIN CLI  → compose for training modes
+  6. INFER CLI  → compose for inference modes
+
+What "shared data.py" means:
+  - There is not data_trend.py / data_yield.py.
+  - One TradingDataset; label owns how a row becomes a dict sample.
+  - Label-private rules (BCE no z-score, latent cache vs head width,
+    which aux fields exist) live on LabelSpec.
+
+Where loss sits:
+  - Supervised: LabelSpec.loss after unpack_target(sample)
+  - Model extras: ModelSpec.wrap_loss
+  - Trainer never sees y / mean / std / shape as positional tuple fields
+
+Wrong mental models (do not use):
+  ✗ model → label → data
+  ✗ TRAIN → model → (model, label)
+  ✗ per-label forks of data.py
+  ✗ TRAIN/INFER/trainer unpack (x, p, mean, std, shape, y)
+
+Right mental model:
+  ✓ labels leaf (incl. dict schema); data uses labels to pack samples;
+    model only unpack_input + forward; compose binds the pair;
+    TRAIN/INFER are thin front-ends over opaque dicts.
+
+
+2.5 Opaque sample dict (pack / unpack)
+--------------------------------------
+
+Problem today:
+  Dataset / trainer / INFER all hard-code the tuple
+      (x, p, mean, std, shape, y)
+  so every new label or aux field ripples through TRAIN, INFER, trainer,
+  collate helpers, and error-ensemble.
+
+Decision (chosen): FULLY OPAQUE SAMPLE DICT
+  - __getitem__ returns a dict assembled by LabelSpec.pack_sample.
+  - TRAIN / INFER / ResumableTrainer never destructure mean/std/shape/y.
+  - ModelSpec.unpack_input(sample) reads only forward kwargs.
+  - Feature-side moments (mean/std/shape) are COMPUTED by data FeaturePrep
+    (see §2.6), then INCLUDED into the dict by the label when packing —
+    labels do not reimplement FiLM moment math.
+
+Train / infer loops:
+
+  for sample in loader:                         # opaque dict
+      pred = model(**model_spec.unpack_input(sample))
+      loss = loss_fn(sample, pred)              # label unpacks inside
+
+loss_fn (compose):
+
+  def loss_fn(sample, pred):
+      target = label.unpack_target(sample)
+      base = label.loss(pred, target)
+      return model_spec.wrap_loss_terms(base, sample, pred)
+
+
+2.6 Boundary: data.py vs LabelSpec  (resolves ambiguity)
+--------------------------------------------------------
+
+Ambiguity today:
+  data.py both (a) loads/slices/normalizes windows AND (b) branches on
+  label_mode to build targets, slice y, special-case rise_flag norm,
+  stash h_past, and return a fixed tuple. Labels own find/loss, but data
+  still contains most label policy. After §2.5, "who packs mean/std/shape?"
+  can look unclear — answer below.
+
+Decision (chosen): data owns FeaturePrep with two named modes;
+                   label owns targets + sample assembly.
+
+----------------------------------------------------------------------
+FEATURE NORMALIZATION — understood design (authoritative)
+----------------------------------------------------------------------
+
+Config (exact names):
+  "normalization": "one-layer" | "two-layer"
+  Code home: data.FeaturePrep
+  Replaces today's boolean normalize_window. Default: "two-layer".
+
+Domain honesty:
+  data.py assumes windowed market/crypto series. FeaturePrep is fixed
+  domain prep shared by all labels — not a fully generic data framework
+  and not forked per label.
+
+What "layer" means:
+  one-layer  — one global norm of the raw series (dataset-wide SharedStats).
+  two-layer  — (1) intra-window norm of x by that window's moments, then
+               (2) inter-window norm of those moments by one shared
+               inter-stats object. Invented composition for long-span crypto.
+
+Why two-layer is the default (and when one-layer fails):
+  BTC-like prices can drift by large factors over years (e.g. ~2x+).
+  Fitting one global mean/std on years-spanning data makes σ_global huge.
+  Local window variance then shrinks toward near-zero in normalized space;
+  short-horizon structure is lost.
+
+  Two-layer avoids might-be-large local mean_w / std_w *inside the path
+  tensor x* by factoring them out:
+    - Intra: x = (x_raw - mean_w) / std_w
+      → absolute level/scale leave x; local shape stays O(1).
+    - The large mean_w / std_w are NOT discarded; they move to moment
+      channels, then are made comparable via inter-window norm:
+        mean_n = (mean_w - E[mean_w]) / Std[mean_w]
+        std_n  = (std_w  - E[std_w])  / Std[std_w]
+      Absolute largeness is absorbed into the shared inter-stats
+      (both E[·] *and* Std[·], not E alone). The model sees
+      (x, mean_n, std_n[, shape_n]), never raw (x, mean_w, std_w).
+
+Sensitivity (do not treat moments as trash):
+  Intra-window stats (mean_w, std_w, shape_w) are more sensitive /
+  regime-informative than individual samples inside the window. After
+  whitening x they are first-class conditioning (FiLM), not disposable
+  byproducts. Dropping them after intra-window norm would throw away
+  the local level/vol summary two-layer was designed to preserve.
+
+Shared-stats invariant (BOTH modes):
+  The normalized sample always refers to exactly ONE frozen train-fitted
+  SharedStats. Denorm / checkpoint resume / infer must reload that same
+  object. Modes differ in payload and *which* SharedStats — not in
+  whether stats are shared.
+
+  one-layer:
+    Payload:     x_n  (+ any globally-normed conditioning)
+    SharedStats: global (mean, std[, ...]) of raw train series
+    Inverse:     x_raw = x_n * std + mean
+
+  two-layer:
+    Payload:     (x, mean_n, std_n[, shape_n])
+                 x already intra-whitened; mean_n/std_n are per-WINDOW
+                 outputs of the shared inter-norm (NOT one scalar pair
+                 for the whole dataset).
+    SharedStats: inter-window
+                 (E[mean_w], Std[mean_w], E[std_w], Std[std_w], ...)
+                 fitted once on train windows — single shared object.
+    Inverse:     mean_w = mean_n * Std[mean_w] + E[mean_w]
+                 std_w  = std_n  * Std[std_w]  + E[std_w]
+                 x_raw  = x * std_w + mean_w     (broadcast over time)
+    Need both E[·] and Std[·] to invert; E alone is not enough.
+
+Label y denorm is SEPARATE:
+  y_raw = y_n * label_std + label_mean
+  uses label SharedStats (rise_flag may be identity). Feature two-layer
+  SharedStats do not restore y; label stats do not restore x.
+
+Mechanics cheat-sheet:
+
+  two-layer:
+    for each window:
+      mean_w, std_w, shape_w = moments(x_raw)
+      x = (x_raw - mean_w) / std_w
+    fit SharedStats on train {mean_w, std_w, shape_w}
+    mean_n, std_n, shape_n = inter_zscore(moments, SharedStats)
+    model input / sample keys: x, mean_n, std_n, shape_n, ...
+
+  one-layer:
+    fit SharedStats on raw train series
+    x_n = (x_raw - mean) / std
+    keep as ablation / short-span control; not default for long history
+
+Ownership:
+  FeaturePrep / SharedStats / WindowContext  → data.py
+  Labels only consume the mode's tensors via WindowContext and pack keys
+  Labels must not reimplement one-layer / two-layer math
+
+Out of scope for first cut:
+  - modality-agnostic data plugins
+  - per-label alternate feature-norm schemes
+  - mode names other than one-layer / two-layer
+
+Two artifacts cross the boundary (and ONLY these):
+
+  (1) WindowContext  — built by data, consumed by label
+  (2) sample dict    — built by label.pack_sample(WindowContext, ...),
+                       returned by Dataset.__getitem__
+
+----------------------------------------------------------------------
+DATA.PY  (shared across labels; domain-fixed FeaturePrep)
+----------------------------------------------------------------------
+Owns:
+  - Load Total series (market + macro), feature metadata
+  - valid_starts, train/val/test splits, shuffle policy
+  - TelePred window indexing (input span, future span, delay d)
+  - FeaturePrep with modes "two-layer" | "one-layer"
+    (SHARED across labels; CRYPTO/MARKET ASSUMPTION; see authoritative
+    FEATURE NORMALIZATION block above):
+      * two-layer payload (x, mean_n, std_n[, shape_n]) + inter SharedStats
+      * one-layer payload x_n + global SharedStats
+      * expose mode tensors on WindowContext; never fork this in labels
+      * recent price path series for labels to cut p (length NOT chosen here)
+  - Cache FILE ENVELOPE: path, pickle/io, num_samples, F, T, windows,
+    telepred ids, feature-prep stats, plus a label payload blob
+  - dataset_signature core (data source, windows, splits, norm flags)
+    and asking label for a label_signature fragment to mix in
+  - ThreadedDataLoader / batching orchestration (collate delegates to
+    label.collate)
+  - Calling label hooks at well-defined points (below)
+
+Does NOT own:
+  - find_* target formulas
+  - which y dims exist / output_dim / yield_target / latent density
+  - y normalize / denorm policy (incl. rise_flag identity)
+  - h_past or other label aux
+  - loss, metrics, viz
+  - if label_mode == ... ladders
+  - pretending to be a modality-agnostic data framework
+
+Produces WindowContext per index (example fields):
+
+  WindowContext = {
+      # identity
+      "index": int,
+      "t": int,                         # bot_time index
+      "telepred_delay": int,
+      "past_window": int,
+      "future_window": int,
+      # raw slices (for label.find / viz)
+      "x_raw": Tensor[T, F],
+      "future_prices": Tensor[delta2],
+      "history_prices": Tensor[...],
+      "current_price": Tensor/scalar,
+      # FeaturePrep outputs (model-side, already computed)
+      "x": Tensor[T, F],                # possibly z-scored
+      "mean": Tensor[F],                # raw window mean (pre dataset-stat)
+      "std": Tensor[F],
+      "shape": Tensor[S, F],
+      "mean_n": Tensor[F],              # after dataset-stat norm (FiLM)
+      "std_n": Tensor[F],
+      "shape_n": Tensor[S, F],
+      "price_feature_idx": int,
+      # optional raw recent prices for label to cut p to its length
+      "prices_norm": Tensor[T],
+  }
+
+----------------------------------------------------------------------
+LABELSPEC  (per-label policy + sample schema)
+----------------------------------------------------------------------
+Owns:
+  - build_cache_row(WindowContext-like raw slices, cfg) -> LabelRow
+      LabelRow = { "y_full": Tensor[...], "aux": {...} }  # e.g. h_past
+  - reduce_label_stats(rows, train_indices) -> LabelStats
+  - normalize_target / denorm_pred / denorm_target (policy)
+  - resolve_dims / sync_output_dim / model_past_len (p length)
+  - pack_sample(ctx: WindowContext, row, label_stats) -> dict
+      * copies/selects feature keys from ctx that THIS label's COMPAT
+        models need (typically x, p, mean_n, std_n, shape_n)
+      * cuts p to label.resolve_model_past_len
+      * writes y (sliced + normalized per policy) + label aux keys
+  - unpack_target(sample) / collate / loss / metrics / viz
+  - label_signature() + label_cache_version for dataset_signature / cache
+  - provided_sample_keys for COMPAT checks vs ModelSpec.required_input_keys
+
+Does NOT own:
+  - loading Total / Binance / macro
+  - computing window mean/std/shape FiLM moments (FeaturePrep in data)
+  - split indices / DataLoader threading
+  - importing model.py
+
+----------------------------------------------------------------------
+HANDSHAKE (who calls whom)
+----------------------------------------------------------------------
+
+  # cache build (once)
+  for idx in all_samples:
+      raw = data.slice_raw(idx)                  # prices, x_raw, windows
+      feat = data.feature_prep.compute(raw)      # mean/std/shape, x_n, ...
+      row  = label.build_cache_row(raw, cfg)     # y_full + aux (h_past, ...)
+      store feature columns + label payload
+  feat_stats  = data.feature_prep.reduce_stats(train)
+  label_stats = label.reduce_label_stats(rows, train)
+  data.write_cache(envelope + label.serialize_payload(...))
+
+  # __getitem__
+  ctx = data.make_window_context(idx)            # FeaturePrep fields filled
+  row = data.label_payload[idx]
+  sample = label.pack_sample(ctx, row, label_stats)
+  return sample                                 # opaque dict
+
+  # train/infer
+  pred = model(**model_spec.unpack_input(sample))
+  loss = label.loss(pred, label.unpack_target(sample))  # via compose
+
+----------------------------------------------------------------------
+OWNERSHIP TABLE (quick reference)
+----------------------------------------------------------------------
+
+  Concern                         | data (FeaturePrep) | LabelSpec
+  -------------------------------+--------------------+----------
+  Load series / splits / telepred | YES                |
+  x mean/std/shape moments        | YES                |
+  x z-score + FiLM stat-norm      | YES                |
+  WindowContext assembly          | YES                |
+  Target find (trend/yield/...)   |                    | YES
+  y slice / output_dim            |                    | YES
+  y norm policy (rise_flag id)    |                    | YES
+  h_past / label aux              |                    | YES
+  pack_sample / unpack_target     |                    | YES
+  Cache file I/O envelope         | YES                |
+  Cache label payload schema      |                    | YES
+  DataLoader threading            | YES                |
+  collate tensor policy           | delegates          | YES
+  loss / metrics / viz            |                    | YES
+  model forward kwargs names      |                    | packs keys;
+                                  |                    | ModelSpec reads
+
+----------------------------------------------------------------------
+RULES OF THUMB
+----------------------------------------------------------------------
+  - If it changes when you switch Binance vs synthetic data → data.
+  - If it changes when you switch trend → yield → rise_flag → label.
+  - If both need a number (e.g. p length): label DECLARES it; data
+    supplies the price series; label.pack_sample cuts p.
+  - data never imports Label_Trend / Label_Yield by name for logic;
+    it only holds `self.label: LabelSpec` and calls the generic hooks.
+  - Labels never import TradingDataset; they only accept WindowContext
+    / tensors / cfg.
+
+Migration note (tuple ABI → dict + boundary):
+  1. Introduce WindowContext + FeaturePrep extracted from today's
+     normalize_window / __getitem__ moment math (behavior-identical).
+  2. Move _compute_labels_and_norm_params label branches into
+     LabelSpec.build_cache_row / reduce_label_stats.
+  3. Move normalize_y / denormalize_y / rise_flag identity into LabelSpec.
+  4. Add pack_sample; __getitem__ returns dict.
+  5. Switch trainer + INFER to unpack_input / unpack_target; delete
+     `x, p, mean, std, shape, y = batch`.
+
+
+2.7 Ensembles of (model, label) — and what "ensemble_label" is
+--------------------------------------------------------------
+
+Requirement:
+  The TRAIN/INFER × (model, label) × data framework must also host a
+  *model* that is itself an ensemble of existing atomic (model, label)
+  tuples (TelePred delay bank, ErrorEnsemble stages, and later arbitrary
+  stacks).
+
+User decision:
+  An ensemble model does NOT need a true supervised label.
+  If anything is called ensemble_label, it is only a COLLECTION of the
+  member labels — not a new find/loss target family like yield/trend.
+
+----------------------------------------------------------------------
+Atomic vs ensemble slots
+----------------------------------------------------------------------
+
+  Atomic unit (unchanged from §2.2–2.6):
+      pair = (ModelSpec_atomic, LabelSpec_true)
+      LabelSpec_true has find / loss / pack_sample / metrics.
+
+  Ensemble unit:
+      ensemble_model = EnsembleModelSpec(
+          members = [ (model_i, label_i), ... ],   # each atomic & COMPAT
+          fusion  = FusionSpec(...),               # how to combine outputs
+      )
+      ensemble_label = LabelCollection(            # NOT a true label
+          members = [ label_i for each member ],
+      )
+
+  TRAIN/INFER still resolve "the active slot" as either:
+      - atomic:  (model, label_true)
+      - ensemble:(ensemble_model, label_collection)
+
+  registry treats LabelCollection as a distinct kind (is_true_label=False).
+  assert_compatible on an ensemble checks EACH member against COMPAT,
+  then checks ENSEMBLE_KINDS constraints (e.g. error ⇒ identical point
+  labels + regression).
+
+----------------------------------------------------------------------
+What LabelCollection is / is not
+----------------------------------------------------------------------
+
+  IS:
+    - ordered bag of member LabelSpecs (and stable member ids)
+    - pack_sample(ctx) -> dict that NAMESPACES member samples:
+          {
+            "features": {...},          # optional shared feature view
+            "members": {
+               "m0": label_0.pack_sample(ctx, row_0, stats_0),
+               "m1": label_1.pack_sample(ctx, row_1, stats_1),
+               ...
+            },
+            "fusion_meta": {...},
+          }
+    - metrics/report that iterate member metrics + fusion metrics
+    - signature fragment = hash of member label_signatures
+
+  IS NOT:
+    - a find() that invents a new joint y for the ensemble as a whole
+    - a single loss replacing member losses (unless FusionSpec explicitly
+      declares a joint train objective later)
+    - something data.py special-cases with if ensemble_label == ...
+
+  So: ensemble_label := collection(member labels), never a parallel
+  Label_Yield-style class.
+
+----------------------------------------------------------------------
+Where training vs inference live
+----------------------------------------------------------------------
+
+  Member TRAINING (default path — matches TelePred & ErrorEnsemble today):
+    - Loop members (or stages/delays).
+    - Each iteration is a normal atomic train_one_run(model_i, label_i)
+      on shared data WindowContext plumbing.
+    - data.py still sees ONE true LabelSpec per run (the member's).
+    - EnsembleModelSpec / LabelCollection are NOT required inside
+      train_one_run for this path.
+    - compose.ensemble_train owns the loop + checkpoint layout.
+
+  Ensemble INFERENCE / reporting (where collection matters):
+    - Load EnsembleModelSpec + all member checkpoints.
+    - data builds one WindowContext.
+    - LabelCollection.pack_sample builds the namespaced sample dict
+      (or compose builds per-member sample views from the same ctx).
+    - EnsembleModelSpec.forward(sample):
+          for each member:
+              pred_i = model_i(**model_i.unpack_input(sample_i))
+          return fusion.combine(pred_i, ...)
+    - Metrics: per-member via label_i, plus fusion-level numbers
+      (e.g. ErrorEnsemble en_k in y-space; TelePred bank curves).
+
+  Optional later: joint training through FusionSpec.loss(sample, preds)
+  — still does not make LabelCollection a true label; joint loss lives
+  on FusionSpec.
+
+----------------------------------------------------------------------
+Specializing today's ensembles
+----------------------------------------------------------------------
+
+  TelePred (--ensemble):
+    members = [(model, label) @ delay d for d in delays]
+    label_relation = identical  ⇒ LabelCollection of N references to
+      the SAME LabelSpec (delays differ in WindowContext / telepred,
+      not in label identity)
+    fusion = delay_bank (report / optional blend; train is per-d)
+
+  ErrorEnsemble (--error-ensemble):
+    members = [(regression, label) @ stage s for s in 0..n-1]
+    label_relation = identical AND label in {trend, yield, rise_flag}
+    fusion = sum residuals in y-normalized space (error_ensemble_logic.txt)
+    train = sequential atomic runs with residual targets derived by
+      compose/error_ensemble (stage target is still the SAME LabelSpec
+      space; residual math is FusionSpec/stage plumbing, not a new label)
+
+  Stack (future general ensemble):
+    members = arbitrary COMPAT atomic pairs (may be heterogeneous labels)
+    ensemble_label = LabelCollection(those labels)
+    fusion = user FusionSpec (weighted sum, gating, etc.)
+    data: one WindowContext; each member label packs its own view
+    (may require per-member label caches if find() differs)
+
+----------------------------------------------------------------------
+data.py interaction under ensembles
+----------------------------------------------------------------------
+
+  - FeaturePrep / WindowContext stay shared across labels (domain-fixed
+    two-layer | one-layer modes), not per-ensemble.
+  - Per atomic train run: data binds self.label = member LabelSpec_true
+    (unchanged §2.6).
+  - Per ensemble infer: data (or compose) binds self.label =
+    LabelCollection; pack_sample dispatches to members. No second
+    FeaturePrep. No ensemble-specific moment math.
+  - Heterogeneous member labels ⇒ possibly multiple label payloads /
+    caches keyed by member id; feature cache still one.
+
+----------------------------------------------------------------------
+Dependency sketch (ensemble)
+----------------------------------------------------------------------
+
+  LabelSpec_true (atomic)          FusionSpec
+         ▲                              ▲
+         │                              │
+  LabelCollection ─────────────── EnsembleModelSpec
+   (bag of labels)                 (bag of (model,label) + fusion)
+         ▲                              ▲
+         └────────── compose ───────────┘
+                       ▲
+                  TRAIN / INFER
+
+  TRAIN atomic member:   compose → (model_i, label_i, data)
+  TRAIN ensemble bank:   compose loops atomic member trains
+  INFER ensemble:        compose → (EnsembleModelSpec, LabelCollection, data)
+
+----------------------------------------------------------------------
+Rules of thumb
+----------------------------------------------------------------------
+  - Need a y to supervise one network head? → true LabelSpec.
+  - Need to group several already-defined (model, label)s?
+      → EnsembleModelSpec + LabelCollection (ensemble_label).
+  - Never invent Label_ErrorEnsemble / Label_TelePred as find/loss
+    families; those are ensemble kinds + FusionSpec.
+  - COMPAT applies to members; ENSEMBLE_KINDS applies to the bag.
+
+
+================================================================================
+3. MIGRATION PLAN INTO Ver_2026_08_30
+================================================================================
+
+Phase 0 — Scaffold
+  1. Copy modules/Ver_2026_08_20 → modules/Ver_2026_08_30.
+  2. Freeze 08_20; all new work lands in 08_30.
+  3. Keep this plan file (copy or symlink) at
+     modules/Ver_2026_08_30/refactor_plan.txt as the living checklist.
+
+Phase 1 — Parity fixes (same behavior, less lying)
+  1. Add rise_flag to --label choices; align default with documented intent.
+  2. Add --yield-target CLI; wire loss-weight flags for active label family
+     (or generate them from LabelSpec.cli_options()).
+  3. Wire --error-ensemble (and --error-ensemble-extend / clean behavior) into
+     TRAIN, OR delete the config claim until wired. Prefer wire.
+  4. Fix INFER dim-1 / rise_flag metrics path (route through Label.metrics /
+     postprocess_infer so binary BCE labels do not hit trend out_dim trees).
+  5. Document VAE product rule in CLI help: vae ignores supervised labels today.
+
+Phase 2 — Registries + compatibility gates
+  1. Add registry.py (or extend labels.py + new models registry) and compat.py.
+  2. TRAIN / train_run / ensemble / error_ensemble call
+     assert_compatible(model, label, ensemble_kind=None) at resolve time.
+  3. Unknown or unsupported pairs raise ValueError with the allowed matrix —
+     never silently train the wrong objective.
+
+Phase 3 — Draw data↔label boundary + opaque sample dict (§2.5–2.6)
+  1. Extract FeaturePrep in data.py with modes two-layer | one-layer
+     (default two-layer = today's normalize_window path); build WindowContext.
+  2. Move label cache branches / y-norm / h_past into LabelSpec
+     (build_cache_row, reduce_label_stats, normalize_target).
+  3. LabelSpec.pack_sample(WindowContext, row, stats) → opaque dict;
+     ModelSpec.unpack_input; migrate trainer + INFER off tuple ABI.
+  4. data keeps only `self.label` generic hooks — no label_mode if-ladders.
+  5. INFER metrics/viz → LabelSpec; delete INFER label_mode trees.
+
+Phase 4 — Clarify model × label product + ensemble slot (§2.7)
+  1. Introduce label="none" (or force label=None) for pure VAE, OR implement a
+     real joint loss if supervised+VAE is desired. Default: vae ⇒ none.
+  2. wrap_model_loss becomes ModelSpec.wrap_loss(label_loss|None) with an
+     explicit composition rule per COMPAT cell.
+  3. use_reconstruction: either (a) actually add recon MSE on regression when
+     True, or (b) rename to emit_reconstruction / return_recon to match behavior.
+  4. Relax PredictionHead hard-limit output_dim ∈ {1,2,3} to “positive int”
+     (or at least allow dims required by registered labels).
+  5. Add EnsembleModelSpec + LabelCollection (ensemble_label = bag of member
+     labels, not a true label). Re-express TelePred + ErrorEnsemble as
+     ensemble kinds with FusionSpec; member train stays atomic train_one_run;
+     ensemble infer uses LabelCollection.pack_sample + fusion.combine.
+
+Phase 5 — Split CLI / entry points
+  Preferred shape (thin dispatchers, shared resolve_config):
+
+    python TRAIN.py train      [...]     # or: python -m … train
+    python TRAIN.py infer      [...]     # wraps former INFER / --test / --validate
+    python TRAIN.py ensemble   [...]     # telepred delay bank
+    python TRAIN.py sweep      [...]
+    python TRAIN.py report     [...]     # history / loss / validation plots
+    python TRAIN.py error-ensemble [...]
+
+  Minimal alternative if subcommands are too disruptive initially:
+    keep flat flags but group them, generate --label choices from registry,
+    move plot-only modes out of the train path, and give INFER its own thin CLI
+    that shares resolve_config + run_* library functions.
+
+  Remove or deprecate --vae-sweep (alias → --sweep --model-type vae).
+  Generalize --vae-compare later as compare --model-a/--model-b (not required
+  for first generic framework cut).
+
+Phase 6 — Config schema pass
+  1. Section or prefix knobs: data / label / model / train / ensemble / paths.
+  2. Label knobs only apply for the active label; model knobs for active model.
+  3. Prefer run-local cfg = get_config(); apply_overrides(cfg, args) over
+     update_config global mutation. Ensemble/sweep clone cfg per trial.
+  4. Checkpoint key: keep architecture + dataset_signature; ensure label identity
+     is always in dataset_signature (already intended); document that clearly.
+  5. Persist a small run_config.json next to checkpoints (error_ensemble already
+     does this) for ALL train modes so reports do not depend on live config.py.
+
+Phase 7 — Golden smoke matrix (§0 inventory)
+  One short run per §0.3 COMPAT cell:
+    (regression, trend), (regression, yield), (regression, latent),
+    (regression, rise_flag), (vae, none)
+  Plus §0.4:
+    telepred ensemble(yield, regression) for delays [0, 2]
+    error_ensemble(yield, regression) n=2 with report
+  Assert: checkpoint key stable, loss finite, infer metrics path does not crash.
+
+
+================================================================================
+4. KEEP vs REDESIGN vs DELETE
+================================================================================
+
+KEEP
+  - Label_* class API, bind_label_loss, sync_output_dim, LABEL_CLASSES
+  - train_one_run, ResumableTrainer, checkpoint key idea
+  - build_market_model + forward (pred, patch, recon)
+  - TelePred delay bank + ensemble_train loop
+  - Error-ensemble math for point labels (error_ensemble_logic.txt)
+  - Label viz helpers currently in labels.py
+
+REDESIGN / EXTRACT
+  - TradingDataset label init/cache branches → LabelSpec
+  - TRAIN.py into commands + shared resolve_config
+  - wrap_model_loss as ModelSpec × LabelSpec composer
+  - INFER as library API + thin CLI; metrics/viz on LabelSpec
+  - Capability gates in one compat module
+  - Nested/sectioned config; stop silent VAE+label
+  - PredictionHead dim∈{1,2,3} as a permanent law → open to registered dims
+
+DELETE OR QUARANTINE
+  - Duplicate INFER metric trees once Label.metrics exists
+  - --vae-sweep alias (keep as deprecated one-liner at most)
+  - Config claim of --error-ensemble until wired (or wire it in Phase 1)
+  - Hard-coded --vae-compare as the only model–model tool (generalize later)
+  - Global update_config as the primary override path
+
+
+================================================================================
+5. PROPOSED FILE LAYOUT (Ver_2026_08_30)
+================================================================================
+
+modules/Ver_2026_08_30/
+  refactor_plan.txt          # this plan (living checklist)
+  config.py                  # sectioned defaults; get_config / apply_overrides
+  registry.py                # LABELS, MODELS, COMPAT, ENSEMBLE_COMPAT lookups
+  compat.py                  # assert_compatible / describe_matrix
+  labels.py                  # LabelSpec implementations (evolve existing)
+  model.py                   # regression transformer
+  model_vae.py               # VAE + build_market_model / ModelSpec.wrap_loss
+  data.py                    # TradingDataset + FeaturePrep (two-layer | one-layer);
+                             #   no label if-ladders; not modality-agnostic
+  trainer.py                 # ResumableTrainer, checkpoint keys
+  train_run.py               # train_one_run
+  ensemble_train.py          # TelePred delay bank
+  error_ensemble.py          # residual stages (point labels only)
+  error_ensemble_logic.txt   # source of truth for residual math
+  error_ensemble_report.py
+  telepred.py
+  TRAIN.py                   # thin CLI dispatcher (subcommands or grouped flags)
+  INFER.py                   # library + thin CLI (test/validate/report_series)
+  strategy.py / portfolio*   # unchanged initially (out of scope for matrix)
+  …
+
+
+================================================================================
+6. NON-GOALS (first cut of Ver_2026_08_30)
+================================================================================
+
+- Do not claim a fully domain-generic data layer. data.py stays a market/crypto
+  windowed FeaturePrep with fixed modes two-layer | one-layer only. Do not
+  abstract that away behind per-label or per-modality plugins in this pass.
+- Do not redesign portfolio / strategy / macro downloaders in this pass.
+- Do not invent a new trainer from scratch — evolve ResumableTrainer.
+- Do not require a real supervised+VAE joint loss unless we decide that cell
+  belongs in COMPAT; prefer (vae, none) first.
+- Do not break existing checkpoint folders under Ver_2026_08_20; 08_30 may use
+  a new checkpoint_dir default or an explicit version tag in keys if needed.
+- Do not expand PredictionHead to arbitrary multi-task heads yet — only remove
+  the artificial {1,2,3} ceiling so registered labels can grow.
+
+
+================================================================================
+7. SUCCESS CRITERIA
+================================================================================
+
+1. Adding a new label means: implement LabelSpec (incl. pack_sample /
+   unpack_target / loss / metrics) + register in LABELS + declare COMPAT
+   rows. No edits to TRAIN argparse choices lists, data.py if-ladders,
+   INFER metric trees, or trainer batch unpacking.
+2. Adding a new model means: implement ModelSpec.build / unpack_input /
+   wrap_loss + register in MODELS + declare COMPAT rows (incl. required
+   sample keys). No special cases in train_one_run.
+3. Unsupported (model, label) or ensemble kind fails fast with a clear matrix
+   message.
+4. TRAIN and INFER share one resolve_config + one train_one_run + one infer
+   pipeline; CLI is orchestration only.
+5. rise_flag trains and infers end-to-end through the generic path.
+6. error-ensemble / telepred are first-class ensemble kinds: member trains are
+   atomic (model, label); ensemble infer uses LabelCollection + FusionSpec.
+   No fake Label_ErrorEnsemble / Label_TelePred find/loss families.
+7. Config default label and CLI --label choices always agree with true
+   VALID_LABEL_MODES; ensemble_label is clearly a collection, not a --label
+   choice alongside yield/trend.
+
+
+================================================================================
+8. IMMEDIATE NEXT STEPS (when implementation starts)
+================================================================================
+
+[x] Copy Ver_2026_08_20 → Ver_2026_08_30   (done 2026-08-29; Phase 0)
+[x] Phase 1 parity fixes (rise_flag CLI, yield-target, error-ensemble wire,
+    INFER dim-1 / rise_flag metrics, VAE help)  (done in Ver_2026_08_30)
+[x] Phase 1 minimum e2e smoke: test_phase1_smoke.py
+    (CPU synthetic regression×rise_flag train + INFER metrics; PASSED)
+[x] Add registry.py + compat.py; gate train_one_run
+    (+ ensemble_train telepred, error_ensemble; Label_None; --label none)
+    test_phase2_compat.py PASSED; Phase 1 smoke still PASSED
+[x] Phase 3 (core ABI): FeaturePrep modes via "normalization";
+    label_cache.build_cache_row; opaque sample dict __getitem__;
+    sample_batch unpack; trainer/loader/INFER/error_ensemble migrated;
+    test_phase3_sample_abi.py + Phase1 smoke PASSED
+    (INFER metrics/viz trees still label_mode ifs — defer full Label.metrics)
+[x] Phase 4: vae⇒none coerce; wrap_loss by COMPAT objective;
+    emit_reconstruction clarify; output_dim positive int;
+    ensemble_spec.EnsembleModelSpec + LabelCollection;
+    telepred/error describe via specs; test_phase4_product.py PASSED
+[x] Phase 5: cli_commands subcommands (flat flags kept);
+    label_metrics.report_test_metrics wired in INFER.run_test;
+    INFER thin CLI; run_config.json written by train_one_run;
+    test_phase5_cli_metrics.py PASSED
+[x] Phase 6: config_sections (paths/data/label/model/train/ensemble);
+    apply_overrides / apply_cli_namespace / filter_active_knobs;
+    TRAIN uses apply_cli_namespace; test_phase6_config.py PASSED
+[x] Phase 7: test_golden_matrix.py PASSED
+    (regression×trend/yield/latent/rise_flag, vae×none,
+     telepred delays [0,2], error_ensemble n=2)
+
+END OF refactor_plan.txt
+
+NOTE: Living implementation checklist is modules/Ver_2026_08_30/refactor_plan.txt.
+This 08_20 copy is kept in sync for reference only after Phase 0.
