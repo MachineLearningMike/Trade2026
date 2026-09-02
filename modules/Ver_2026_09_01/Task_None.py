@@ -56,17 +56,14 @@ class Task_None(Task):
         return (0.0,)
 
     @classmethod
-    def make_auxiliary(cls, config: Optional[dict] = None, **overrides) -> dict:
-        return {}
-
-    @classmethod
     def loss(
         cls,
         x: torch.Tensor,
         y_pred: torch.Tensor,
         y_truth: torch.Tensor,
-        auxiliary: Optional[dict] = None,
+        config: Optional[dict] = None,
     ) -> torch.Tensor:
+        del x, y_truth, config
         if isinstance(y_pred, (tuple, list)):
             y_pred = y_pred[0]
         return y_pred.sum() * 0.0
@@ -81,11 +78,11 @@ class Task_None(Task):
         y_pred: torch.Tensor,
         y_truth: torch.Tensor,
         *,
-        auxiliary: Optional[dict] = None,
         dataset=None,
         config: Optional[dict] = None,
         **_kwargs,
     ) -> dict:
+        del y_pred, y_truth, dataset, config
         return {'note': 'label=none (no supervised metrics)'}
 
     @classmethod
@@ -95,10 +92,6 @@ class Task_None(Task):
     @classmethod
     def unpack_metrics(cls, metrics: dict) -> dict:
         return {}
-
-    @classmethod
-    def normalize_policy(cls) -> str:
-        return 'identity'
 
     @classmethod
     def normalize(cls, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
@@ -116,7 +109,6 @@ class Task_None(Task):
             'output_dim': forced_dim,
             'latent_dim': forced_dim,
             'label_slice': cls.target_slice(forced_dim),
-            'normalize_policy': cls.normalize_policy(),
         }
 
     @classmethod
@@ -125,18 +117,62 @@ class Task_None(Task):
         return int(config['output_dim'])
 
     @classmethod
-    def build_cache_row(cls, ctx: 'WindowContext', config: dict) -> torch.Tensor:
-        result = cls.find(ctx.future_prices, ctx.current_price)
+    def build_raw_y(
+        cls, t, total_x, total_p, config, *, mean, std,
+    ) -> torch.Tensor:
+        from telepred import windows_for_sample
+
+        del total_x, mean, std
+        delay = int(config.get('telepred_delay', 0))
+        past = int(config['past_window'])
+        future = int(config.get('future_window', cls.resolve_future_window(config)))
+        win = windows_for_sample(int(t), delay, past, future)
+        p = total_p.reshape(-1)
+        result = cls.find(p[win['future']], p[int(win['bot_time'])])
         z = float(result[0] if isinstance(result, (tuple, list)) else result)
         return torch.tensor([z], dtype=torch.float32)
+
+
+    @classmethod
+    def cache_intra_fields(cls, config):
+        return dict(cls.signature_fields(config))
+
+    @classmethod
+    def pack_datapoint(cls, dataset, idx):
+        from task_base import pack_datapoint as _pack
+        return _pack(cls, dataset, idx)
+
+    @classmethod
+    def unpack_datapoint(cls, batch):
+        from task_base import unpack_datapoint as _unpack
+        return _unpack(cls, batch)
+
+    @classmethod
+    def print_prediction_samples(cls, preds, test_labels, *, dataset=None,
+                                 yield_target=None, latent_dist=None, n=5):
+        return None
+
+    @classmethod
+    def report_header_fields(cls, dataset, config=None):
+        return {}
+
+    @classmethod
+    def postprocess_predictions(cls, preds, dataset):
+        from task_base import postprocess_predictions as _post
+        return _post(cls, preds, dataset)
+
+    @classmethod
+    def visualize_inference(cls, *args, **kwargs):
+        viz = getattr(cls, 'visualize', None)
+        if viz is None:
+            print(f"⚠ {cls.name}: no visualize() for inference plots")
+            return None
+        return viz(*args, **kwargs)
 
     @classmethod
     def signature_fields(cls, config: Mapping[str, Any]) -> Dict[str, Any]:
         return {}
 
-    @classmethod
-    def dataset_banner_lines(cls, *, bound, config, dataset) -> List[str]:
-        return ["  label=none (unsupervised; no supervised target knobs)"]
 
     @classmethod
     def format_metric_lines(cls, metrics: Mapping[str, Any]) -> List[str]:

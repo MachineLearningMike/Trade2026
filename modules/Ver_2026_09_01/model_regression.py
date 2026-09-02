@@ -7,7 +7,7 @@ import torch.nn as nn
 from typing import Optional, Tuple
 from config import get_config
 from Task_Trend import Task_Trend
-from task_base import resolve_model_past_len
+
 
 
 # ═══════════════════════════════════════════════════════════
@@ -613,7 +613,7 @@ class MarketRegressionWithHeads(nn.Module):
         return predictions, patch_map, recon
 
 
-# Label objectives live on Task_*.loss / task_base.bind_task_loss.
+# Label objectives live on Task_*.loss.
 
 
 # ═══════════════════════════════════════════════════════════
@@ -648,7 +648,7 @@ if __name__ == "__main__":
     print(f"  num_heads: {config['num_heads']}")
     print(f"  output_dim: {config['output_dim']}")
 
-    n_max_past = int(resolve_model_past_len(config))
+    n_max_past = int(config.get('future_window', config.get('past_window', 50)))
     model = MarketRegressionWithHeads(
         in_features=F,
         n_market_features=n_market,
@@ -680,14 +680,12 @@ if __name__ == "__main__":
     std = torch.randn(B, F, device=device).abs() + 1e-3
     momentum = torch.randn(B, num_momentum, F, device=device)
 
-    _trend_aux = Task_Trend.make_auxiliary(
-        {'slope_loss_weight': 0.1, 'intercept_loss_weight': 0.01}
-    )
+    _trend_cfg = {'slope_loss_weight': 0.1, 'intercept_loss_weight': 0.01}
     check_all_weights_updated(
         model,
         sample_batch=(x, p, mean, std, momentum),
         loss_fn=lambda x_, y_pred, y_truth: Task_Trend.loss(
-            x_, y_pred, y_truth, _trend_aux
+            x_, y_pred, y_truth, _trend_cfg
         ),
         name="MarketRegressionWithHeads",
     )

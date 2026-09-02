@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from telepred import parse_delay_list
-from train_run import train_one_run
+from trainer import train_one_run
 
 DEFAULT_PATCH_SIZES = (5, 10, 20)
 DEFAULT_NUM_LAYERS = (2, 4, 6)
@@ -109,13 +109,13 @@ def run_ensemble_train(
     """
     Train one TelePred(d) element per delay (separate dataset + checkpoint).
 
-    ``get_dataset`` defaults to ``dataset_build.get_dataset``.
+    ``get_dataset`` defaults to ``TradingDataset`` (returns dataset; use .total_features).
     When ``write_csv`` is True (default for ``--ensemble``), appends one row
     per delay to ``_save/ensemble_<label>_<model_type>/results.csv``.
     ``--ensemble-sweep`` passes ``write_csv=False`` and writes its own CSV.
     """
     if get_dataset is None:
-        from dataset_build import get_dataset as get_dataset
+        from data import TradingDataset as get_dataset
 
     if delays is None:
         delays = parse_delay_list(
@@ -126,9 +126,7 @@ def run_ensemble_train(
 
     label = str(config.get('label', 'yield')).lower()
     mt = str(config.get('model_type', 'regression')).lower()
-    from task_base import assert_compatible
     from ensemble_spec import EnsembleModelSpec, describe_ensemble
-    assert_compatible(mt, label, ensemble_kind='telepred')
     telepred_spec = EnsembleModelSpec.telepred(mt, label, delays)
     if write_csv and csv_path is None:
         csv_path = ensemble_csv_path(label=label, model_type=mt)
@@ -151,9 +149,10 @@ def run_ensemble_train(
         elem_cfg['telepred_delay'] = int(d)
         ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         try:
-            from task_base import get_task_class
-            task = get_task_class(elem_cfg.get('label', 'trend'))
-            dataset, total_features = get_dataset(elem_cfg, task=task)
+            from INFER import _resolve_task
+            task = _resolve_task(elem_cfg)
+            dataset = get_dataset(elem_cfg, task=task)
+            total_features = dataset.total_features
             # Extend only when this delay already has weights (same policy as vae_sweep).
             from trainer import generate_checkpoint_key
             ckpt_key = generate_checkpoint_key(elem_cfg, dataset.cache_key)
@@ -301,7 +300,7 @@ def run_ensemble_sweep(
     Outer hyperparameter grid; each trial trains the full TelePred delay bank.
     """
     if get_dataset is None:
-        from dataset_build import get_dataset as get_dataset
+        from data import TradingDataset as get_dataset
 
     cfg = dict(config)
     cfg['resume'] = True
@@ -336,12 +335,13 @@ def run_ensemble_sweep(
     print("=" * 60 + "\n")
 
     # Probe F / n_market once with delay=0 dataset (layout independent of d).
-    from task_base import get_task_class
+    from INFER import _resolve_task
     probe_cfg = dict(cfg)
     probe_cfg['telepred_delay'] = 0
-    dataset0, total_features = get_dataset(
-        probe_cfg, task=get_task_class(probe_cfg.get('label', 'trend'))
+    dataset0 = get_dataset(
+        probe_cfg, task=_resolve_task(probe_cfg)
     )
+    total_features = dataset0.total_features
     n_market = int(dataset0.n_market_features)
     # Drop large probe; each delay rebuilds its own dataset inside ensemble.
     del dataset0

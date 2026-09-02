@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Smoke: Task base + Task_* classes (no Label_* compat)."""
+"""Smoke: Task base + Task_* subclasses (no registry in task_base)."""
 from __future__ import annotations
 
 import traceback
@@ -12,27 +12,27 @@ def main() -> int:
     from Task_Latent import Task_Latent
     from Task_Rise import Task_Rise
     from Task_None import Task_None
-    from task_base import get_task_class, TASK_CLASSES
-    from Task_Trend import Task_Trend as TT
-    from Task_Yield import Task_Yield as TY
-    from Task_Latent import Task_Latent as TL
-    from Task_Rise import Task_Rise as TR
+    from INFER import _resolve_task
 
     for cls in (Task_Trend, Task_Yield, Task_Latent, Task_Rise, Task_None):
         assert issubclass(cls, Task), cls
 
-    assert TT is Task_Trend and TY is Task_Yield
-    assert TL is Task_Latent and TR is Task_Rise
+    assert _resolve_task({'label': 'trend'}) is Task_Trend
+    assert _resolve_task({'label': 'yield'}) is Task_Yield
+    assert _resolve_task({'label': 'latent'}) is Task_Latent
+    assert _resolve_task({'label': 'rise_flag'}) is Task_Rise
+    assert _resolve_task({'label': 'none'}) is Task_None
 
-    assert get_task_class('trend') is Task_Trend
-    assert get_task_class('yield') is Task_Yield
-    assert get_task_class('latent') is Task_Latent
-    assert get_task_class('rise_flag') is Task_Rise
-    assert get_task_class('none') is Task_None
-    assert set(TASK_CLASSES) == {'trend', 'yield', 'latent', 'rise_flag', 'none'}
-
-    assert Task_Rise.normalize_policy() == 'identity'
-    assert Task_Trend.normalize_policy() == 'zscore'
+    import torch
+    y = torch.tensor([[10.0, 20.0]])
+    mean = torch.tensor([[0.0, 10.0]])
+    std = torch.tensor([[5.0, 5.0]])
+    # Rise leaves labels alone; Trend standardizes.
+    assert torch.equal(Task_Rise.normalize(y, mean, std), y)
+    assert torch.allclose(
+        Task_Trend.normalize(y, mean, std),
+        torch.tensor([[2.0, 2.0]]),
+    )
 
     print('task hierarchy smoke ok')
     return 0

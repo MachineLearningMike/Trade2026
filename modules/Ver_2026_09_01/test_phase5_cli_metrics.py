@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 5 smoke: subcommand split + label_metrics.report_test_metrics."""
+"""Phase 5 smoke: subcommand split + task.pack_metrics."""
 from __future__ import annotations
 
 import traceback
@@ -13,7 +13,6 @@ def main() -> int:
         apply_command_to_namespace,
         split_command_argv,
     )
-    from task_base import report_test_metrics
 
     assert 'train' in COMMANDS and 'error-ensemble' in COMMANDS
 
@@ -39,21 +38,25 @@ def main() -> int:
     apply_command_to_namespace('error-ensemble', ns3)
     assert ns3.error_ensemble is True
 
-    # rise_flag metrics via LabelSpec path
     preds = torch.tensor([[2.0], [-1.0], [0.1], [3.0]])
     labels = torch.tensor([[1.0], [0.0], [0.0], [1.0]])
-    m = report_test_metrics(
-        'rise_flag', preds, labels, print_samples=False,
-    )
+    from Task_Rise import Task_Rise
+    from Task_Trend import Task_Trend
+    packed = Task_Rise.pack_metrics(preds, labels, config={})
+    m = Task_Rise.unpack_metrics(packed)
+    for k, v in packed.items():
+        m.setdefault(k, v)
     assert 'bce_with_logits' in m and 'accuracy' in m
     assert 0.0 <= m['accuracy'] <= 1.0
 
-    # trend dim 2
     preds_t = torch.randn(4, 2)
     labels_t = torch.randn(4, 2)
-    m2 = report_test_metrics(
-        'trend', preds_t, labels_t, config={'output_dim': 2}, print_samples=False,
+    packed_t = Task_Trend.pack_metrics(
+        preds_t, labels_t, config={'output_dim': 2},
     )
+    m2 = Task_Trend.unpack_metrics(packed_t)
+    for k, v in packed_t.items():
+        m2.setdefault(k, v)
     assert 'slope_mse' in m2 and 'intercept_mse' in m2
 
     print('phase5 cli+metrics smoke ok')

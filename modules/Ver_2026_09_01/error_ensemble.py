@@ -22,7 +22,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 
-from task_base import bind_task_loss, get_task_class
+
+from INFER import _resolve_task
 
 
 ModelLike = Union[nn.Module, Callable[[], nn.Module]]
@@ -78,9 +79,9 @@ def apply_denormalize(
 
 
 def label_norm_from_dataset(dataset) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Dataset label affine used by ``TradingDataset.normalize_y`` (stage 0)."""
-    mean = torch.as_tensor(dataset._label_stat_mean, dtype=torch.float32).reshape(-1)
-    std = torch.as_tensor(dataset._label_stat_std, dtype=torch.float32).reshape(-1)
+    """Train-set label affine used by ``Task.normalize`` / ``denormalize`` (stage 0)."""
+    mean = torch.as_tensor(dataset.label_stat_mean, dtype=torch.float32).reshape(-1)
+    std = torch.as_tensor(dataset.label_stat_std, dtype=torch.float32).reshape(-1)
     std = torch.where(std.abs() < 1e-8, torch.ones_like(std), std)
     return mean.detach().cpu(), std.detach().cpu()
 
@@ -516,7 +517,7 @@ class ErrorEnsemble(nn.Module):
         self.label_cls = None
         if label is not None:
             if isinstance(label, str):
-                self.label_cls = get_task_class(label)
+                self.label_cls = _resolve_task({'label': label})
             elif isinstance(label, type):
                 self.label_cls = label
             else:
@@ -525,7 +526,12 @@ class ErrorEnsemble(nn.Module):
         if loss is not None:
             self.loss_fn = loss
         elif self.label_cls is not None:
-            self.loss_fn = bind_task_loss(self.label_cls, config)
+            def _loss(x, y_pred, y_truth):
+                if isinstance(y_pred, (tuple, list)):
+                    y_pred = y_pred[0]
+                return self.label_cls.loss(x, y_pred, y_truth, config)
+
+            self.loss_fn = _loss
         else:
             self.loss_fn = None
 
@@ -634,18 +640,17 @@ def error_ensemble_stage_keys(
     dataset_signature: Optional[str] = None,
 ) -> List[str]:
     """Checkpoint keys for ``model_0 .. model_{n-1}`` under the current config."""
-    from data import generate_dataset_signature
-    from task_base import sync_output_dim
-
+    from data import TradingDataset
+    
     cfg = dict(config)
-    sync_output_dim(cfg)
+    _resolve_task(cfg).sync_output_dim(cfg)
     n_models = int(n if n is not None else cfg.get('error_ensemble_n', 3) or 3)
     if n_models < 1:
         raise ValueError(f"error_ensemble_n must be >= 1, got {n_models}")
     sig = (
         dataset_signature
         if dataset_signature is not None
-        else generate_dataset_signature(cfg)
+        else TradingDataset.generate_dataset_signature(cfg, _resolve_task(cfg))
     )
     return [stage_checkpoint_key(cfg, sig, stage) for stage in range(n_models)]
 
@@ -832,13 +837,12 @@ def load_one_error_stage(
     mix raw/label affines into y-space sums and make loss(en_i, y) rise with i.
     """
     from config import project_root_dir
-    from task_base import resolve_model_past_len, sync_output_dim
-    from model_v_autoencoder import build_market_model, resolve_max_seq_len
+        from model_v_autoencoder import build_market_model, resolve_max_seq_len
     from telepred import resolve_past_window
     from INFER import find_checkpoint_by_key
 
     cfg = dict(config)
-    sync_output_dim(cfg)
+    _resolve_task(cfg).sync_output_dim(cfg)
     if device is None:
         device = torch.device(cfg['device'] if cfg.get('device') else 'cpu')
     else:
@@ -886,7 +890,7 @@ def load_one_error_stage(
         cfg['max_seq_len'] = resolve_max_seq_len(cfg, past_window)
     model_past_len = int(
         getattr(dataset, 'model_past_len', None)
-        or resolve_model_past_len(cfg)
+        or _resolve_task(cfg).resolve_model_past_len(cfg)
     )
     # Head was trained with this past length; prefer ckpt-implied look_price path.
     if bool(cfg.get('look_price', False)):
@@ -977,6 +981,7 @@ def evaluate_ensemble_over_stages(
         device = torch.device(config.get('device') or 'cpu')
     else:
         device = torch.device(device)
+    task = task or getattr(dataset, 'task', None) or _resolve_task(config)
 
     # label_norm is used by load_one_error_stage fallbacks; metrics use y itself.
     _ = label_norm
@@ -1017,14 +1022,7 @@ def evaluate_ensemble_over_stages(
         progress_label="collect y(D)",
         progress_every=100,
     ):
-        from data import as_train_tuple
-        try:
-            _x, _p, _mean, _std, _shape, y_t = as_train_tuple(batch)
-        except Exception as e:
-            raise ValueError(
-                "evaluate_ensemble_over_stages expects sample dict or "
-                "(x, p, mean, std, momentum, y) batches"
-            ) from e
+        _kwargs, y_t = task.unpack_datapoint(batch)
         y_norm = y_t.detach().cpu()
         y_chunks.append(y_norm)
         n_batches += 1
@@ -1058,13 +1056,12 @@ def evaluate_ensemble_over_stages(
                 progress_label=f"model_{stage}(D)",
                 progress_every=50,
             ):
-                from data import as_train_tuple
-                x, p, mean, std, momentum, _y = as_train_tuple(batch)
-                x = x.to(device)
-                p = p.to(device)
-                mean = mean.to(device)
-                std = std.to(device)
-                momentum = momentum.to(device)
+                kwargs, _y = task.unpack_datapoint(batch)
+                x = kwargs['x'].to(device)
+                p = kwargs['p'].to(device)
+                mean = kwargs['mean'].to(device)
+                std = kwargs['std'].to(device)
+                momentum = kwargs['momentum'].to(device)
                 pred = head_prediction(model(x, p, mean, std, momentum))
                 contrib_b = contribution_in_y_space(stage, pred, (s_mean, s_std))
                 contrib_chunks.append(contrib_b.detach().cpu())
@@ -1110,26 +1107,22 @@ def evaluate_ensemble_over_stages(
             'n_batches': n_batches,
         }
         if attach_label_metrics:
-            from task_base import compute_label_metrics
-
             if task is None:
                 raise TypeError(
                     "evaluate_ensemble_over_stages(attach_label_metrics=True) "
                     "requires task= (caller-owned Task)"
                 )
-            # rise_flag: en_k treated as logit; y is {0,1} (identity affine).
-            # yield/trend: en_k and y already in the same y-normalized space.
-            row['label_metrics'] = compute_label_metrics(
-                task=task,
-                preds=running,
-                y_truth=y_all,
-                config=config,
-                dataset=dataset,
+            packed = task.pack_metrics(
+                running, y_all, dataset=dataset, config=config,
             )
+            metrics = task.unpack_metrics(packed)
+            for k, v in packed.items():
+                metrics.setdefault(k, v)
+            row['label_metrics'] = metrics
         if out and loss > float(out[-1]['loss']) + 1e-8:
             prev = float(out[-1]['loss'])
             prev_k = int(out[-1]['k'])
-            warn_task = task or get_task_class(config.get('label', 'trend'))
+            warn_task = task or _resolve_task(config)
             print(
                 "⚠ "
                 + warn_task.ensemble_loss_increase_warning(
@@ -1190,6 +1183,7 @@ def compute_stage_target_stats(
 
     from data import ThreadedDataLoader
 
+    task = getattr(dataset, 'task', None) or _resolve_task(config)
     for m in prev_models:
         m.eval()
         m.to(device)
@@ -1217,13 +1211,12 @@ def compute_stage_target_stats(
         progress_label=f"residual stats model_{stage}",
         progress_every=25,
     ):
-        from data import as_train_tuple
-        x, p, mean, std, momentum, y_norm = as_train_tuple(batch)
-        x = x.to(device)
-        p = p.to(device)
-        mean = mean.to(device)
-        std = std.to(device)
-        momentum = momentum.to(device)
+        kwargs, y_norm = task.unpack_datapoint(batch)
+        x = kwargs['x'].to(device)
+        p = kwargs['p'].to(device)
+        mean = kwargs['mean'].to(device)
+        std = kwargs['std'].to(device)
+        momentum = kwargs['momentum'].to(device)
         y_norm = y_norm.to(device)
 
         prev_y = None
@@ -1279,13 +1272,12 @@ def load_error_ensemble_stages(
     ``(models, keys_loaded, stage_indices, stage_norms, label_norm)``.
     """
     from config import project_root_dir
-    from task_base import resolve_model_past_len, sync_output_dim
-    from model_v_autoencoder import build_market_model, resolve_max_seq_len
+        from model_v_autoencoder import build_market_model, resolve_max_seq_len
     from telepred import resolve_past_window
     from INFER import find_checkpoint_by_key
 
     cfg = dict(config)
-    sync_output_dim(cfg)
+    _resolve_task(cfg).sync_output_dim(cfg)
     n_models = int(n if n is not None else cfg.get('error_ensemble_n', 3) or 3)
     if stage_keys is None:
         keys = error_ensemble_stage_keys(cfg, n=n_models)
@@ -1304,7 +1296,7 @@ def load_error_ensemble_stages(
     cfg['max_seq_len'] = resolve_max_seq_len(cfg, past_window)
     cfg['output_dim'] = int(getattr(dataset, 'output_dim', cfg.get('output_dim', 2)))
     model_past_len = int(
-        getattr(dataset, 'model_past_len', resolve_model_past_len(cfg))
+        getattr(dataset, 'model_past_len', _resolve_task(cfg).resolve_model_past_len(cfg))
     )
 
     ckpt_root = Path(cfg.get('checkpoint_dir', 'trading_checkpoints'))
@@ -1392,10 +1384,9 @@ def count_finished_error_ensemble_stages(
     cfg = dict(config)
     sig = str(getattr(dataset, 'cache_key', '') or '')
     if not sig:
-        from data import generate_dataset_signature
-        from task_base import sync_output_dim
-        sync_output_dim(cfg)
-        sig = generate_dataset_signature(cfg)
+        from data import TradingDataset
+                _resolve_task(cfg).sync_output_dim(cfg)
+        sig = TradingDataset.generate_dataset_signature(cfg, _resolve_task(cfg))
 
     ckpt_root = Path(cfg.get('checkpoint_dir', 'trading_checkpoints'))
     if not ckpt_root.is_absolute():
@@ -1456,9 +1447,8 @@ def run_error_ensemble_train(
     ``task`` is the caller-owned Task (same instance handed to the dataset).
     """
     from model_v_autoencoder import build_market_model, resolve_max_seq_len, wrap_model_loss
-    from train_run import train_one_run
-    from task_base import resolve_model_past_len
-    from telepred import resolve_past_window
+    from trainer import train_one_run
+        from telepred import resolve_past_window
 
     if task is None:
         raise TypeError(
@@ -1477,9 +1467,7 @@ def run_error_ensemble_train(
 
     label_mode = str(getattr(task, 'name', cfg_base.get('label', 'yield'))).lower()
     model_type = str(cfg_base.get('model_type', 'regression')).lower()
-    from task_base import assert_compatible
     from ensemble_spec import EnsembleModelSpec, describe_ensemble
-    assert_compatible(model_type, label_mode, ensemble_kind='error')
     err_spec = EnsembleModelSpec.error(label_mode, n_models, model_id=model_type)
 
     cfg_base['error_ensemble_n'] = n_models
@@ -1534,7 +1522,7 @@ def run_error_ensemble_train(
             stage_cfg['max_seq_len'] = resolve_max_seq_len(stage_cfg, past_window)
             stage_cfg['output_dim'] = dataset.output_dim
             model_past_len = int(
-                getattr(dataset, 'model_past_len', resolve_model_past_len(stage_cfg))
+                getattr(dataset, 'model_past_len', _resolve_task(stage_cfg).resolve_model_past_len(stage_cfg))
             )
 
             active = build_market_model(
@@ -1675,19 +1663,11 @@ def run_error_ensemble_train(
             )
             wrapper = wrapper.to(device)
 
-            base_loss_fn = bind_task_loss(
-                task,
-                stage_cfg,
-                yield_target=getattr(
-                    dataset, 'yield_target', stage_cfg.get('yield_target', 'both')
-                ),
-                latent_distribution=getattr(
-                    dataset,
-                    'latent_distribution',
-                    stage_cfg.get('latent_distribution', 'normal'),
-                ),
-            )
-            # wrap_model_loss is a no-op branch for regression; keep for parity.
+            def base_loss_fn(x, y_pred, y_truth):
+                if isinstance(y_pred, (tuple, list)):
+                    y_pred = y_pred[0]
+                return task.loss(x, y_pred, y_truth, stage_cfg)
+
             base_loss_fn = wrap_model_loss(wrapper.active, base_loss_fn, stage_cfg)
             loss_fn = bind_residual_stage_loss(base_loss_fn, wrapper)
 
@@ -1746,7 +1726,11 @@ def run_error_ensemble_train(
             require_finished=False,
         )
         if loaded:
-            base_loss = bind_task_loss(task, cfg_base)
+            def base_loss(x, y_pred, y_truth):
+                if isinstance(y_pred, (tuple, list)):
+                    y_pred = y_pred[0]
+                return task.loss(x, y_pred, y_truth, cfg_base)
+
             ensemble = ErrorEnsemble(
                 models=loaded,
                 label=task,

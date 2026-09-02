@@ -24,15 +24,14 @@ import argparse
 import json
 import shutil
 
-from config import update_config
-from dataset_build import get_dataset, project_root_dir
-from task_base import sync_output_dim
+from config import project_root_dir, update_config
+from data import TradingDataset
+
 from telepred import parse_delay_list
 from trainer import resolve_checkpoint_identity
-from train_run import train_one_run
+from trainer import train_one_run
 
-# Compatibility re-export for callers that still do ``from TRAIN import get_dataset``.
-__all__ = ['main', 'get_dataset', 'project_root_dir']
+__all__ = ['main', 'TradingDataset', 'project_root_dir']
 
 
 def _resolve_report_dir(report_name: str, *, flag: str = '--report'):
@@ -161,9 +160,18 @@ def _export_training_history_plot(source_dir: Path, report_dir: Path) -> Optiona
 
 
 def _resolve_task(config: dict):
-    """TRAIN owns the principal task: create from config['label']."""
-    from task_base import get_task_class
-    return get_task_class(config.get('label', 'trend'))
+    """TRAIN owns the principal task: pick Task_* from config['label']."""
+    from Task_Trend import Task_Trend
+    from Task_Yield import Task_Yield
+    from Task_Latent import Task_Latent
+    from Task_Rise import Task_Rise
+    from Task_None import Task_None
+
+    name = str(config.get('label', 'trend')).strip().lower()
+    for cls in (Task_Trend, Task_Yield, Task_Latent, Task_Rise, Task_None):
+        if cls.name == name:
+            return cls
+    raise ValueError(f"Unknown task {name!r}")
 
 
 def _export_label_metrics_report(
@@ -173,62 +181,10 @@ def _export_label_metrics_report(
     *,
     report_name: str,
 ) -> Optional[Path]:
-    """
-    Evaluate the source checkpoint on val + test, write ``report.text`` with
-    the hosting label's metric slots.
-    """
-    from task_base import (
-        evaluate_checkpoint_key_metrics,
-        get_task_class,
-        write_metrics_report_text,
-    )
-
-    source_dir = Path(source_dir)
-    report_dir = Path(report_dir)
-    key = source_dir.name
-
-    print("\n📊 Computing label metrics for report.text (val + test)...")
-    task = get_task_class(config.get('label', 'trend'))
-    dataset, _total_features = get_dataset(config, task=task)
-    config['output_dim'] = dataset.output_dim
-    if task.name == 'yield':
-        config['yield_target'] = getattr(dataset, 'yield_target', 'both')
-    if task.name == 'latent':
-        config['latent_distribution'] = getattr(
-            dataset, 'latent_distribution', config.get('latent_distribution', 'normal')
-        )
-
-    label_mode = task.name
-    try:
-        m = evaluate_checkpoint_key_metrics(
-            config, dataset, key,
-            task=task,
-            checkpoint_dir=config['checkpoint_dir'],
-        )
-    except FileNotFoundError as exc:
-        print(f"⚠ {exc}; skipping report.text metrics")
-        return None
-
-    extra = dict(task.report_header_fields(dataset, config))
-    sig = getattr(dataset, 'cache_key', None)
-    if sig is not None:
-        extra['Dataset signature'] = sig
-    extra = {k: v for k, v in extra.items() if v is not None}
-    path = write_metrics_report_text(
-        report_dir,
-        report_name=report_name,
-        label_mode=label_mode,
-        model_type=str(config.get('model_type', 'regression')),
-        checkpoint_key=str(m.get('checkpoint_key', key)),
-        checkpoint_path=str(m.get('checkpoint_path', '')),
-        val_metrics=m.get('val_metrics'),
-        test_metrics=m.get('test_metrics'),
-        val_n=m.get('val_n'),
-        test_n=m.get('test_n'),
-        extra_header=extra or None,
-    )
-    print(f"📄 Label metrics → {path}")
-    return path
+    """Label metrics report export — rebuild on Tasks later."""
+    del config, source_dir, report_dir, report_name
+    print("⚠ Label metrics report export removed from task_base; rebuild on Tasks.")
+    return None
 
 
 def main(config):
@@ -475,7 +431,6 @@ def main(config):
             help='TelePred delta2: label future length in bars (yield/trend/latent)',
         )
         parser.add_argument('--batch-size', type=int, default=config['batch_size'], help='Batch size')
-        parser.add_argument('--total-days', type=int, default=config['total_synthetic_days'], help='Total days of data')
         parser.add_argument('--step', type=int, default=config['step'], help='Step size for start indices')
         parser.add_argument('--max-accum-deviation', type=float, default=config['max_accum_deviation'],
                            help='Threshold for cumulative absolute deviation')
@@ -499,10 +454,9 @@ def main(config):
                 "train objective; prefer label unused / future label=none)."
             ),
         )
-        from task_base import label_cli_choices
         parser.add_argument(
             '--label', type=str, default=config.get('label', 'trend'),
-            choices=list(label_cli_choices()),
+            choices=['trend', 'yield', 'latent', 'rise_flag', 'none'],
             help=(
                 'Label family: trend | yield | latent | rise_flag | none. '
                 'COMPAT: regression×{trend,yield,latent,rise_flag}; '
@@ -601,8 +555,6 @@ def main(config):
             default=not config.get('look_price', True),
             help='Do not concat recent past prices p into the prediction head',
         )
-        parser.add_argument('--use-binance', action='store_true', default=config['use_binance_data'],
-                           help='Use real Binance data instead of synthetic')
         parser.add_argument('--symbol', type=str, default=config.get('binance_primary_symbol', 'BTCUSDT'),
                            help='Primary trading pair symbol')
     
@@ -635,12 +587,15 @@ def main(config):
         config['telepred_delays'] = parse_delay_list(
             config.get('telepred_delays', [config.get('telepred_delay', 0)])
         )
-    # Phase 4: vae ⇒ label none (COMPAT unsupervised cell).
-    from task_base import resolve_atomic_slot
-    from task_base import MODEL_VAE, normalize_model_id
-    if normalize_model_id(config.get('model_type')) == MODEL_VAE:
-        resolve_atomic_slot(config, coerce_vae_to_none=True, warn=True)
-    sync_output_dim(config)
+    # vae ⇒ label none
+    if str(config.get('model_type', '')).lower().strip() == 'vae':
+        if str(config.get('label', '')).lower().strip() != 'none':
+            print(
+                f"⚠ model_type=vae requires label=none; "
+                f"coercing label {config.get('label')!r} → 'none'"
+            )
+            config['label'] = 'none'
+    _resolve_task(config).sync_output_dim(config)
 
     if getattr(args, 'normalization_layers', None):
         config['normalization_layers'] = str(args.normalization_layers).strip().lower()
@@ -661,8 +616,30 @@ def main(config):
         print("  Keyboard:       N / Space = next,  Q / Esc = quit")
         print("=" * 60 + "\n")
 
-        dataset, total_features = get_dataset(config, task=_resolve_task(config))
-        dataset.visualize_trends(num_samples=6, interactive=True)
+        task = _resolve_task(config)
+        dataset = TradingDataset(config, task=task)
+        total_features = dataset.total_features
+        if dataset.label_tensor.shape[0] == 0:
+            print("⚠ No labels available for visualization.")
+            return
+        print("\n" + "=" * 60)
+        print("VISUALIZING LINEAR TRENDS")
+        print("  Interactive: Next = new random page, Quit = exit")
+        print("=" * 60)
+        task.visualize(
+            total_tensor=dataset.Total,
+            valid_starts=dataset.valid_starts,
+            label_tensor=dataset.label_tensor,
+            mean_tensor=dataset.mean_tensor,
+            std_tensor=dataset.std_tensor,
+            price_feature_idx=dataset.price_feature_idx,
+            past_window=dataset.past_window,
+            future_window=dataset.future_window,
+            mode=dataset.horizon_mode,
+            num_samples=6,
+            interactive=True,
+            normalize_prices=dataset.normalize_window,
+        )
 
         print("\n✅ Trend visualization completed!")
         return
@@ -1316,12 +1293,26 @@ def main(config):
         print("Visualizing features...")
         print("=" * 60 + "\n")
         
-        # Get data
-        dataset, total_features = get_dataset(config, task=_resolve_task(config))
         
-        for fid, feature in enumerate(total_features):
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        dataset = TradingDataset(config, task=_resolve_task(config))
+        for fid, feature in enumerate(dataset.total_features):
             try:
-                dataset.visualize_feature(fid, feature, dataset.feature_names[fid])
+                z = (feature - feature.mean()) / (feature.std() + 1e-8)
+                days = np.linspace(0, len(feature) / (60 * 24), len(feature))
+                plt.figure(figsize=(15, 5))
+                plt.plot(days, z, label=f'Feature {fid}', color='blue')
+                plt.title(
+                    f'Feature {fid}: {dataset.feature_names[fid]} Over Time'
+                )
+                plt.xlabel('Days (interval: 1 min)')
+                plt.ylabel('Value (Z-score normalized)')
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                plt.tight_layout()
+                plt.show()
             except Exception as e:
                 print(f"⚠ Failed to visualize feature {fid}: {e}")
                 print(dataset.feature_names[fid])
@@ -1414,7 +1405,7 @@ def main(config):
         print("  Plot: batch loss / moving avg / running loss (no save)")
         print("=" * 60 + "\n")
 
-        # Lazy import keeps TRAIN → INFER one-way (dataset_build owns get_dataset).
+        # Lazy import keeps TRAIN → INFER one-way.
         from INFER import run_validate
 
         run_validate(
@@ -1470,7 +1461,7 @@ def main(config):
         print(f"  Batch size (config test_batch_size): {test_bs}")
         print("=" * 60 + "\n")
 
-        # Lazy import keeps TRAIN → INFER one-way (dataset_build owns get_dataset).
+        # Lazy import keeps TRAIN → INFER one-way.
         from INFER import run_test
 
         viz = not bool(getattr(args, 'no_viz', False))
@@ -1491,7 +1482,7 @@ def main(config):
             delays=config.get('telepred_delays'),
             epochs_per_trial=max(1, int(getattr(args, 'sweep_epochs', 1))),
             extend_epochs=float(getattr(args, 'sweep_extend', 1.0)),
-            get_dataset=get_dataset,
+            get_dataset=TradingDataset,
         )
         print(f"\n✅ Ensemble sweep completed → {csv_path}")
         return
@@ -1501,7 +1492,7 @@ def main(config):
         run_ensemble_train(
             config,
             delays=config.get('telepred_delays'),
-            get_dataset=get_dataset,
+            get_dataset=TradingDataset,
             num_epochs=float(config['epochs']),
             extend=(args.extend is not None and args.extend != 0),
             extend_epochs=args.extend if args.extend is not None else 0.0,
@@ -1516,7 +1507,8 @@ def main(config):
 
     # Single-element path (and legacy --sweep / --error-ensemble on one delay)
     task = _resolve_task(config)
-    dataset, total_features = get_dataset(config, task=task)
+    dataset = TradingDataset(config, task=task)
+    total_features = dataset.total_features
 
     if getattr(args, 'sweep', False) or getattr(args, 'vae_sweep', False):
         from vae_sweep import run_hparam_sweep

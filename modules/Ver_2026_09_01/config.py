@@ -91,10 +91,8 @@ config = {
     'error_ensemble_n': 6,
     # Set at runtime per stage (0-based); included in checkpoint key.
     # 'error_ensemble_stage': None,
-    'num_features': 5,
     'num_momentum': 4,
-    'total_synthetic_days': 30,
-    
+
     # ============================================================
     # DATA SPLIT CONFIGURATION
     # ============================================================
@@ -205,7 +203,6 @@ config = {
     # ============================================================
     # BINANCE DATA CONFIGURATION
     # ============================================================
-    'use_binance_data': True,
     'binance_datatype': 'klines',
     'binance_interval': '1m',
     # Half-open-ish span in minutes: need end > start. Need enough bars for

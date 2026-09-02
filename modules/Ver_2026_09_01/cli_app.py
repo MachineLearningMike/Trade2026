@@ -18,7 +18,6 @@ from types import SimpleNamespace
 from typing import Any, List, Optional, Sequence, Tuple
 
 from cli_commands import COMMANDS
-from task_base import label_cli_choices
 
 # Old-style exclusive flags → force legacy mega-parser (with warning).
 _LEGACY_HINT_FLAGS = (
@@ -68,7 +67,7 @@ def _blank_args() -> SimpleNamespace:
         features=False, validate_yield=None, test=None,
         # product / data
         past_window=None, future_window=None, batch_size=None,
-        total_days=None, step=None, max_accum_deviation=None,
+        step=None, max_accum_deviation=None,
         min_trend_horizon=None, min_yield_percent=None,
         model_type=None, label=None, yield_target=None,
         latent_distribution=None,
@@ -82,7 +81,7 @@ def _blank_args() -> SimpleNamespace:
         head_hidden_dim_multiplier=None,
         # None = leave config.py unchanged (do not re-stamp every run)
         no_causal=None, no_reconstruction=None, no_look_price=None,
-        use_binance=None, symbol=None,
+        symbol=None,
         train_ratio=None, val_ratio=None,
         no_validate=None, validate_every=None, val_batch_size=None,
         # simplified extras
@@ -98,7 +97,7 @@ def _add_shared(p: argparse.ArgumentParser, config: dict) -> None:
         help="Model: regression | vae (default from config)",
     )
     p.add_argument(
-        '--label', default=None, choices=list(label_cli_choices()),
+        '--label', default=None, choices=['trend', 'yield', 'latent', 'rise_flag', 'none'],
         help='Label: trend|yield|latent|rise_flag|none',
     )
     p.add_argument(

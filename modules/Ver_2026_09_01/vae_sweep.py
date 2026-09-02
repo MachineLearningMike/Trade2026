@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 import torch.optim as optim
 
-from task_base import bind_task_loss
+from trainer import _BoundTask
 from model_v_autoencoder import build_market_model, resolve_max_seq_len, wrap_model_loss
 from trainer import ResumableTrainer, generate_checkpoint_key
 
@@ -104,7 +104,7 @@ def run_hparam_sweep(
     ``task`` is the caller-owned Task handed to the dataset / trainer.
     """
     from data import ThreadedDataLoader
-    from task_base import resolve_model_past_len
+    from INFER import _resolve_task
 
     if task is None:
         raise TypeError("run_hparam_sweep requires task= (caller-owned Task)")
@@ -137,7 +137,7 @@ def run_hparam_sweep(
     n_latent = int(cfg['n_latent_macros'])
     n_heads = int(cfg['num_heads'])
     _model_past_len = int(
-        getattr(dataset, 'model_past_len', resolve_model_past_len(cfg))
+        getattr(dataset, 'model_past_len', _resolve_task(cfg).resolve_model_past_len(cfg))
     )
     cfg['output_dim'] = int(dataset.output_dim)
     extend_epochs = float(extend_epochs)
@@ -252,19 +252,15 @@ def run_hparam_sweep(
                 )
                 model = model.to(device)
 
-                base_loss = bind_task_loss(
-                    task,
-                    trial_cfg,
-                    yield_target=getattr(
-                        dataset, 'yield_target', trial_cfg.get('yield_target', 'both')
-                    ),
-                    latent_distribution=getattr(
-                        dataset,
-                        'latent_distribution',
-                        trial_cfg.get('latent_distribution', 'normal'),
-                    ),
+                def _label_loss(x, pred, y):
+                    if isinstance(pred, (tuple, list)):
+                        pred = pred[0]
+                    return task.loss(x, pred, y, trial_cfg)
+
+                loss_fn = wrap_model_loss(model, _label_loss, trial_cfg)
+                train_task = _BoundTask(
+                    task, config=trial_cfg, loss_callable=loss_fn,
                 )
-                loss_fn = wrap_model_loss(model, base_loss, trial_cfg)
 
                 train_loader = ThreadedDataLoader(
                     dataset.train_dataset,
@@ -280,26 +276,21 @@ def run_hparam_sweep(
                     model.parameters(), lr=trial_cfg['learning_rate']
                 )
                 trainer = ResumableTrainer(
-                    dataset_signature=dataset.cache_key,
+                    task=train_task,
                     model=model,
-                    loss_fn=loss_fn,
                     optimizer=optimizer,
                     dataloader=train_loader,
-                    task=task,
-                    save_dir=trial_cfg['checkpoint_dir'],
-                    device=trial_cfg['device'],
-                    save_every_n_minutes=trial_cfg['save_every_n_minutes'],
                     val_loader=val_loader,
-                    enable_validation=True,
-                    validate_every_n_epochs=1,
-                    # Must pass trial key: otherwise trainer re-hashes get_config()
-                    # (default patch/layers) and every sweep trial shares one folder.
+                    dataset_signature=dataset.cache_key,
                     checkpoint_key=ckpt_key,
-                    embed_dim=trial_cfg['embed_dim'],
-                    max_seq_len=trial_cfg['max_seq_len'],
+                    save_dir=trial_cfg['checkpoint_dir'],
                     recent_checkpoints=trial_cfg.get(
                         'recent_checkpoints', trial_cfg.get('max_checkpoints', 3)
                     ),
+                    save_every_n_minutes=trial_cfg['save_every_n_minutes'],
+                    device=trial_cfg['device'],
+                    enable_validation=True,
+                    validate_every_n_epochs=1,
                 )
 
                 key_dir = Path(trial_cfg['checkpoint_dir']) / ckpt_key

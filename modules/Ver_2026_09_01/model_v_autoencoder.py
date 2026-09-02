@@ -17,7 +17,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import get_config
-from task_base import resolve_model_past_len
 from model_regression import (
     Depatch,
     PatchEmbed,
@@ -90,30 +89,28 @@ def build_market_model(
     return MarketRegressionWithHeads(**common)
 
 
-def unpack_model_input(sample_or_batch):
-    """ModelSpec.unpack_input — see sample_batch.unpack_model_input."""
-    from data import unpack_model_input as _unpack
-    return _unpack(sample_or_batch)
+def unpack_model_input(sample_or_batch, task=None):
+    """Model forward kwargs from a datapoint via the active task."""
+    assert task is not None
+    kwargs, _y = task.unpack_datapoint(sample_or_batch)
+    return kwargs
 
 
 def wrap_loss(model: nn.Module, label_loss_fn, config: dict, objective: Optional[str] = None):
     """
-    ModelSpec.wrap_loss — compose train loss from COMPAT objective.
+    Compose train loss.
 
     objective:
-      'supervised'   → label_loss_fn only (regression × true label)
-      'unsupervised' → VAE recon+KL only; y ignored (vae × none)
-    If objective is None, resolved from config via compat/COMPAT.
+      'supervised'   → label_loss_fn only
+      'unsupervised' → VAE recon+KL only; y ignored
+    If objective is None: vae → unsupervised, else supervised.
     """
-    from task_base import assert_config_compatible
-    from task_base import normalize_model_id
-
+    model_id = str(config.get('model_type', 'regression')).lower().strip()
     if objective is None:
-        objective = assert_config_compatible(config)
+        objective = 'unsupervised' if model_id == 'vae' else 'supervised'
 
     recon_w = float(config.get('reconstruction_loss_weight', 1.0))
     kl_w = float(config.get('vae_kl_weight', 0.1))
-    model_id = normalize_model_id(config.get('model_type', 'regression'))
 
     if objective == 'supervised':
         def loss_fn(x, pred, y):
@@ -156,7 +153,7 @@ def wrap_loss(model: nn.Module, label_loss_fn, config: dict, objective: Optional
         return loss_fn
 
     raise ValueError(
-        f"Unknown COMPAT objective {objective!r}; expected "
+        f"Unknown objective {objective!r}; expected "
         f"'supervised' or 'unsupervised'"
     )
 
@@ -522,7 +519,7 @@ if __name__ == "__main__":
     feat_dim = n_market + n_macro
     S = int(config.get('num_momentum', 4))
     max_seq_len = resolve_vae_max_seq_len(T, P)
-    n_max_past = int(resolve_model_past_len(config))
+    n_max_past = int(config.get('future_window', config.get('past_window', 50)))
 
     model = MarketVAEWithHeads(
         in_features=feat_dim,

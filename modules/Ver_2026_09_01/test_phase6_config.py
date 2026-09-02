@@ -67,7 +67,6 @@ def main() -> int:
         validate_every = 1
         val_batch_size = 16
         telepred_delay = 0
-        use_binance = False
         symbol = 'BTCUSDT'
         no_causal = True
         no_reconstruction = True

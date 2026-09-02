@@ -13,7 +13,10 @@ from torch.distributions import StudentT
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 
-from task_base import Task
+from task_base import (
+    Task,
+    scale_prices_by_window_moments,
+)
 
 
 class Task_Latent(Task):
@@ -343,48 +346,25 @@ class Task_Latent(Task):
         return (float(fut[0]),)
 
     @classmethod
-    def make_auxiliary(cls, config: Optional[dict] = None, **overrides) -> dict:
-        """
-        Loss knobs for latent density NLL.
-
-        Keys: latent_weight, latent_distribution, output_dim
-        """
-        cfg = config or {}
-        dist = cls.resolve_latent_distribution(cfg, **overrides)
-        aux = {
-            'latent_weight': float(cfg.get('latent_loss_weight', 1.0)),
-            'latent_distribution': dist,
-            'output_dim': cls.resolve_output_dim(cfg, latent_distribution=dist),
-        }
-        for k, v in overrides.items():
-            if v is not None and k != 'latent_distribution':
-                aux[k] = v
-        return aux
-
-    @classmethod
     def loss(
         cls,
         x: torch.Tensor,
         y_pred: torch.Tensor,
         y_truth: torch.Tensor,
-        auxiliary: Optional[dict] = None,
+        config: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         Negative log-likelihood under the configured density.
-
-        Signature (same call shape as trend/yield; different semantics)::
-
-            loss(x: Tensor, y_pred: Tensor, y_truth: Tensor, auxiliary=None)
 
         y_pred:
           normal  → (B, 2) = (mu, var_raw)
           student → (B, 3) = (location, scale_raw, df_raw)
         y_truth:
-          (B,) or (B, 1) realized next-bar price future[0] (cache dim 1)
+          (B,) or (B, 1) realized next-bar price future[0]
         """
-        aux = auxiliary or {}
-        weight = float(aux.get('latent_weight', 1.0))
-        dist = cls.resolve_latent_distribution(aux)
+        cfg = config or {}
+        weight = float(cfg.get('latent_loss_weight', 1.0))
+        dist = cls.resolve_latent_distribution(cfg)
 
         if not torch.is_tensor(y_pred):
             raise TypeError(
@@ -451,16 +431,18 @@ class Task_Latent(Task):
         y_pred: torch.Tensor,
         y_truth: torch.Tensor,
         *,
-        auxiliary: Optional[dict] = None,
         dataset=None,
         config: Optional[dict] = None,
         **_kwargs,
     ) -> dict:
-        cfg = dict(config or {})
-        aux = cls.make_auxiliary(cfg, **(auxiliary or {}))
-        dist = cls.resolve_latent_distribution(aux)
+        cfg = config or {}
+        dist = cls.resolve_latent_distribution(cfg)
         metrics = {
-            'nll': float(cls.loss(y_pred, y_pred, y_truth, auxiliary=aux).item()),
+            'nll': float(
+                cls.loss(
+                    torch.zeros(1), y_pred, y_truth, config=cfg,
+                ).item()
+            ),
         }
         loc_n, scale_n, df_t = cls.decode_latent_params(
             y_pred, latent_distribution=dist
@@ -472,9 +454,13 @@ class Task_Latent(Task):
             return metrics
         loc_obs, scale_obs = cls.latent_params_to_obs_space(
             loc_n, scale_n,
-            dataset._label_stat_mean, dataset._label_stat_std,
+            dataset.label_stat_mean, dataset.label_stat_std,
         )
-        y_obs = dataset.denormalize_y(y_truth.detach().cpu()).reshape(-1)
+        y_obs = cls.denormalize(
+            y_truth.detach().cpu(),
+            dataset.label_stat_mean,
+            dataset.label_stat_std,
+        ).reshape(-1)
         loc_obs = loc_obs.reshape(-1).to(y_obs.device)
         scale_obs = scale_obs.reshape(-1).to(y_obs.device)
         metrics['location_mae'] = float((loc_obs - y_obs).abs().mean().item())
@@ -498,16 +484,24 @@ class Task_Latent(Task):
         return {k: metrics[k] for k in slots if k in metrics}
 
     @classmethod
-    def normalize_policy(cls) -> str:
-        return 'zscore'
-
-    @classmethod
     def normalize(cls, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-        return cls.zscore_normalize(y, mean, std)
+        mean = mean.to(device=y.device, dtype=y.dtype)
+        std = std.to(device=y.device, dtype=y.dtype)
+        if y.shape[-1] != mean.shape[-1]:
+            raise ValueError(
+                f"y last dim {tuple(y.shape)} incompatible with mean {tuple(mean.shape)}"
+            )
+        return (y - mean) / (std + 1e-8)
 
     @classmethod
     def denormalize(cls, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-        return cls.zscore_denormalize(y, mean, std)
+        mean = mean.to(device=y.device, dtype=y.dtype)
+        std = std.to(device=y.device, dtype=y.dtype)
+        if y.shape[-1] != mean.shape[-1]:
+            raise ValueError(
+                f"y last dim {tuple(y.shape)} incompatible with mean {tuple(mean.shape)}"
+            )
+        return y * std + mean
 
     @classmethod
     def bind_dataset_outputs(cls, config: dict) -> dict:
@@ -525,7 +519,6 @@ class Task_Latent(Task):
             'output_dim': forced_dim,
             'latent_dim': forced_dim,
             'label_slice': cls.target_slice(forced_dim),
-            'normalize_policy': cls.normalize_policy(),
         }
 
     @classmethod
@@ -534,10 +527,29 @@ class Task_Latent(Task):
         return int(config['output_dim'])
 
     @classmethod
-    def build_cache_row(cls, ctx: 'WindowContext', config: dict) -> torch.Tensor:
-        future_for_label, history_for_label = cls.scale_prices_by_window_moments(
-            ctx.future_prices, ctx.history_prices, ctx.mean, ctx.std,
-            ctx.price_feature_idx, ctx.normalize_window,
+    def build_raw_y(
+        cls, t, total_x, total_p, config, *, mean, std,
+    ) -> torch.Tensor:
+        from telepred import windows_for_sample
+
+        del total_x
+        delay = int(config.get('telepred_delay', 0))
+        past = int(config['past_window'])
+        future = int(config.get('future_window', cls.resolve_future_window(config)))
+        win = windows_for_sample(int(t), delay, past, future)
+        p = total_p.reshape(-1)
+        two_layer = (
+            str(config.get('normalization_layers', 'two-layer'))
+            .strip().lower().replace('_', '-')
+            in ('two-layer', 'twolayer', '2-layer', '2layer')
+        )
+        future_for_label, history_for_label = scale_prices_by_window_moments(
+            p[win['future']],
+            p[win['label_history']],
+            mean,
+            std,
+            int(config.get('price_feature_idx', 0)),
+            two_layer,
         )
         result = cls.find(future_for_label, history_for_label)
         if isinstance(result, (tuple, list)):
@@ -546,20 +558,49 @@ class Task_Latent(Task):
             y_obs = float(result.item() if hasattr(result, 'item') else result)
         return torch.tensor([y_obs], dtype=torch.float32)
 
+
+    @classmethod
+    def cache_intra_fields(cls, config):
+        return dict(cls.signature_fields(config))
+
+    @classmethod
+    def pack_datapoint(cls, dataset, idx):
+        from task_base import pack_datapoint as _pack
+        return _pack(cls, dataset, idx)
+
+    @classmethod
+    def unpack_datapoint(cls, batch):
+        from task_base import unpack_datapoint as _unpack
+        return _unpack(cls, batch)
+
+    @classmethod
+    def print_prediction_samples(cls, preds, test_labels, *, dataset=None,
+                                 yield_target=None, latent_dist=None, n=5):
+        return None
+
+    @classmethod
+    def report_header_fields(cls, dataset, config=None):
+        return {}
+
+    @classmethod
+    def postprocess_predictions(cls, preds, dataset):
+        from task_base import postprocess_predictions as _post
+        return _post(cls, preds, dataset)
+
+    @classmethod
+    def visualize_inference(cls, *args, **kwargs):
+        viz = getattr(cls, 'visualize', None)
+        if viz is None:
+            print(f"⚠ {cls.name}: no visualize() for inference plots")
+            return None
+        return viz(*args, **kwargs)
+
     @classmethod
     def signature_fields(cls, config: Mapping[str, Any]) -> Dict[str, Any]:
         return {
             'latent_distribution': config.get('latent_distribution', 'normal'),
         }
 
-    @classmethod
-    def dataset_banner_lines(cls, *, bound, config, dataset) -> List[str]:
-        return [
-            f"  latent_distribution: "
-            f"{bound.get('latent_distribution', config.get('latent_distribution'))}",
-            f"  model output_dim (density params): {bound.get('output_dim')}",
-            f"  label cache dim (observation): {1}",
-        ]
 
     @classmethod
     def format_metric_lines(cls, metrics: Mapping[str, Any]) -> List[str]:
@@ -623,9 +664,13 @@ class Task_Latent(Task):
         )
         loc_obs, scale_obs = cls.latent_params_to_obs_space(
             loc_n, scale_n,
-            dataset._label_stat_mean, dataset._label_stat_std,
+            dataset.label_stat_mean, dataset.label_stat_std,
         )
-        y_obs = dataset.denormalize_y(test_labels.detach().cpu()).reshape(-1)
+        y_obs = cls.denormalize(
+            test_labels.detach().cpu(),
+            dataset.label_stat_mean,
+            dataset.label_stat_std,
+        ).reshape(-1)
         loc_obs = loc_obs.reshape(-1).to(y_obs.device)
         scale_obs = scale_obs.reshape(-1).to(y_obs.device)
         if df_t is None:

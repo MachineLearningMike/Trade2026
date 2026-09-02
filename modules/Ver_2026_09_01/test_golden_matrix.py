@@ -2,7 +2,7 @@
 """
 Phase 7 golden smoke matrix (§0 COMPAT + ensemble kinds).
 
-CPU / synthetic / 1 epoch. Proves each atomic cell trains + infers, plus
+CPU / 1 epoch. Proves each atomic cell trains + infers, plus
 TelePred (delays 0,2) and ErrorEnsemble (n=2).
 
 Usage::
@@ -34,11 +34,11 @@ def _finite(x) -> bool:
 
 
 def _train_infer_cell(model_type: str, label: str, cell_dir: Path, **overrides):
-    from test_phase1_smoke import _smoke_config as base_smoke_config, _build_synthetic_dataset as build_synthetic_dataset
-    from train_run import train_one_run
+    from test_phase1_smoke import _smoke_config as base_smoke_config, _build_dataset as build_dataset
+    from trainer import train_one_run
     from trainer import generate_checkpoint_key
     from INFER import run_test
-    import dataset_build
+    import data as data_mod
     import INFER as infer_mod
 
     if cell_dir.exists():
@@ -51,16 +51,17 @@ def _train_infer_cell(model_type: str, label: str, cell_dir: Path, **overrides):
         label=label,
         **overrides,
     )
-    dataset, total, task = build_synthetic_dataset(cfg)
+    dataset, total, task = build_dataset(cfg)
     assert len(dataset) >= 4
 
-    def _fake_get_dataset(_c, task=None):
+    def _FakeTradingDataset(_c, task=None):
         # Rebuild with the *caller* config (delay/stage may differ).
-        ds, tot, _t = build_synthetic_dataset(_c)
-        return ds, tot
+        ds, tot, _t = build_dataset(_c)
+        ds.total_features = tot
+        return ds
 
-    dataset_build.get_dataset = _fake_get_dataset
-    infer_mod.get_dataset = _fake_get_dataset
+    data_mod.TradingDataset = _FakeTradingDataset
+    infer_mod.TradingDataset = _FakeTradingDataset
 
     outcome = train_one_run(
         cfg,
@@ -95,7 +96,7 @@ def _train_infer_cell(model_type: str, label: str, cell_dir: Path, **overrides):
 
 
 def _telepred_bank(cell_dir: Path):
-    from test_phase1_smoke import _smoke_config as base_smoke_config, _build_synthetic_dataset as build_synthetic_dataset
+    from test_phase1_smoke import _smoke_config as base_smoke_config, _build_dataset as build_dataset
     from ensemble_train import run_ensemble_train
 
     if cell_dir.exists():
@@ -110,8 +111,9 @@ def _telepred_bank(cell_dir: Path):
     )
 
     def _gd(c, task=None):
-        ds, tot, _t = build_synthetic_dataset(c)
-        return ds, tot
+        ds, tot, _t = build_dataset(c)
+        ds.total_features = tot
+        return ds
 
     results = run_ensemble_train(
         cfg,
@@ -133,7 +135,7 @@ def _telepred_bank(cell_dir: Path):
 
 
 def _error_ensemble(cell_dir: Path):
-    from test_phase1_smoke import _smoke_config as base_smoke_config, _build_synthetic_dataset as build_synthetic_dataset
+    from test_phase1_smoke import _smoke_config as base_smoke_config, _build_dataset as build_dataset
     from error_ensemble import (
         count_finished_error_ensemble_stages,
         run_error_ensemble_train,
@@ -149,7 +151,7 @@ def _error_ensemble(cell_dir: Path):
         yield_target='near',
         error_ensemble_n=2,
     )
-    dataset, total, task = build_synthetic_dataset(cfg)
+    dataset, total, task = build_dataset(cfg)
     out = run_error_ensemble_train(
         cfg,
         dataset,

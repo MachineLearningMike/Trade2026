@@ -46,9 +46,7 @@ def resolve_delta1(config: dict) -> int:
 
 def resolve_delta2(config: dict) -> int:
     """TelePred delta2 / label future length (bars)."""
-    from task_base import resolve_future_window
-
-    return int(resolve_future_window(config))
+    return int(config.get('future_window', 50))
 
 
 def resolve_delay(config: dict) -> int:

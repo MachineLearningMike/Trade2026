@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase 4 smoke: COMPAT product coercion, wrap_loss, ensemble specs, head dims."""
+"""Phase 4 smoke: wrap_loss, ensemble specs, head dims."""
 from __future__ import annotations
 
 import traceback
@@ -9,31 +9,16 @@ import torch.nn as nn
 
 
 def main() -> int:
-    from task_base import CompatibilityError, assert_compatible, resolve_atomic_slot
     from ensemble_spec import EnsembleModelSpec, LabelCollection, describe_ensemble
     from model_regression import PredictionHead
     from model_v_autoencoder import wrap_loss
 
-    # output_dim relaxed
     h = PredictionHead(8, 16, output_dim=5)
     assert h.output_dim == 5
     try:
         PredictionHead(8, 16, output_dim=0)
         raise AssertionError('expected fail on output_dim=0')
     except ValueError:
-        pass
-
-    # vae ⇒ none coerce
-    cfg = {'model_type': 'vae', 'label': 'yield'}
-    obj = resolve_atomic_slot(cfg, coerce_vae_to_none=True, warn=False)
-    assert obj == 'unsupervised'
-    assert cfg['label'] == 'none'
-
-    assert assert_compatible('regression', 'rise_flag') == 'supervised'
-    try:
-        assert_compatible('vae', 'yield')
-        raise AssertionError('vae+yield must fail without coerce')
-    except CompatibilityError:
         pass
 
     # wrap_loss supervised vs unsupervised
@@ -63,7 +48,6 @@ def main() -> int:
     loss = unsup(torch.zeros(2, 3, 4), pred, y)
     assert float(loss) > 0.0
 
-    # Ensemble specs
     tele = EnsembleModelSpec.telepred('regression', 'yield', [0, 2, 5])
     assert tele.kind == 'telepred'
     assert len(tele.members) == 3

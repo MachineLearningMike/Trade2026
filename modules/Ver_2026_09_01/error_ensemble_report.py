@@ -27,8 +27,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from config import get_config, project_root_dir
-from task_base import bind_task_loss, get_task_class, sync_output_dim
-from data import generate_dataset_signature
+from INFER import _resolve_task
+from data import TradingDataset
 from trainer import (
     LatestEpochLoss,
     TrainingHistory,
@@ -178,7 +178,7 @@ def _plot_ensemble_vs_stage(
 
     en_k = model_0 + ... + model_k
     """
-    task = get_task_class(label_mode)
+    task = _resolve_task({'label': label_mode})
 
     artifacts: Dict[str, Optional[str]] = {
         "ensemble_performance_vs_stage": None,
@@ -316,17 +316,12 @@ def _evaluate_loaded_ensemble(
     device = torch.device(cfg["device"] if cfg.get("device") else "cpu")
     label_norm = label_norm_from_dataset(dataset)
 
-    task = get_task_class(cfg.get("label", "yield"))
-    loss_fn = bind_task_loss(
-        task,
-        cfg,
-        yield_target=getattr(dataset, "yield_target", cfg.get("yield_target", "both")),
-        latent_distribution=getattr(
-            dataset,
-            "latent_distribution",
-            cfg.get("latent_distribution", "normal"),
-        ),
-    )
+    task = _resolve_task(cfg)
+
+    def loss_fn(x, y_pred, y_truth):
+        if isinstance(y_pred, (tuple, list)):
+            y_pred = y_pred[0]
+        return task.loss(x, y_pred, y_truth, cfg)
 
     bs_train = int(cfg.get("batch_size", 32))
     bs_val = int(cfg.get("validate_batch_size", bs_train))
@@ -400,228 +395,14 @@ def _write_label_metric_reports(
     summary: Dict,
     ckpt_root: Path,
 ) -> None:
-    """
-    Write label metric ``report.text`` for each member and each en_k.
-
-    Members: best_val weights, val+test via INFER streaming.
-    Ensembles: reuse metrics attached during wholesale en_k eval (val+test).
-    """
-    from task_base import (
-        evaluate_checkpoint_key_metrics,
-        get_task_class,
-        metrics_to_jsonable,
-        write_metrics_report_text,
+    """Label metrics report — rebuild on Tasks later."""
+    del cfg, dataset, report_dir, report_name, stage_keys, ckpt_root
+    print(
+        "⚠ Label metrics report export removed from task_base; "
+        "rebuild on Tasks later."
     )
+    summary["label_metrics_skipped"] = True
 
-    task = get_task_class(cfg.get("label", "trend"))
-    label_mode = task.name
-    model_type = str(cfg.get("model_type", "regression"))
-    slots = list(task.metric_slots())
-    summary["metric_slots"] = slots
-    summary["label_metrics_note"] = task.metrics_report_note(cfg)
-    summary_headers = tuple(task.summary_metric_headers())
-    summary["summary_metric_headers"] = list(summary_headers)
-
-    member_rows: List[Dict] = []
-    print("\n📊 Per-member label metrics (best_val, val+test)...")
-    for stage, key in enumerate(stage_keys):
-        stage_dir = report_dir / f"model_{stage}"
-        stage_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            m = evaluate_checkpoint_key_metrics(
-                cfg, dataset, key, checkpoint_dir=ckpt_root, task=task,
-            )
-        except Exception as exc:
-            print(f"  ⚠ model_{stage} metrics failed: {exc}")
-            member_rows.append(
-                {
-                    "stage": stage,
-                    "model": f"model_{stage}",
-                    "checkpoint_key": key,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
-            continue
-        write_metrics_report_text(
-            stage_dir,
-            report_name=f"{report_name}/model_{stage}",
-            label_mode=label_mode,
-            model_type=model_type,
-            checkpoint_key=str(m.get("checkpoint_key", key)),
-            checkpoint_path=str(m.get("checkpoint_path", "")),
-            val_metrics=m.get("val_metrics"),
-            test_metrics=m.get("test_metrics"),
-            val_n=m.get("val_n"),
-            test_n=m.get("test_n"),
-            extra_header={
-                "Entity": f"model_{stage} (member best_val)",
-                "Dataset signature": getattr(dataset, "cache_key", None),
-            },
-        )
-        row = {
-            "stage": stage,
-            "model": f"model_{stage}",
-            "checkpoint_key": m.get("checkpoint_key", key),
-            "checkpoint_path": m.get("checkpoint_path"),
-            "val_n": m.get("val_n"),
-            "test_n": m.get("test_n"),
-            "val_metrics": metrics_to_jsonable(m.get("val_metrics")),
-            "test_metrics": metrics_to_jsonable(m.get("test_metrics")),
-        }
-        member_rows.append(row)
-        # Attach onto existing stage summary entry when present.
-        for s in summary.get("stages") or []:
-            if int(s.get("stage", -1)) == stage:
-                s["label_metrics"] = {
-                    "val": row["val_metrics"],
-                    "test": row["test_metrics"],
-                    "val_n": row["val_n"],
-                    "test_n": row["test_n"],
-                    "report_text": f"model_{stage}/report.text",
-                }
-                break
-        vm = m.get("val_metrics") or {}
-        cells = task.format_summary_metric_cells(vm)
-        print(
-            f"  model_{stage}: val "
-            + " ".join(f"{h}={c}" for h, c in zip(summary_headers, cells))
-        )
-
-    summary["member_label_metrics"] = member_rows
-
-    ens = summary.get("ensemble_over_stages") or {}
-    en_rows: List[Dict] = []
-    print("\n📊 Per-ensemble en_k label metrics (from wholesale val/test)...")
-    val_by_k = {
-        int(r.get("k", int(r["n_stages"]) - 1)): r
-        for r in (ens.get("val") or [])
-    }
-    test_by_k = {
-        int(r.get("k", int(r["n_stages"]) - 1)): r
-        for r in (ens.get("test") or [])
-    }
-    for k in sorted(set(val_by_k) | set(test_by_k)):
-        en_dir = report_dir / f"en_{k}"
-        en_dir.mkdir(parents=True, exist_ok=True)
-        va = val_by_k.get(k) or {}
-        te = test_by_k.get(k) or {}
-        va_m = va.get("label_metrics")
-        te_m = te.get("label_metrics")
-        write_metrics_report_text(
-            en_dir,
-            report_name=f"{report_name}/en_{k}",
-            label_mode=label_mode,
-            model_type=model_type,
-            checkpoint_key=",".join(
-                str(x) for x in (ens.get("keys_loaded") or stage_keys)[: k + 1]
-            ),
-            checkpoint_path=f"ensemble en_{k} (flat y-space sum)",
-            val_metrics=va_m,
-            test_metrics=te_m,
-            val_n=va.get("n_examples"),
-            test_n=te.get("n_examples"),
-            extra_header={
-                "Entity": f"en_{k}",
-                "Definition": va.get("definition") or te.get("definition"),
-                "Note": summary.get("label_metrics_note"),
-            },
-        )
-        en_rows.append(
-            {
-                "k": k,
-                "ensemble": f"en_{k}",
-                "definition": va.get("definition") or te.get("definition"),
-                "val_n": va.get("n_examples"),
-                "test_n": te.get("n_examples"),
-                "val_metrics": metrics_to_jsonable(va_m),
-                "test_metrics": metrics_to_jsonable(te_m),
-                "report_text": f"en_{k}/report.text",
-            }
-        )
-        if va_m:
-            cells = task.format_summary_metric_cells(va_m)
-            print(
-                f"  en_{k}: val "
-                + " ".join(f"{h}={c}" for h, c in zip(summary_headers, cells))
-            )
-
-    summary["ensemble_label_metrics"] = en_rows
-
-    # Overview report.text at report root.
-    overview_lines = [
-        f"Report:           {report_name}",
-        f"Label:            {label_mode}",
-        f"Model:            {model_type}",
-        f"Metric slots:    {slots}",
-        f"Note:             {summary.get('label_metrics_note')}",
-        "",
-        "=== Members (best_val) ===",
-        "",
-    ]
-    for row in member_rows:
-        overview_lines.append(f"--- {row.get('model')} key={row.get('checkpoint_key')} ---")
-        if row.get("error"):
-            overview_lines.append(f"  error: {row['error']}")
-            overview_lines.append("")
-            continue
-        overview_lines.append(f"  val n={row.get('val_n')}")
-        overview_lines.extend(
-            list(task.format_metric_lines(row.get("val_metrics") or {}))
-        )
-        overview_lines.append(f"  test n={row.get('test_n')}")
-        overview_lines.extend(
-            list(task.format_metric_lines(row.get("test_metrics") or {}))
-        )
-        overview_lines.append("")
-    overview_lines.append("=== Ensembles en_k (flat combine) ===")
-    overview_lines.append("")
-    for row in en_rows:
-        overview_lines.append(
-            f"--- {row.get('ensemble')} | {row.get('definition')} ---"
-        )
-        overview_lines.append(f"  val n={row.get('val_n')}")
-        overview_lines.extend(
-            list(task.format_metric_lines(row.get("val_metrics") or {}))
-        )
-        overview_lines.append(f"  test n={row.get('test_n')}")
-        overview_lines.extend(
-            list(task.format_metric_lines(row.get("test_metrics") or {}))
-        )
-        overview_lines.append("")
-    (report_dir / "report.text").write_text(
-        "\n".join(overview_lines).rstrip() + "\n", encoding="utf-8"
-    )
-    print(f"📄 Overview label metrics → {report_dir / 'report.text'}")
-
-    # Label-owned member vs ensemble metric plot (2×n series on one axes).
-    from task_base import plot_member_vs_ensemble_metrics
-
-    member_by_stage = []
-    for stage in range(len(stage_keys)):
-        row = next(
-            (r for r in member_rows if int(r.get("stage", -1)) == stage),
-            None,
-        )
-        member_by_stage.append((row or {}).get("val_metrics") or {})
-    ensemble_by_stage = []
-    for stage in range(len(stage_keys)):
-        row = next(
-            (r for r in en_rows if int(r.get("k", -1)) == stage),
-            None,
-        )
-        ensemble_by_stage.append((row or {}).get("val_metrics") or {})
-
-    plot_path = plot_member_vs_ensemble_metrics(
-        label_mode,
-        member_by_stage,
-        ensemble_by_stage,
-        save_path=report_dir / "label_metrics_member_vs_ensemble.png",
-        decision_threshold=task.decision_threshold_from_config(cfg),
-        split_name="val",
-    )
-    if plot_path is not None:
-        summary["label_metrics_plot"] = plot_path.name
-        print(f"📈 Member vs ensemble metrics → {plot_path}")
 
 
 def _discover_stage_keys_from_sidecars(
@@ -684,7 +465,7 @@ def build_report(
     )
 
     cfg = get_config()
-    sync_output_dim(cfg)
+    _resolve_task(cfg).sync_output_dim(cfg)
     n = int(cfg.get("error_ensemble_n", 3) or 3)
     ckpt_root = Path(cfg["checkpoint_dir"])
     if not ckpt_root.is_absolute():
@@ -693,7 +474,7 @@ def build_report(
     key_source = "cli"
     if stage_keys is None:
         # First try config-derived keys (cheap, no dataset load).
-        prelim_sig = generate_dataset_signature(cfg)
+        prelim_sig = TradingDataset.generate_dataset_signature(cfg, _resolve_task(cfg))
         prelim_keys = []
         for stage in range(n):
             c = dict(cfg)
@@ -734,19 +515,20 @@ def build_report(
             for k, v in run_cfg.items():
                 if v is not None and k != "error_ensemble_logic":
                     cfg[k] = v
-            sync_output_dim(cfg)
+            _resolve_task(cfg).sync_output_dim(cfg)
 
     # Prefer dataset.cache_key (same identity train_one_run uses) when available.
     if dataset is None and (eval_ensemble or key_source.startswith("discovered")):
-        from dataset_build import get_dataset
+        from data import TradingDataset
 
         print("Loading dataset for checkpoint-key identity + ensemble eval...")
-        dataset, total_features = get_dataset(cfg)
+        dataset = TradingDataset(cfg, _resolve_task(cfg))
+        total_features = dataset.total_features
 
     if dataset is not None and hasattr(dataset, "cache_key"):
         sig = str(dataset.cache_key)
     else:
-        sig = generate_dataset_signature(cfg)
+        sig = TradingDataset.generate_dataset_signature(cfg, _resolve_task(cfg))
 
     # If we only had prelim config keys, recompute with dataset.cache_key.
     if key_source == "config+signature" and dataset is not None:
@@ -888,10 +670,11 @@ def build_report(
     if eval_ensemble:
         try:
             if dataset is None:
-                from dataset_build import get_dataset
+                from data import TradingDataset
 
                 print("Loading dataset for ensemble-over-stages evaluation...")
-                dataset, total_features = get_dataset(cfg)
+                dataset = TradingDataset(cfg, _resolve_task(cfg))
+                total_features = dataset.total_features
             ens = _evaluate_loaded_ensemble(
                 cfg,
                 dataset,
@@ -911,7 +694,7 @@ def build_report(
                 label_mode=_label_for_plot,
             )
             if ens.get("train") or ens.get("val") or ens.get("test"):
-                _task_plot = get_task_class(_label_for_plot)
+                _task_plot = _resolve_task({'label': _label_for_plot})
                 _hdrs = _task_plot.summary_metric_headers()
                 print("Compare ensembles en_k = sum_{i=0..k} model_i:")
                 for split in ("train", "val", "test"):
@@ -942,10 +725,11 @@ def build_report(
     # ------------------------------------------------------------------
     try:
         if dataset is None:
-            from dataset_build import get_dataset
+            from data import TradingDataset
 
             print("Loading dataset for label metrics...")
-            dataset, total_features = get_dataset(cfg)
+            dataset = TradingDataset(cfg, _resolve_task(cfg))
+            total_features = dataset.total_features
         _write_label_metric_reports(
             cfg,
             dataset,
@@ -993,7 +777,7 @@ def build_report(
         "Invariant (Yield/MSE labels): loss(en_i, y) should not grow with i.",
         "",
     ]
-    _task_md = get_task_class(str(summary.get("label", "trend")))
+    _task_md = _resolve_task({'label': str(summary.get('label', 'trend'))})
     fn = getattr(_task_md, 'ensemble_logic_markdown_notes', None)
     if callable(fn):
         lines.extend(list(fn()))
@@ -1064,7 +848,7 @@ def build_report(
 
     # Label metric tables — column set owned by Task.summary_metric_headers
     _lab = str(summary.get("label", "trend"))
-    _task_tab = get_task_class(_lab)
+    _task_tab = _resolve_task({'label': _lab})
     _hdrs = list(
         summary.get("summary_metric_headers")
         or _task_tab.summary_metric_headers()

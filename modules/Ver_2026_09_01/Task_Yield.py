@@ -70,8 +70,8 @@ class Task_Yield(Task):
             pred_tensor=pred_cpu,
             fixed_order=True,
             sample_ids=list(used_indices),
-            label_mean=getattr(dataset, '_label_stat_mean', None),
-            label_std=getattr(dataset, '_label_stat_std', None),
+            label_mean=getattr(dataset, 'label_stat_mean', None),
+            label_std=getattr(dataset, 'label_stat_std', None),
         )
 
 
@@ -276,53 +276,21 @@ class Task_Yield(Task):
         return full
 
     @classmethod
-    def make_auxiliary(cls, config: Optional[dict] = None, **overrides) -> dict:
-        """
-        Class-private loss knobs for yield.
-
-        Keys: chance_weight, near_weight, yield_target
-        """
-        cfg = config or {}
-        yt = cls.resolve_yield_target(cfg, **overrides)
-        # near_loss_weight preferred; wait_loss_weight kept as legacy alias.
-        near_w = cfg.get('near_loss_weight', cfg.get('wait_loss_weight', 1.0))
-        aux = {
-            'chance_weight': float(cfg.get('chance_loss_weight', 1.0)),
-            'near_weight': float(near_w),
-            'yield_target': yt,
-        }
-        for k, v in overrides.items():
-            if k == 'yield_target':
-                continue
-            if k == 'wait_weight' and 'near_weight' not in overrides:
-                aux['near_weight'] = v
-                continue
-            if k == 'wait_loss_weight' and 'near_loss_weight' not in overrides:
-                aux['near_weight'] = float(v)
-                continue
-            aux[k] = v
-        return aux
-
-    @classmethod
     def loss(
         cls,
         x: torch.Tensor,
         y_pred: torch.Tensor,
         y_truth: torch.Tensor,
-        auxiliary: Optional[dict] = None,
+        config: Optional[dict] = None,
     ) -> torch.Tensor:
-        """
-        Uniform signature: loss(x, y_pred, y_truth, auxiliary).
-
-        MSE on model targets for the active yield_target.
-        ``x`` unused for yield (kept for API uniformity).
-        """
-        aux = auxiliary or {}
-        chance_weight = float(aux.get('chance_weight', 1.0))
+        """MSE on active yield_target channels. Knobs from ``config``."""
+        del x
+        cfg = config or {}
+        chance_weight = float(cfg.get('chance_loss_weight', 1.0))
         near_weight = float(
-            aux.get('near_weight', aux.get('wait_weight', 1.0))
+            cfg.get('near_loss_weight', cfg.get('wait_loss_weight', 1.0))
         )
-        yt = cls.resolve_yield_target(aux)
+        yt = cls.resolve_yield_target(cfg)
 
         out_dim = y_pred.shape[-1]
         if y_truth.shape[-1] != out_dim:
@@ -361,14 +329,12 @@ class Task_Yield(Task):
         y_pred: torch.Tensor,
         y_truth: torch.Tensor,
         *,
-        auxiliary: Optional[dict] = None,
         dataset=None,
         config: Optional[dict] = None,
         **_kwargs,
     ) -> dict:
-        cfg = dict(config or {})
-        if auxiliary:
-            cfg.update({k: v for k, v in auxiliary.items() if v is not None})
+        del dataset
+        cfg = config or {}
         yt = cls.resolve_yield_target(cfg)
         out_dim = int(y_pred.shape[-1])
         metrics = {}
@@ -403,16 +369,24 @@ class Task_Yield(Task):
         return {k: metrics[k] for k in slots if k in metrics}
 
     @classmethod
-    def normalize_policy(cls) -> str:
-        return 'zscore'
-
-    @classmethod
     def normalize(cls, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-        return cls.zscore_normalize(y, mean, std)
+        mean = mean.to(device=y.device, dtype=y.dtype)
+        std = std.to(device=y.device, dtype=y.dtype)
+        if y.shape[-1] != mean.shape[-1]:
+            raise ValueError(
+                f"y last dim {tuple(y.shape)} incompatible with mean {tuple(mean.shape)}"
+            )
+        return (y - mean) / (std + 1e-8)
 
     @classmethod
     def denormalize(cls, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-        return cls.zscore_denormalize(y, mean, std)
+        mean = mean.to(device=y.device, dtype=y.dtype)
+        std = std.to(device=y.device, dtype=y.dtype)
+        if y.shape[-1] != mean.shape[-1]:
+            raise ValueError(
+                f"y last dim {tuple(y.shape)} incompatible with mean {tuple(mean.shape)}"
+            )
+        return y * std + mean
 
     @classmethod
     def bind_dataset_outputs(cls, config: dict) -> dict:
@@ -429,7 +403,6 @@ class Task_Yield(Task):
             'output_dim': forced_dim,
             'latent_dim': forced_dim,
             'label_slice': cls.target_slice(forced_dim, yield_target=yt),
-            'normalize_policy': cls.normalize_policy(),
         }
 
     @classmethod
@@ -440,19 +413,65 @@ class Task_Yield(Task):
         return int(config['output_dim'])
 
     @classmethod
-    def build_cache_row(cls, ctx: 'WindowContext', config: dict) -> torch.Tensor:
-        future_window = int(config.get('future_window', 50))
+    def build_raw_y(
+        cls, t, total_x, total_p, config, *, mean, std,
+    ) -> torch.Tensor:
+        from telepred import windows_for_sample
+
+        del total_x, mean, std
+        delay = int(config.get('telepred_delay', 0))
+        past = int(config['past_window'])
+        future = int(config.get('future_window', cls.resolve_future_window(config)))
+        win = windows_for_sample(int(t), delay, past, future)
+        p = total_p.reshape(-1)
         result = cls.find(
-            ctx.future_prices,
-            ctx.current_price,
+            p[win['future']],
+            p[int(win['bot_time'])],
             min_yield_percent=float(config.get('min_yield_percent', 0.0)),
-            max_hope_future_horizon=future_window,
+            max_hope_future_horizon=future,
         )
         if len(result) == 1:
             chance, near = float(result[0]), 0.0
         else:
             chance, near = float(result[0]), float(result[1])
         return torch.tensor([chance, near], dtype=torch.float32)
+
+
+    @classmethod
+    def cache_intra_fields(cls, config):
+        return dict(cls.signature_fields(config))
+
+    @classmethod
+    def pack_datapoint(cls, dataset, idx):
+        from task_base import pack_datapoint as _pack
+        return _pack(cls, dataset, idx)
+
+    @classmethod
+    def unpack_datapoint(cls, batch):
+        from task_base import unpack_datapoint as _unpack
+        return _unpack(cls, batch)
+
+    @classmethod
+    def print_prediction_samples(cls, preds, test_labels, *, dataset=None,
+                                 yield_target=None, latent_dist=None, n=5):
+        return None
+
+    @classmethod
+    def report_header_fields(cls, dataset, config=None):
+        return {}
+
+    @classmethod
+    def postprocess_predictions(cls, preds, dataset):
+        from task_base import postprocess_predictions as _post
+        return _post(cls, preds, dataset)
+
+    @classmethod
+    def visualize_inference(cls, *args, **kwargs):
+        viz = getattr(cls, 'visualize', None)
+        if viz is None:
+            print(f"⚠ {cls.name}: no visualize() for inference plots")
+            return None
+        return viz(*args, **kwargs)
 
     @classmethod
     def signature_fields(cls, config: Mapping[str, Any]) -> Dict[str, Any]:
@@ -461,12 +480,6 @@ class Task_Yield(Task):
             'yield_target': config.get('yield_target', 'both'),
         }
 
-    @classmethod
-    def dataset_banner_lines(cls, *, bound, config, dataset) -> List[str]:
-        return [
-            f"  min_yield_percent: {config.get('min_yield_percent')}",
-            f"  yield_target: {bound.get('yield_target', config.get('yield_target'))}",
-        ]
 
     @classmethod
     def format_metric_lines(cls, metrics: Mapping[str, Any]) -> List[str]:

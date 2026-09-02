@@ -17,11 +17,25 @@ from tqdm import tqdm
 
 from config import get_config
 from model_v_autoencoder import build_market_model, resolve_max_seq_len, wrap_model_loss
-from task_base import resolve_model_past_len, bind_task_loss, get_task_class
+from task_base import normalize_x
 from trainer import generate_checkpoint_key
-from dataset_build import get_dataset
+from data import TradingDataset
 from telepred import resolve_past_window
-from task_base import Task
+
+
+def _resolve_task(config: dict):
+    """INFER owns the principal task: pick Task_* from config['label']."""
+    from Task_Trend import Task_Trend
+    from Task_Yield import Task_Yield
+    from Task_Latent import Task_Latent
+    from Task_Rise import Task_Rise
+    from Task_None import Task_None
+
+    name = str(config.get('label', 'trend')).strip().lower()
+    for cls in (Task_Trend, Task_Yield, Task_Latent, Task_Rise, Task_None):
+        if cls.name == name:
+            return cls
+    raise ValueError(f"Unknown task {name!r}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -194,7 +208,7 @@ def load_model(
     F = dataset.F
     n_max_past = int(
         getattr(dataset, 'model_past_len', None)
-        or resolve_model_past_len(config)
+        or dataset.task.resolve_model_past_len(config)
     )
     model = build_market_model(
         config,
@@ -218,11 +232,10 @@ def _collate_batch(dataset, indices: List[int]):
     Collates dataset dict samples, then returns
     (x, p, y, mean, std, momentum) for existing INFER call sites.
     """
-    from data import collate_samples, unpack_model_input, unpack_target
-    samples = [dataset[idx] for idx in indices]
-    batch = collate_samples(samples)
-    kwargs = unpack_model_input(batch)
-    y = unpack_target(batch)
+    from data import ThreadedDataLoader
+    datapoints = [dataset[idx] for idx in indices]
+    batch = ThreadedDataLoader.collate_datapoints(datapoints)
+    kwargs, y = dataset.task.unpack_datapoint(batch)
     return (
         kwargs['x'],
         kwargs['p'],
@@ -385,8 +398,8 @@ def run_inference_on_indices(
             else:
                 pred_chunks.append(task.postprocess_predictions(pred_cpu, dataset))
                 label_chunks.append(
-                    torch.stack(
-                        [dataset.denormalize_y(y[i]) for i in range(y.shape[0])]
+                    task.denormalize(
+                        y, dataset.label_stat_mean, dataset.label_stat_std
                     )
                 )
 
@@ -449,14 +462,13 @@ def _sample_observation_time(dataset, idx: int) -> int:
     return int(dataset.valid_starts[idx]) + int(dataset.past_window)
 
 
-def _item_at_observation_bar(dataset, t_obs: int):
+def _item_at_observation_bar(dataset, t_obs: int, task):
     """
     Build one model sample whose latent observation is bar ``t_obs``.
 
     History is ``Total[t_obs - past_window : t_obs]`` (ends one bar before
     the observation). Label is window-z of ``Total[t_obs]`` = future[0],
-    then dataset label-normalized — same convention as Task_Latent.find
-    + data.py latent labeling.
+    then task-normalized — same convention as Task_Latent.find.
     """
     pw = int(dataset.past_window)
     start = int(t_obs) - pw
@@ -467,7 +479,7 @@ def _item_at_observation_bar(dataset, t_obs: int):
     x = dataset.Total[start:start + pw]
     price_idx = int(dataset.price_feature_idx)
     if dataset.normalize:
-        _, mean, std, momentum = Task.normalize_x(x, compute_moments=True)
+        _, mean, std, momentum = normalize_x(x, compute_moments=True)
         std = std.clone()
         std[std == 0] = 1
         x_n = (x - mean) / std
@@ -485,7 +497,11 @@ def _item_at_observation_bar(dataset, t_obs: int):
         or 0
     )
     p = x_n[-n_p:, price_idx] if n_p else x_n.new_zeros(0)
-    y = dataset.normalize_y(obs_win.reshape(1).float())
+    y = task.normalize(
+        obs_win.reshape(1).float(),
+        dataset.label_stat_mean,
+        dataset.label_stat_std,
+    )
     st = dataset.stats
     mean_n = (mean - st['mean']['mean']) / (st['mean']['std'] + 1e-8)
     std_n = (std - st['std']['mean']) / (st['std']['std'] + 1e-8)
@@ -511,8 +527,12 @@ def collect_latent_price_series(
     At each t, history ends at t-1 and the density targets P(t)=future[0]
     (Task_Latent.find). t0 is the seed sample's observation bar.
     """
+    if task is None:
+        raise TypeError(
+            "collect_latent_price_series requires task= (caller-owned Task)"
+        )
     model.eval()
-    label_std = dataset._label_stat_std
+    label_std = dataset.label_stat_std
     normalize = bool(getattr(dataset, 'normalize_window', True))
     price_idx = int(dataset.price_feature_idx)
     pw = int(dataset.past_window)
@@ -546,7 +566,7 @@ def collect_latent_price_series(
                 raw_means, raw_stds = [], []
                 good_bars = []
                 for to in bars:
-                    item = _item_at_observation_bar(dataset, to)
+                    item = _item_at_observation_bar(dataset, to, task)
                     if item is None:
                         continue
                     x, p, mean_n, std_n, momentum_n, y, mean_r, std_r = item
@@ -568,19 +588,20 @@ def collect_latent_price_series(
                 std = torch.stack(stds).to(device, non_blocking=True)
                 momentum = torch.stack(momentums).to(device, non_blocking=True)
                 pred, _, _ = model(x, p, mean, std, momentum)
-                if task is None:
-                    raise TypeError(
-                        "collect_latent_price_series requires task= "
-                        "(caller-owned Task)"
-                    )
                 loc_n, scale_n, _df = task.decode_prediction_params(
                     pred.detach(), latent_distribution=latent_distribution
                 )
                 loc_n_cpu = loc_n.reshape(-1, 1).detach().cpu()
                 scale_n_cpu = scale_n.reshape(-1).detach().cpu()
-                loc_obs = dataset.denormalize_y(loc_n_cpu).reshape(-1)
+                loc_obs = task.denormalize(
+                    loc_n_cpu, dataset.label_stat_mean, dataset.label_stat_std
+                ).reshape(-1)
                 scale_obs = scale_n_cpu * label_std_s
-                y_obs = dataset.denormalize_y(y.reshape(-1, 1)).reshape(-1)
+                y_obs = task.denormalize(
+                    y.reshape(-1, 1),
+                    dataset.label_stat_mean,
+                    dataset.label_stat_std,
+                ).reshape(-1)
 
                 win_mean = torch.stack(raw_means)[:, price_idx].cpu().float()
                 win_std = torch.stack(raw_stds)[:, price_idx].cpu().float()
@@ -699,8 +720,9 @@ def run_test(
     )
 
     print("\nLoading dataset (same path as TRAIN)...", flush=True)
-    task = get_task_class(config.get('label', 'trend'))
-    dataset, total_features = get_dataset(config, task=task)
+    task = _resolve_task(config)
+    dataset = TradingDataset(config, task=task)
+    total_features = dataset.total_features
     # Align head width with resolved yield_target / trend slice / latent density
     config['output_dim'] = dataset.output_dim
     if task.name == 'yield':
@@ -752,16 +774,21 @@ def run_test(
     print(f"✓ Finished inference on {len(preds)} test samples", flush=True)
 
     out_dim = preds.shape[-1]
-    from task_base import report_test_metrics
-    metrics = report_test_metrics(
-        task=task,
-        preds=preds,
-        test_labels=test_labels,
-        config=config,
-        dataset=dataset,
-        print_samples=True,
-        n_samples=5,
+    packed = task.pack_metrics(
+        preds, test_labels, dataset=dataset, config=config,
     )
+    metrics = task.unpack_metrics(packed)
+    for k, v in packed.items():
+        metrics.setdefault(k, v)
+    print("\n📊 Test Set Results:")
+    print(f"  Metric slots:   {list(task.metric_slots())}")
+    for line in task.format_metric_lines(metrics):
+        print(line)
+    if task.name != 'none':
+        print("\n📈 Sample Predictions (first 5):")
+        task.print_prediction_samples(
+            preds, test_labels, dataset=dataset, n=5,
+        )
 
     if visualize:
         task.visualize_inference(
@@ -850,8 +877,8 @@ def run_validate(
     )
 
     print("\nLoading dataset (same path as TRAIN)...", flush=True)
-    task = get_task_class(config.get('label', 'trend'))
-    dataset, _total_features = get_dataset(config, task=task)
+    task = _resolve_task(config)
+    dataset = TradingDataset(config, task=task)
     config['output_dim'] = dataset.output_dim
     if task.name == 'yield':
         config['yield_target'] = getattr(dataset, 'yield_target', 'both')
@@ -955,15 +982,12 @@ def run_validate(
     model = load_model(checkpoint_path, config, dataset, device)
     print("✓ Model loaded successfully", flush=True)
 
-    _base_loss_fn = bind_task_loss(
-        task,
-        config,
-        yield_target=getattr(dataset, 'yield_target', config.get('yield_target', 'both')),
-        latent_distribution=getattr(
-            dataset, 'latent_distribution', config.get('latent_distribution', 'normal')
-        ),
-    )
-    loss_fn = wrap_model_loss(model, _base_loss_fn, config)
+    def _label_loss(x, pred, y):
+        if isinstance(pred, (tuple, list)):
+            pred = pred[0]
+        return task.loss(x, pred, y, config)
+
+    loss_fn = wrap_model_loss(model, _label_loss, config)
 
     model.eval()
     weighted_loss_sum = 0.0
@@ -1101,8 +1125,8 @@ def run_vae_compare(
     print("=" * 60 + "\n")
 
     print("Loading dataset...", flush=True)
-    task = get_task_class(config.get('label', 'yield'))
-    dataset, _ = get_dataset(config, task=task)
+    task = _resolve_task({**config, 'label': 'yield'})
+    dataset = TradingDataset(config, task=task)
     config['output_dim'] = dataset.output_dim
     if task.name != 'yield':
         print(
@@ -1130,9 +1154,10 @@ def run_vae_compare(
     print(f"Loading yield from: {yield_path}", flush=True)
     model_yield = load_model(yield_path, cfg_yield, dataset, device)
 
-    yield_aux = task.make_auxiliary(config)
-    chance_w = float(yield_aux.get('chance_weight', 1.0))
-    near_w = float(yield_aux.get('near_weight', yield_aux.get('wait_weight', 1.0)))
+    chance_w = float(config.get('chance_loss_weight', 1.0))
+    near_w = float(
+        config.get('near_loss_weight', config.get('wait_loss_weight', 1.0))
+    )
     yt = task.resolve_yield_target(config)
 
     val_sorted = sorted(dataset.val_indices)
@@ -1589,8 +1614,8 @@ def run_validate_yield(
         config['label'] = 'yield'
 
     print("\nLoading dataset (same path as TRAIN)...", flush=True)
-    task = get_task_class('yield')
-    dataset, _total_features = get_dataset(config, task=task)
+    task = _resolve_task({'label': 'yield'})
+    dataset = TradingDataset(config, task=task)
     config['output_dim'] = dataset.output_dim
     if task.name != 'yield':
         raise RuntimeError(
@@ -1743,8 +1768,8 @@ def run_validate_yield(
             pred_tensor=pred_cpu,
             fixed_order=True,
             sample_ids=list(used_indices),
-            label_mean=getattr(dataset, '_label_stat_mean', None),
-            label_std=getattr(dataset, '_label_stat_std', None),
+            label_mean=getattr(dataset, 'label_stat_mean', None),
+            label_std=getattr(dataset, 'label_stat_std', None),
         )
 
     print("\n✓ Validate-yield complete!", flush=True)

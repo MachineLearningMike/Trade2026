@@ -1,0 +1,29 @@
+Report:           t
+Label:            rise_flag
+Model:            regression
+Checkpoint key:   k
+Checkpoint path:  x
+Measure slots:    ['bce_with_logits', 'accuracy', 'true_positive', 'true_negative', 'false_positive', 'false_negative', 'tpr', 'tnr', 'fpr', 'fnr', 'precision', 'mean_prob', 'positive_rate_true', 'positive_rate_pred', 'decision_threshold']
+Entity: en_0
+
+=== Validation ===
+  n_samples:       4
+  BCE (logits):    0.3982
+  Accuracy @thr:   1.0000  (thr=0.5)
+  Confusion:       TP=2  TN=2  FP=0  FN=0
+  Rates:           TPR=1.0000  TNR=1.0000  FPR=0.0000  FNR=0.0000
+  Precision:       1.0000
+  Mean P(rise):    0.5313
+  True pos rate:   0.5000
+  Pred pos rate:   0.5000
+
+=== Test ===
+  n_samples:       4
+  BCE (logits):    0.3473
+  Accuracy @thr:   1.0000  (thr=0.5)
+  Confusion:       TP=2  TN=2  FP=0  FN=0
+  Rates:           TPR=1.0000  TNR=1.0000  FPR=0.0000  FNR=0.0000
+  Precision:       1.0000
+  Mean P(rise):    0.5266
+  True pos rate:   0.5000
+  Pred pos rate:   0.5000

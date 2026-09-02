@@ -16,7 +16,12 @@ from pathlib import Path
 from tqdm import tqdm
 from typing import Optional, Tuple, List, Dict, Any
 import matplotlib.pyplot as plt
-from config import get_config
+
+from model_v_autoencoder import build_market_model, resolve_max_seq_len, wrap_loss
+
+from model_regression import report_model_size, check_all_weights_updated
+
+from data import ThreadedDataLoader
 
 
 # ═══════════════════════════════════════════════════════════
@@ -73,11 +78,11 @@ def resolve_checkpoint_identity(config: dict) -> Tuple[str, str, Path]:
     Shared by TRAIN CLI modes (--history / --loss / --validation / --report /
     --clean) and any caller that must match ResumableTrainer's folder layout.
     """
-    from task_base import sync_output_dim
-    from data import generate_dataset_signature
+    from INFER import _resolve_task
+    from data import TradingDataset
 
-    sync_output_dim(config)
-    signature = generate_dataset_signature(config)
+    _resolve_task(config).sync_output_dim(config)
+    signature = TradingDataset.generate_dataset_signature(config, _resolve_task(config))
     key = generate_checkpoint_key(config, signature)
     key_dir = Path(config['checkpoint_dir']) / key
     return signature, key, key_dir
@@ -1484,66 +1489,47 @@ class ValidationEpochLoss:
 class ResumableTrainer:
     """
     Trainer with robust handling of all interruption scenarios and validation.
-    Optimized for speed with reduced overhead.
 
-    ``loss_fn`` must be the concrete label objective already, with signature::
-
-        loss_fn(x, y_pred, y_truth) -> scalar Tensor
-
-    typically ``task_base.bind_task_loss(task, config)``. ``task`` is owned
-    by TRAIN/INFER and stored on ``self.task`` — never read from a dataset.
-    The trainer does not dispatch on task id; all families share the same
-    model path.
+    Loss comes from ``task.loss`` (caller-owned Task). Never borrow from a dataset.
     """
-    
-    def __init__(self, dataset_signature,
-                model, loss_fn, optimizer, dataloader,
-                task=None,
-                save_dir='trading_checkpoints', device='cpu',
-                save_every_n_minutes=5,
-                val_loader=None, 
-                enable_validation=False, 
-                validate_every_n_epochs=1,
-                checkpoint_key=None,
-                embed_dim=None,
-                max_seq_len=None,
-                recent_checkpoints=None):
-        self.dataset_signature = dataset_signature
+
+    def __init__(
+        self,
+        # train objects
+        task,
+        model,
+        optimizer,
+        dataloader,
+        val_loader,
+        # checkpoint identity / persistence
+        dataset_signature,
+        checkpoint_key,
+        save_dir,
+        recent_checkpoints,
+        save_every_n_minutes,
+        # runtime policy
+        device,
+        enable_validation,
+        validate_every_n_epochs,
+    ):
+        self.task = task
         self.model = model.to(device)
-        self.loss_fn = loss_fn
         self.optimizer = optimizer
         self.dataloader = dataloader
-        if task is None:
-            raise TypeError(
-                "ResumableTrainer requires task= "
-                "(caller-owned Task from TRAIN/INFER; not from dataset)"
-            )
-        self.task = task
         self.val_loader = val_loader
-        self.device = device
-        self.embed_dim = embed_dim
-        self.max_seq_len = max_seq_len
 
-        self.enable_validation = enable_validation
-        self.validate_every_n_epochs = validate_every_n_epochs
-        
-        if checkpoint_key is None or recent_checkpoints is None:
-            config = get_config()
-            if checkpoint_key is None:
-                checkpoint_key = generate_checkpoint_key(config, self.dataset_signature)
-            if recent_checkpoints is None:
-                recent_checkpoints = config.get(
-                    'recent_checkpoints', config.get('max_checkpoints', 5)
-                )
-        
+        self.dataset_signature = dataset_signature
         self.checkpoint_key = checkpoint_key
-        
         self.state_manager = TrainingState(
             save_dir=save_dir,
             save_every_n_minutes=save_every_n_minutes,
             recent_checkpoints=recent_checkpoints,
-            checkpoint_key=checkpoint_key
+            checkpoint_key=checkpoint_key,
         )
+
+        self.device = device
+        self.enable_validation = enable_validation
+        self.validate_every_n_epochs = validate_every_n_epochs
         # Wall-clock anchor for periodic saves (set when train() starts).
         self._last_checkpoint_save_time = None
         
@@ -1614,8 +1600,8 @@ class ResumableTrainer:
                 latest_epoch_loss=self.latest_epoch_loss.to_dict() if self.latest_epoch_loss.batch_losses else None,
                 is_emergency=True,
                 training_finished=False,
-                embed_dim=getattr(self, 'embed_dim', None),
-                max_seq_len=getattr(self, 'max_seq_len', None),
+                embed_dim=getattr(getattr(self.model, 'active', self.model), 'embed_dim', None),
+                max_seq_len=getattr(getattr(self.model, 'active', self.model), 'max_seq_len', None),
             )
         except Exception as e:
             print(f"Emergency save failed: {e}")
@@ -1688,13 +1674,13 @@ class ResumableTrainer:
                 if batch is None:
                     break
                 
-                from data import batch_to_device, unpack_model_input, unpack_target
-                batch = batch_to_device(batch, self.device, non_blocking=True)
-                kwargs = unpack_model_input(batch)
+                from data import ThreadedDataLoader
+                batch = ThreadedDataLoader.batch_to_device(batch, self.device, non_blocking=True)
+                kwargs, y = self.task.unpack_datapoint(batch)
                 x = kwargs['x']
-                y = unpack_target(batch)
                 PRED = self.model(**kwargs)
-                LOSS = self.loss_fn(x, PRED, y)
+                pred = PRED[0] if isinstance(PRED, (tuple, list)) else PRED
+                LOSS = self.task.loss(x, pred, y)
                 batch_loss = float(LOSS.item())
                 total_loss += batch_loss
                 num_batches += 1
@@ -2006,8 +1992,8 @@ class ResumableTrainer:
                                 self.latest_epoch_loss.to_dict()
                                 if self.latest_epoch_loss.batch_losses else None
                             ),
-                            embed_dim=getattr(self, "embed_dim", None),
-                            max_seq_len=getattr(self, "max_seq_len", None),
+                            embed_dim=getattr(getattr(self.model, 'active', self.model), 'embed_dim', None),
+                            max_seq_len=getattr(getattr(self.model, 'active', self.model), 'max_seq_len', None),
                         )
                         print("\n" + "=" * 60)
                         print("✓ TRAINING COMPLETE FOR CURRENT PLAN")
@@ -2121,8 +2107,8 @@ class ResumableTrainer:
                                 loss=train_loss,
                                 val_loss=val_loss,
                                 history=self.history.to_dict(),
-                                embed_dim=getattr(self, 'embed_dim', None),
-                                max_seq_len=getattr(self, 'max_seq_len', None),
+                                embed_dim=getattr(getattr(self.model, 'active', self.model), 'embed_dim', None),
+                                max_seq_len=getattr(getattr(self.model, 'active', self.model), 'max_seq_len', None),
                             )
                         except Exception as e:
                             print(f"⚠ Failed to save best-val checkpoint: {e}")
@@ -2211,8 +2197,8 @@ class ResumableTrainer:
                             self.latest_epoch_loss.to_dict()
                             if self.latest_epoch_loss.batch_losses else None
                         ),
-                        embed_dim=getattr(self, "embed_dim", None),
-                        max_seq_len=getattr(self, "max_seq_len", None),
+                        embed_dim=getattr(getattr(self.model, 'active', self.model), 'embed_dim', None),
+                        max_seq_len=getattr(getattr(self.model, 'active', self.model), 'max_seq_len', None),
                     )
                     print(f"\n✓ Training complete!")
                     print(f"   Key: {self.checkpoint_key}")
@@ -2327,7 +2313,6 @@ class ResumableTrainer:
         
         model = self.model
         optimizer = self.optimizer
-        loss_fn = self.loss_fn
         device = self.device
         dataloader = self.dataloader
 
@@ -2369,15 +2354,15 @@ class ResumableTrainer:
                         
             compute_start = time.perf_counter()
             
-            from data import batch_to_device, unpack_model_input, unpack_target
-            batch = batch_to_device(batch, device, non_blocking=True)
-            kwargs = unpack_model_input(batch)
+            from data import ThreadedDataLoader
+            batch = ThreadedDataLoader.batch_to_device(batch, device, non_blocking=True)
+            kwargs, y = self.task.unpack_datapoint(batch)
             x = kwargs['x']
-            y = unpack_target(batch)
 
             optimizer.zero_grad()
             PRED = model(**kwargs)
-            LOSS = loss_fn(x, PRED, y)
+            pred = PRED[0] if isinstance(PRED, (tuple, list)) else PRED
+            LOSS = self.task.loss(x, pred, y)
             LOSS.backward()
             optimizer.step()
             batch_loss = LOSS.item()
@@ -2449,8 +2434,8 @@ class ResumableTrainer:
                     latest_epoch_loss=None,
                     is_emergency=False,
                     training_finished=False,
-                    embed_dim=getattr(self, 'embed_dim', None),
-                    max_seq_len=getattr(self, 'max_seq_len', None),
+                    embed_dim=getattr(getattr(self.model, 'active', self.model), 'embed_dim', None),
+                    max_seq_len=getattr(getattr(self.model, 'active', self.model), 'max_seq_len', None),
                 )
                 self._last_checkpoint_save_time = time.time()
                 save_dt = time.perf_counter() - save_t0
@@ -2483,6 +2468,298 @@ class ResumableTrainer:
 # ═══════════════════════════════════════════════════════════
 # DEMO
 # ═══════════════════════════════════════════════════════════
+
+
+# ===========================================================================
+# SINGLE-RUN TRAINING (moved from train_run.py)
+# ===========================================================================
+
+class _BoundTask:
+    """Bind config (and optional loss override) so ResumableTrainer stays config-free."""
+
+    def __init__(self, base, *, config, loss_callable=None):
+        self._base = base
+        self._config = config
+        self._loss_callable = loss_callable
+        self.name = base.name
+
+    def loss(self, x, y_pred, y_truth, config=None):
+        del config
+        if isinstance(y_pred, (tuple, list)):
+            y_pred = y_pred[0]
+        if self._loss_callable is not None:
+            return self._loss_callable(x, y_pred, y_truth)
+        return self._base.loss(x, y_pred, y_truth, self._config)
+
+    def unpack_datapoint(self, batch):
+        return self._base.unpack_datapoint(batch)
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+
+
+def train_one_run(
+    config: dict,
+    dataset,
+    total_features,
+    *,
+    task,
+    num_epochs: Optional[float] = None,
+    resume: Optional[bool] = None,
+    extend: bool = False,
+    extend_epochs: float = 0.0,
+    probe_weights: bool = True,
+    show_banner: bool = True,
+    suppress_history_plot: bool = False,
+    model=None,
+    loss_fn=None,
+) -> Dict[str, Any]:
+    """
+    Build model + trainer and run ResumableTrainer.train for one config.
+
+    ``task`` is caller-owned. Optional ``loss_fn`` (x, pred, y) overrides
+    ``task.loss`` for residual / VAE wrappers.
+    """
+    cfg = config
+    mt = str(cfg.get('model_type', 'regression')).lower().strip()
+    lab = str(cfg.get('label', 'trend')).lower().strip()
+    if mt == 'vae' and lab != 'none':
+        cfg['label'] = 'none'
+        lab = 'none'
+    objective = 'unsupervised' if mt == 'vae' else 'supervised'
+
+    from telepred import resolve_past_window
+    past_window = int(resolve_past_window(cfg))
+    F = (
+        total_features.shape[0]
+        if hasattr(total_features, 'shape')
+        else len(total_features)
+    )
+    n_features_after_latent = (
+        dataset.n_market_features + cfg['n_latent_macros']
+    )
+    embed_dim = n_features_after_latent * cfg['patch_size']
+    if embed_dim % cfg['num_heads'] != 0:
+        raise ValueError(
+            f"embed_dim ({embed_dim}) must be divisible by num_heads "
+            f"({cfg['num_heads']})."
+        )
+    cfg['embed_dim'] = embed_dim
+    cfg['max_seq_len'] = resolve_max_seq_len(cfg, past_window)
+    cfg['output_dim'] = dataset.output_dim
+
+    _model_type = str(cfg.get('model_type', 'regression')).lower()
+    delay = int(cfg.get('telepred_delay', 0) or 0)
+    _err_stage = cfg.get('error_ensemble_stage', None)
+
+    if show_banner:
+        print(f"\nData shapes:")
+        print(f"  Input x: (F={F}, past_window={past_window})")
+        print(f"  TelePred delay d: {delay}")
+        if _err_stage is not None:
+            print(
+                f"  ErrorEnsemble stage: {int(_err_stage)} / "
+                f"n={int(cfg.get('error_ensemble_n', 0) or 0)}"
+            )
+        print(f"  Task: {task.name}")
+        print(f"  Model type: {_model_type}")
+        _od = cfg['output_dim']
+        _yt = getattr(dataset, 'yield_target', cfg.get('yield_target', 'both'))
+        _ld = getattr(
+            dataset, 'latent_distribution', cfg.get('latent_distribution', 'normal')
+        )
+        _onames = task.target_names(
+            _od,
+            yield_target=_yt,
+            latent_distribution=_ld,
+        )
+        print(f"  Output: {_onames} - {_od} values (output_dim)")
+        print(f"  Total samples: {len(dataset)}")
+        print(f"  Train/Val/Test: {len(dataset.train_indices)}/"
+              f"{len(dataset.val_indices)}/{len(dataset.test_indices)}")
+
+    if task is None:
+        raise TypeError(
+            "train_one_run requires task= (caller-owned Task from TRAIN/INFER)"
+        )
+    _model_past_len = int(
+        getattr(
+            dataset,
+            'model_past_len',
+            task.resolve_model_past_len(cfg),
+        )
+    )
+    if model is None:
+        model = build_market_model(
+            cfg,
+            in_features=F,
+            n_market_features=dataset.n_market_features,
+            n_macro_features=dataset.n_macro_features,
+            n_max_past_horizon=_model_past_len,
+            max_seq_len=cfg['max_seq_len'],
+        )
+    _model_name = type(model).__name__
+    if show_banner:
+        report_model_size(model, name=_model_name)
+
+    _probe_device = (
+        torch.device(cfg['device']) if cfg.get('device') else torch.device('cpu')
+    )
+    model = model.to(_probe_device)
+
+    def _label_loss(x, pred, y):
+        if isinstance(pred, (tuple, list)):
+            pred = pred[0]
+        return task.loss(x, pred, y, cfg)
+
+    if loss_fn is None:
+        loss_fn = wrap_loss(model, _label_loss, cfg, objective=objective)
+
+    train_task = _BoundTask(
+        task,
+        config=cfg,
+        loss_callable=loss_fn if (
+            loss_fn is not _label_loss or objective == 'unsupervised'
+        ) else None,
+    )
+
+    if probe_weights:
+        _probe_T = (past_window // cfg['patch_size']) * cfg['patch_size']
+        check_all_weights_updated(
+            model,
+            sample_batch=(
+                torch.randn(2, _probe_T, F, device=_probe_device),
+                torch.randn(2, _model_past_len, device=_probe_device),
+                torch.randn(2, F, device=_probe_device),
+                torch.randn(2, F, device=_probe_device).abs() + 1e-3,
+                torch.randn(
+                    2, cfg.get('num_momentum', 4), F, device=_probe_device
+                ),
+            ),
+            loss_fn=loss_fn,
+            name=_model_name,
+        )
+
+    train_loader = ThreadedDataLoader(
+        dataset.train_dataset, batch_size=cfg['batch_size'], shuffle=True
+    )
+    val_loader = ThreadedDataLoader(
+        dataset.val_dataset, batch_size=cfg['validate_batch_size'], shuffle=False
+    )
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.Adam(
+        trainable if trainable else model.parameters(),
+        lr=cfg['learning_rate'],
+    )
+
+    ckpt_key = generate_checkpoint_key(cfg, dataset.cache_key)
+    # Phase 5/6: persist run config beside checkpoints (reports must not
+    # depend on live config.py alone).
+    try:
+        import json
+        from config import project_root_dir
+        key_dir = Path(cfg.get('checkpoint_dir', 'trading_checkpoints'))
+        if not key_dir.is_absolute():
+            key_dir = project_root_dir() / key_dir
+        key_dir = key_dir / ckpt_key
+        key_dir.mkdir(parents=True, exist_ok=True)
+        run_cfg_path = key_dir / 'run_config.json'
+        payload = {
+            k: cfg.get(k)
+            for k in (
+                'label', 'model_type', 'yield_target', 'latent_distribution',
+                'normalization_layers', 'output_dim',
+                'past_window', 'future_window', 'telepred_delay',
+                'patch_size', 'num_layers', 'num_heads', 'n_latent_macros',
+                'look_price', 'emit_reconstruction', 'use_reconstruction',
+                'error_ensemble_n', 'error_ensemble_stage',
+            )
+            if k in cfg or cfg.get(k) is not None
+        }
+        payload['dataset_signature'] = dataset.cache_key
+        payload['checkpoint_key'] = ckpt_key
+        with open(run_cfg_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, sort_keys=True, default=str)
+    except Exception as e:
+        print(f"⚠ Could not write run_config.json: {e}")
+
+    trainer = ResumableTrainer(
+        task=train_task,
+        model=model,
+        optimizer=optimizer,
+        dataloader=train_loader,
+        val_loader=val_loader,
+        dataset_signature=dataset.cache_key,
+        checkpoint_key=ckpt_key,
+        save_dir=cfg['checkpoint_dir'],
+        recent_checkpoints=cfg.get(
+            'recent_checkpoints', cfg.get('max_checkpoints', 3)
+        ),
+        save_every_n_minutes=cfg['save_every_n_minutes'],
+        device=cfg['device'],
+        enable_validation=cfg.get('validate', True),
+        validate_every_n_epochs=cfg.get('validate_every_n_epochs', 1),
+    )
+    if show_banner:
+        print("\n" + "=" * 60)
+        print("ELEMENT TRAINING")
+        print("=" * 60)
+        print(f"  telepred_delay: {delay}")
+        print(f"  checkpoint_key: {ckpt_key}")
+        print(f"  epochs: {num_epochs if num_epochs is not None else cfg['epochs']}")
+        print(f"  device: {trainer.device}")
+        print("=" * 60 + "\n")
+
+    _orig_show = None
+    if suppress_history_plot:
+        _orig_show = ResumableTrainer._show_history_if_available
+        ResumableTrainer._show_history_if_available = lambda self: False
+
+    try:
+        epochs = (
+            float(cfg['epochs']) if num_epochs is None else float(num_epochs)
+        )
+        do_resume = cfg.get('resume', True) if resume is None else bool(resume)
+        train_outcome = trainer.train(
+            num_epochs=epochs,
+            resume=do_resume,
+            extend=bool(extend),
+            extend_epochs=float(extend_epochs) if extend else 0.0,
+        )
+    finally:
+        if _orig_show is not None:
+            ResumableTrainer._show_history_if_available = _orig_show
+
+    tr = list(trainer.history.train_losses)
+    va = list(trainer.history.val_losses)
+
+    def _finite_min(values):
+        nums = [
+            float(v)
+            for v in values
+            if v is not None and math.isfinite(float(v))
+        ]
+        return min(nums) if nums else None
+
+    best_v = trainer.state_manager.best_val_loss
+    if best_v is None:
+        best_v = _finite_min(va)
+
+    return {
+        'checkpoint_key': ckpt_key,
+        'telepred_delay': delay,
+        'dataset_signature': dataset.cache_key,
+        'epochs_ran': len(tr),
+        'final_train_loss': tr[-1] if tr else None,
+        'best_train_loss': _finite_min(tr),
+        'final_val_loss': va[-1] if va and va[-1] is not None else None,
+        'best_val_loss': best_v,
+        'train_outcome': train_outcome or 'trained',
+        'skipped_finished': train_outcome == 'skipped_finished',
+        'trainer': trainer,
+        'model': model,
+    }
 
 if __name__ == "__main__":
     print("=" * 60)
@@ -2578,26 +2855,28 @@ if __name__ == "__main__":
     train_loader = DummyLoader(DummyDataset())
     val_loader = DummyLoader(DummyDataset())
 
-    def dummy_loss(x, y_pred, y_truth):
-        if isinstance(y_pred, (tuple, list)):
-            y_pred = y_pred[0]
-        return nn.functional.mse_loss(y_pred, y_truth)
-
-    from task_base import get_task_class
+    from INFER import _resolve_task
+    demo_cfg = {
+        'label': 'trend',
+        'output_dim': 3,
+        'slope_loss_weight': 1.0,
+        'intercept_loss_weight': 1.0,
+    }
+    demo_task = _resolve_task(demo_cfg)
     trainer = ResumableTrainer(
-        dataset_signature='demo_signature',
+        task=_BoundTask(demo_task, config=demo_cfg),
         model=model,
-        loss_fn=dummy_loss,
         optimizer=optimizer,
         dataloader=train_loader,
-        task=get_task_class('trend'),
-        save_dir='test_checkpoints',
-        device='cpu',
-        save_every_n_minutes=5,
         val_loader=val_loader,
+        dataset_signature='demo_signature',
+        checkpoint_key='test_key',
+        save_dir='test_checkpoints',
+        recent_checkpoints=5,
+        save_every_n_minutes=5,
+        device='cpu',
         enable_validation=True,
         validate_every_n_epochs=1,
-        checkpoint_key='test_key',
     )
 
     print("\nFirst run: training for 3 epochs with validation...")

@@ -10,12 +10,43 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from task_base import (
-    ENSEMBLE_KINDS,
-    normalize_ensemble_kind,
-    normalize_label_id,
-    normalize_model_id,
-)
+def normalize_label_id(label):
+    return str(label or 'trend').lower().strip()
+
+
+def normalize_model_id(model):
+    return str(model or 'regression').lower().strip()
+
+
+# Ensemble catalog lives here (not in task_base).
+ENSEMBLE_KINDS = {
+    'telepred': {
+        'members': 'repeat_atomic',
+        'label_relation': 'identical',
+        'fusion': 'delay_bank',
+        'requires_supervised': True,
+    },
+    'error': {
+        'members': 'repeat_atomic',
+        'label_relation': 'identical',
+        'fusion': 'sum_residuals_y_space',
+        'atomic_model': 'regression',
+        'atomic_labels': frozenset({'trend', 'yield', 'rise_flag'}),
+    },
+    'stack': {
+        'members': 'list_of_atomic',
+        'label_relation': 'collection',
+        'fusion': 'FusionSpec',
+    },
+}
+
+
+def normalize_ensemble_kind(kind):
+    if kind is None:
+        return None
+    k = str(kind).lower().strip()
+    return k or None
+
 
 
 @dataclass

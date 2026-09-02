@@ -146,55 +146,24 @@ class Task_Rise(Task):
         return (float(flag),)
 
     @classmethod
-    def make_auxiliary(cls, config: Optional[dict] = None, **overrides) -> dict:
-        """
-        Class-private knobs for rise_flag (loss + metric decision).
-
-        Keys:
-          rise_flag_weight — scale on BCE-with-logits
-          decision_threshold — P(rise) cutoff for TP/TN/FP/FN (from config)
-        """
-        cfg = dict(config or {})
-        cfg.update({k: v for k, v in overrides.items() if v is not None})
-        aux = {
-            'rise_flag_weight': float(cfg.get('rise_flag_loss_weight', 1.0)),
-            'decision_threshold': float(
-                cfg.get('rise_flag_decision_threshold', 0.5)
-            ),
-        }
-        return aux
-
-    @classmethod
     def loss(
         cls,
         x: torch.Tensor,
         y_pred: torch.Tensor,
         y_truth: torch.Tensor,
-        auxiliary: Optional[dict] = None,
+        config: Optional[dict] = None,
     ) -> torch.Tensor:
-        """
-        Binary classifier loss: sigmoid + BCE on a single logit.
-
-        Uniform signature: loss(x, y_pred, y_truth, auxiliary).
-
-        Equivalent forms:
-            prob = sigmoid(y_pred);  loss = BCE(prob, y_truth)
-            loss = BCEWithLogits(y_pred, y_truth)   # used here (stable)
-
-        ``y_pred`` last dim 1 = logit; ``y_truth`` ∈ {0,1}.
-        ``x`` unused (API uniformity).
-        """
-        aux = auxiliary or {}
-        w = float(aux.get('rise_flag_weight', 1.0))
+        """BCE-with-logits on a single rise logit. Knobs from ``config``."""
+        del x
+        cfg = config or {}
+        w = float(cfg.get('rise_flag_loss_weight', 1.0))
         if y_pred.shape[-1] != 1 or y_truth.shape[-1] != 1:
             raise ValueError(
                 f"{cls.name} loss expects pred/truth last dim 1, "
                 f"got pred={tuple(y_pred.shape)} truth={tuple(y_truth.shape)}"
             )
-        # Flatten to (B,) for binary classification.
         logits = y_pred[:, 0]
         target = y_truth[:, 0].clamp(0.0, 1.0)
-        # sigmoid(logits) is inside binary_cross_entropy_with_logits.
         return w * F.binary_cross_entropy_with_logits(logits, target)
 
     @classmethod
@@ -221,7 +190,6 @@ class Task_Rise(Task):
         y_pred: torch.Tensor,
         y_truth: torch.Tensor,
         *,
-        auxiliary: Optional[dict] = None,
         dataset=None,
         config: Optional[dict] = None,
         decision_threshold: float = 0.5,
@@ -233,19 +201,14 @@ class Task_Rise(Task):
         Positive class = rise (y=1). Decision: sigmoid(logit) >= threshold
         (default 0.5).
         """
+        del dataset
         if y_pred.shape[-1] != 1 or y_truth.shape[-1] != 1:
             raise ValueError(
                 f"{cls.name} metrics expect pred/truth last dim 1, "
                 f"got pred={tuple(y_pred.shape)} truth={tuple(y_truth.shape)}"
             )
-        aux = dict(auxiliary or {})
-        if config is not None:
-            # Config is the source of truth for thr when aux omitted.
-            if 'decision_threshold' not in aux:
-                aux['decision_threshold'] = float(
-                    config.get('rise_flag_decision_threshold', decision_threshold)
-                )
-        thr = float(aux.get('decision_threshold', decision_threshold))
+        cfg = config or {}
+        thr = float(cfg.get('rise_flag_decision_threshold', decision_threshold))
 
         logits = y_pred[:, 0]
         target = y_truth[:, 0].clamp(0.0, 1.0)
@@ -291,7 +254,6 @@ class Task_Rise(Task):
         y_pred: torch.Tensor,
         y_truth: torch.Tensor,
         *,
-        auxiliary: Optional[dict] = None,
         dataset=None,
         config: Optional[dict] = None,
         **kwargs,
@@ -303,7 +265,7 @@ class Task_Rise(Task):
         """
         return cls.compute_metrics(
             y_pred, y_truth,
-            auxiliary=auxiliary, dataset=dataset, config=config, **kwargs,
+            dataset=dataset, config=config, **kwargs,
         )
 
     @classmethod
@@ -311,10 +273,6 @@ class Task_Rise(Task):
         """Select declared metric slots from a packed metrics dict."""
         slots = cls.metric_slots()
         return {k: metrics[k] for k in slots if k in metrics}
-
-    @classmethod
-    def normalize_policy(cls) -> str:
-        return 'identity'
 
     @classmethod
     def normalize(cls, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
@@ -339,7 +297,6 @@ class Task_Rise(Task):
             'output_dim': forced_dim,
             'latent_dim': forced_dim,
             'label_slice': cls.target_slice(forced_dim),
-            'normalize_policy': cls.normalize_policy(),
         }
 
     @classmethod
@@ -348,16 +305,62 @@ class Task_Rise(Task):
         return int(config['output_dim'])
 
     @classmethod
-    def build_cache_row(cls, ctx: 'WindowContext', config: dict) -> torch.Tensor:
-        future_window = int(config.get('future_window', 50))
+    def build_raw_y(
+        cls, t, total_x, total_p, config, *, mean, std,
+    ) -> torch.Tensor:
+        from telepred import windows_for_sample
+
+        del total_x, mean, std
+        delay = int(config.get('telepred_delay', 0))
+        past = int(config['past_window'])
+        future = int(config.get('future_window', cls.resolve_future_window(config)))
+        win = windows_for_sample(int(t), delay, past, future)
+        p = total_p.reshape(-1)
         result = cls.find(
-            ctx.future_prices,
-            ctx.current_price,
+            p[win['future']],
+            p[int(win['bot_time'])],
             min_yield_percent=float(config.get('min_yield_percent', 0.0)),
-            max_hope_future_horizon=future_window,
+            max_hope_future_horizon=future,
         )
         flag = float(result[0] if isinstance(result, (tuple, list)) else result)
         return torch.tensor([flag], dtype=torch.float32)
+
+
+    @classmethod
+    def cache_intra_fields(cls, config):
+        return dict(cls.signature_fields(config))
+
+    @classmethod
+    def pack_datapoint(cls, dataset, idx):
+        from task_base import pack_datapoint as _pack
+        return _pack(cls, dataset, idx)
+
+    @classmethod
+    def unpack_datapoint(cls, batch):
+        from task_base import unpack_datapoint as _unpack
+        return _unpack(cls, batch)
+
+    @classmethod
+    def print_prediction_samples(cls, preds, test_labels, *, dataset=None,
+                                 yield_target=None, latent_dist=None, n=5):
+        return None
+
+    @classmethod
+    def report_header_fields(cls, dataset, config=None):
+        return {}
+
+    @classmethod
+    def postprocess_predictions(cls, preds, dataset):
+        from task_base import postprocess_predictions as _post
+        return _post(cls, preds, dataset)
+
+    @classmethod
+    def visualize_inference(cls, *args, **kwargs):
+        viz = getattr(cls, 'visualize', None)
+        if viz is None:
+            print(f"⚠ {cls.name}: no visualize() for inference plots")
+            return None
+        return viz(*args, **kwargs)
 
     @classmethod
     def signature_fields(cls, config: Mapping[str, Any]) -> Dict[str, Any]:
@@ -365,13 +368,6 @@ class Task_Rise(Task):
             'min_yield_percent': config.get('min_yield_percent', 0.0),
         }
 
-    @classmethod
-    def dataset_banner_lines(cls, *, bound, config, dataset) -> List[str]:
-        return [
-            f"  min_yield_percent (rise threshold stub): "
-            f"{config.get('min_yield_percent')}",
-            f"  label cache dim (binary flag): {1}",
-        ]
 
     @classmethod
     def plot_metric_slots(cls) -> Tuple[str, ...]:

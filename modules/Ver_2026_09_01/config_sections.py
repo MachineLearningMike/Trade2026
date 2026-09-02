@@ -18,9 +18,9 @@ CONFIG_SECTIONS: Dict[str, Sequence[str]] = {
     'data': (
         'past_window', 'future_window', 'step',
         'telepred_delay', 'telepred_delays', 'telepred_definition_id',
-        'num_features', 'num_momentum', 'total_synthetic_days',
+        'num_momentum',
         'train_ratio', 'val_ratio', 'shuffle_split',
-        'use_binance_data', 'binance_primary_symbol', 'binance_symbols',
+        'binance_primary_symbol', 'binance_symbols',
         'binance_datatype', 'binance_interval',
         'binance_start_date', 'binance_end_date',
         'normalization_layers',
@@ -179,7 +179,6 @@ def apply_cli_namespace(cfg: MutableMapping[str, Any], args: Any) -> MutableMapp
         'past_window': getattr(args, 'past_window', None),
         'future_window': getattr(args, 'future_window', None),
         'batch_size': getattr(args, 'batch_size', None),
-        'total_synthetic_days': getattr(args, 'total_days', None),
         'step': getattr(args, 'step', None),
         'max_accum_deviation': getattr(args, 'max_accum_deviation', None),
         'min_trend_horizon': getattr(args, 'min_trend_horizon', None),
@@ -209,7 +208,6 @@ def apply_cli_namespace(cfg: MutableMapping[str, Any], args: Any) -> MutableMapp
         'validate_every_n_epochs': getattr(args, 'validate_every', None),
         'validate_batch_size': getattr(args, 'val_batch_size', None),
         'telepred_delay': getattr(args, 'telepred_delay', None),
-        'use_binance_data': getattr(args, 'use_binance', None),
         'binance_primary_symbol': getattr(args, 'symbol', None),
     }
     # Invert-flags: only apply when explicitly set (not None).

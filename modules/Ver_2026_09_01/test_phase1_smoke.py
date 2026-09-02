@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Minimum Phase 1 end-to-end smoke (CPU, synthetic, few steps).
+Minimum Phase 1 end-to-end smoke (CPU, few steps).
 
 Proves:
   - (regression, rise_flag) builds, trains at least one minibatch path
@@ -26,13 +26,10 @@ import torch
 
 def _smoke_config(ckpt_dir: Path, **overrides) -> dict:
     from config import get_config
-    from task_base import resolve_atomic_slot, sync_output_dim
+    from INFER import _resolve_task
 
     cfg = get_config()
     cfg.update({
-        'use_binance_data': False,
-        'total_synthetic_days': 1,
-        'num_features': 5,
         'price_feature_idx': 0,
         'past_window': 40,
         'future_window': 10,
@@ -75,37 +72,18 @@ def _smoke_config(ckpt_dir: Path, **overrides) -> dict:
     if overrides:
         cfg.update(overrides)
     if str(cfg.get('model_type', '')).lower() == 'vae':
-        resolve_atomic_slot(cfg, coerce_vae_to_none=True, warn=False)
-    sync_output_dim(cfg)
+        cfg['label'] = 'none'
+    _resolve_task(cfg).sync_output_dim(cfg)
     return cfg
 
 
-def _build_synthetic_dataset(cfg: dict):
-    """Market-only synthetic TradingDataset (no Binance / FSV dependency)."""
-    from data import TradingDataset, generate_synthetic_data
-    from task_base import get_task_class
+def _build_dataset(cfg: dict):
+    from data import TradingDataset
+    from INFER import _resolve_task
 
-    T = 60 * 24 * int(cfg['total_synthetic_days'])
-    F = int(cfg['num_features'])
-    price_idx = int(cfg['price_feature_idx'])
-    market_list = generate_synthetic_data(T, F, price_idx)
-    names = [f'feature_{i}' for i in range(F)]
-    task = get_task_class(cfg.get('label', 'trend'))
-    dataset = TradingDataset(
-        features=market_list,
-        n_market_features=F,
-        n_macro_features=0,
-        feature_names=names,
-        price_feature_idx=price_idx,
-        task=task,
-        past_window=int(cfg['past_window']),
-        future_minutes=int(cfg['future_window']),
-        step=int(cfg['step']),
-        device=cfg['device'],
-        runtime_config=cfg,
-    )
-    total = np.stack(market_list, axis=0).astype(np.float32)
-    return dataset, total, task
+    task = _resolve_task(cfg)
+    dataset = TradingDataset(cfg, task=task)
+    return dataset, dataset.total_features, task
 
 
 def main() -> int:
@@ -123,8 +101,8 @@ def main() -> int:
     assert cfg['label'] == 'rise_flag'
     assert int(cfg['output_dim']) == 1
 
-    print('\n[1/3] Building synthetic rise_flag dataset...')
-    dataset, total_features, task = _build_synthetic_dataset(cfg)
+    print('\n[1/3] Building rise_flag dataset...')
+    dataset, total_features, task = _build_dataset(cfg)
     assert getattr(dataset, 'label_mode') == 'rise_flag'
     assert int(dataset.output_dim) == 1
     assert len(dataset) >= 4, f'too few samples: {len(dataset)}'
@@ -132,19 +110,18 @@ def main() -> int:
           f'{len(dataset.train_indices)}/{len(dataset.val_indices)}/'
           f'{len(dataset.test_indices)} output_dim={dataset.output_dim}')
 
-    # INFER.run_test → get_dataset(config). Stub so train/test share the same
-    # synthetic market-only dataset (avoids Binance/FSV and key mismatch).
-    import dataset_build
+    # Stub TradingDataset so train/test share the same built instance.
+    import data as data_mod
     import INFER as infer_mod
 
-    def _fake_get_dataset(_config, task=None):
-        return dataset, total_features
+    def _FakeTradingDataset(_config, task=None):
+        return dataset
 
-    dataset_build.get_dataset = _fake_get_dataset
-    infer_mod.get_dataset = _fake_get_dataset
+    data_mod.TradingDataset = _FakeTradingDataset
+    infer_mod.TradingDataset = _FakeTradingDataset
 
     print('\n[2/3] train_one_run (1 epoch, no val, CPU)...')
-    from train_run import train_one_run
+    from trainer import train_one_run
     outcome = train_one_run(
         cfg,
         dataset,
