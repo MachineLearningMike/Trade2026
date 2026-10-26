@@ -63,7 +63,7 @@ config = {
     # DATA / TELEPRED WINDOWS (bars on binance_interval, usually 1m)
     # ============================================================
     # delta1: model input length X(t,d)
-    'past_window': 60 * 48,   # 24h of 1m bars (formerly past_hours=24)
+    'past_window': 60 * 24 * 5,   # 24h of 1m bars (formerly past_hours=24)
     # delta2: label future length p[t+1 : t+1+future_window]
     # Shared by yield, trend, and latent (TelePred delta2).
     'future_window': 40,
@@ -81,16 +81,62 @@ config = {
     'telepred_definition_id': 'telepred_v1',
 
     # ============================================================
-    # ERROR ENSEMBLE (residual boosting; see error_ensemble.py)
+    # ERROR ENSEMBLE (flat residual chain in Y₀; Task + Task_Error)
     # ============================================================
-    # model_0 fits y; model_i fits residual e_{i-1} = e_{i-2} - y_{i-1}
-    # (e_{-1} := y). Final ŷ = Σ y_i.
-    # Train: TRAIN.py --error-ensemble [--clean]
-    #        TRAIN.py --error-ensemble-extend N
-    # Number of stages / models: model_0 .. model_{n-1}.
-    'error_ensemble_n': 6,
+    # Stage 0 = original Task (config['label']); stages 1..n-1 = Task_Error.
+    # Train: python TRAIN.py error-ensemble --stages N [--clean]
+    # Number of element models including the original Task.
+    'error_ensemble_n': 3,
     # Set at runtime per stage (0-based); included in checkpoint key.
     # 'error_ensemble_stage': None,
+    #
+    # Per-stage neural model_type + arch hparams (demo).
+    # Index = stage. Omitted keys fall back to the top-level model_* block
+    # (and then Task.model_spec_defaults). Only keys in task_base.MODEL_SPEC_KEYS
+    # are applied.
+    #
+    # Demo: stage 0 small regressor; stage 1 wider/deeper; stage 2 smaller again.
+    'error_ensemble_model_specs': [
+        {   # stage 0 — original Task (e.g. rise_flag / yield / trend)
+            'model_type': 'regression',
+            'patch_size': 15,
+            'num_layers': 6,
+            'num_heads': 5,
+            'n_latent_macros': 30,
+            'ff_dim_multiplier': 4,
+            'dropout': 0.1,
+            'head_hidden_dim_multiplier': 4,
+            'causal': False,
+            'use_reconstruction': False,
+            'emit_reconstruction': False,
+        },
+        {   # stage 1 — first Task_Error (fits error_0 in Y₀)
+            'model_type': 'regression',
+            'patch_size': 10,
+            'num_layers': 4,
+            'num_heads': 5,
+            'n_latent_macros': 30,
+            'ff_dim_multiplier': 4,
+            'dropout': 0.1,
+            'head_hidden_dim_multiplier': 4,
+            'causal': False,
+            'use_reconstruction': False,
+            'emit_reconstruction': False,
+        },
+        {   # stage 2 — second Task_Error (fits error_1 in Y₀)
+            'model_type': 'regression',
+            'patch_size': 10,
+            'num_layers': 2,
+            'num_heads': 5,
+            'n_latent_macros': 30,
+            'ff_dim_multiplier': 4,
+            'dropout': 0.05,
+            'head_hidden_dim_multiplier': 4,
+            'causal': False,
+            'use_reconstruction': False,
+            'emit_reconstruction': False,
+        },
+    ],
     'num_momentum': 4,
 
     # ============================================================
@@ -168,7 +214,7 @@ config = {
 
     # ------------------------------------------------------------
     # TREND (label=trend) — uses shared future_window as max horizon /
-    # joint past+future search cap / model p length
+    # joint past+future search cap
     # ------------------------------------------------------------
     'max_accum_deviation': 0.351,   # legacy alias; prefer fitness_threshold
     'min_trend_horizon': 3,
@@ -236,7 +282,8 @@ config = {
     # FeaturePrep depth (see refactor_plan FEATURE NORMALIZATION):
     #   'two-layer' — intra-window z-score of x, then inter-window norm of
     #                 window moments (mean/std/momentum) for FiLM (default).
-    #   'one-layer' — no intra-window z-score stack.
+    #   'one-layer' — no per-window z-score; x uses train-only global mean/std
+    #                 (stats['x'] in the label cache).
     'normalization_layers': 'two-layer',
 
     'n_latent_macros': 30,  # Number of latent macro features to use in the model
@@ -256,9 +303,9 @@ config = {
     # ============================================================
     # TRANSFORMER / VAE ENCODER CONFIGURATION
     # ============================================================
-    'patch_size': 15,   # 20, 10
+    'patch_size': 10,   # 20, 10, 15
     'embed_dim': None,  # AUTO-COMPUTED
-    'num_layers': 6,    # 6, 2
+    'num_layers': 1,    # 6, 2
     'num_heads': 5,     # 8, 4
     'ff_dim_multiplier': 4,
     'dropout': 0.1,
@@ -269,10 +316,6 @@ config = {
     # HEAD CONFIGURATION
     # ============================================================
     'head_hidden_dim_multiplier': 4,
-    # If True, concat recent past prices p onto the flattened decoder
-    # tokens before the prediction head (adds n_max_past_horizon to
-    # head input_dim). If False, the head sees decoder tokens only.
-    'look_price': False,
     # Prediction head width. Must match label family:
     #   trend:   3 = (h,m,b),  2 = (m,b)
     #   yield:   2 = both;  1 = chance or near  (forced from yield_target)
@@ -282,7 +325,7 @@ config = {
     # ============================================================
     # TRAINING CONFIGURATION
     # ============================================================
-    'epochs': 1,
+    'epochs': 2,
     'batch_size': 20,
     'learning_rate': 0.000_01, # 0.000_01 works long. 0.000_05, # 0.000_000_1 gives the similar speed as 0.000_000_1 x 100
     'save_every_n_minutes': 5,

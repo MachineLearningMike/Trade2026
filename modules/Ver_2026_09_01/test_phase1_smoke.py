@@ -57,7 +57,6 @@ def _smoke_config(ckpt_dir: Path, **overrides) -> dict:
         'validate': False,
         'resume': False,
         'clean': True,
-        'look_price': False,
         'use_reconstruction': False,
         'emit_reconstruction': False,
         'checkpoint_dir': str(ckpt_dir),

@@ -41,7 +41,7 @@ _RUN_CONFIG_KEYS = (
     'past_window', 'future_window', 'step', 'telepred_delay',
     'patch_size', 'num_layers', 'num_heads', 'n_latent_macros',
     'ff_dim_multiplier', 'head_hidden_dim_multiplier', 'dropout',
-    'causal', 'use_reconstruction', 'look_price', 'output_dim',
+    'causal', 'use_reconstruction', 'output_dim',
     'num_momentum', 'normalization_layers', 'train_ratio', 'val_ratio',
     'error_ensemble_n', 'error_ensemble_stage',
     'binance_start_date', 'binance_end_date', 'binance_symbols',
@@ -147,12 +147,6 @@ def infer_arch_from_state_dict(
         if key in state_dict:
             cfg['output_dim'] = int(state_dict[key].shape[0])
             break
-    fc1 = state_dict.get('prediction_head.fc1.weight')
-    if fc1 is not None and cfg.get('embed_dim'):
-        n_stat = 1 + 1 + int(cfg.get('num_momentum', 4))
-        base = n_stat * int(cfg['embed_dim'])
-        in_dim = int(fc1.shape[1])
-        cfg['look_price'] = in_dim > base
     return cfg
 
 
@@ -379,11 +373,9 @@ class ResidualStageWrapper(nn.Module):
         # Mirror common attrs used by diagnostics / INFER helpers.
         for attr in (
             'output_dim',
-            'n_max_past_horizon',
             'patch_size',
             'embed_dim',
             'max_seq_len',
-            'look_price',
             'use_reconstruction',
         ):
             if hasattr(active, attr):
@@ -399,20 +391,20 @@ class ResidualStageWrapper(nn.Module):
             getattr(self, f'prev_std_{i}'),
         )
 
-    def forward(self, x, p, mean, std, momentum):
+    def forward(self, x, mean, std, momentum):
         if len(self.prev) == 0:
             self.last_prev_sum_y = None
         else:
             with torch.no_grad():
                 total_y = None
                 for i, m in enumerate(self.prev):
-                    pred = head_prediction(m(x, p, mean, std, momentum))
+                    pred = head_prediction(m(x, mean, std, momentum))
                     contrib = contribution_in_y_space(
                         i, pred, self._prev_norm_pair(i)
                     )
                     total_y = contrib if total_y is None else total_y + contrib
                 self.last_prev_sum_y = total_y
-        return self.active(x, p, mean, std, momentum)
+        return self.active(x, mean, std, momentum)
 
     # Persist / resume only the active stage weights (prev stages have their
     # own checkpoint keys). Keep Module.parameters() intact so .to(device)
@@ -564,7 +556,7 @@ class ErrorEnsemble(nn.Module):
         """Head outputs in each stage's own target space."""
         preds: List[torch.Tensor] = []
         for m in self.models:
-            preds.append(head_prediction(m(x, p, mean, std, momentum)))
+            preds.append(head_prediction(m(x, mean, std, momentum)))
         self.last_stage_preds_norm = preds
         self.last_stage_preds = preds
         self.last_stage_preds_y = [
@@ -573,7 +565,7 @@ class ErrorEnsemble(nn.Module):
         ]
         return preds
 
-    def forward(self, x, p, mean, std, momentum):
+    def forward(self, x, mean, std, momentum):
         """
         Return ``(en_m, patch_map, recon)`` in **y-normalized** space:
 
@@ -584,7 +576,7 @@ class ErrorEnsemble(nn.Module):
         preds_y: List[torch.Tensor] = []
         total_y = None
         for i, m in enumerate(self.models):
-            out = m(x, p, mean, std, momentum)
+            out = m(x, mean, std, momentum)
             last_full = out
             pred_norm = head_prediction(out)
             pred_y = contribution_in_y_space(i, pred_norm, self.stage_norm_pair(i))
@@ -837,7 +829,7 @@ def load_one_error_stage(
     mix raw/label affines into y-space sums and make loss(en_i, y) rise with i.
     """
     from config import project_root_dir
-        from model_v_autoencoder import build_market_model, resolve_max_seq_len
+    from model_v_autoencoder import build_market_model, resolve_max_seq_len
     from telepred import resolve_past_window
     from INFER import find_checkpoint_by_key
 
@@ -888,22 +880,12 @@ def load_one_error_stage(
         cfg['embed_dim'] = n_features_after_latent * int(cfg['patch_size'])
     if not cfg.get('max_seq_len'):
         cfg['max_seq_len'] = resolve_max_seq_len(cfg, past_window)
-    model_past_len = int(
-        getattr(dataset, 'model_past_len', None)
-        or _resolve_task(cfg).resolve_model_past_len(cfg)
-    )
-    # Head was trained with this past length; prefer ckpt-implied look_price path.
-    if bool(cfg.get('look_price', False)):
-        # n_max_past_horizon equals model_past_len used at train time.
-        # If run config has future_window, model_past_len often equals it for yield.
-        pass
 
     model = build_market_model(
         cfg,
         in_features=F,
         n_market_features=dataset.n_market_features,
         n_macro_features=dataset.n_macro_features,
-        n_max_past_horizon=model_past_len,
         max_seq_len=int(cfg['max_seq_len']),
     )
     model.load_state_dict(state)
@@ -1022,8 +1004,7 @@ def evaluate_ensemble_over_stages(
         progress_label="collect y(D)",
         progress_every=100,
     ):
-        _kwargs, y_t = task.unpack_datapoint(batch)
-        y_norm = y_t.detach().cpu()
+        y_norm = batch['y'].detach().cpu()
         y_chunks.append(y_norm)
         n_batches += 1
     if not y_chunks:
@@ -1056,13 +1037,11 @@ def evaluate_ensemble_over_stages(
                 progress_label=f"model_{stage}(D)",
                 progress_every=50,
             ):
-                kwargs, _y = task.unpack_datapoint(batch)
-                x = kwargs['x'].to(device)
-                p = kwargs['p'].to(device)
-                mean = kwargs['mean'].to(device)
-                std = kwargs['std'].to(device)
-                momentum = kwargs['momentum'].to(device)
-                pred = head_prediction(model(x, p, mean, std, momentum))
+                x = batch['x'].to(device)
+                mean = batch['mean'].to(device)
+                std = batch['std'].to(device)
+                momentum = batch['momentum'].to(device)
+                pred = head_prediction(model(x, mean, std, momentum))
                 contrib_b = contribution_in_y_space(stage, pred, (s_mean, s_std))
                 contrib_chunks.append(contrib_b.detach().cpu())
             # Full-dataset contribution model_i(D), then free model_i.
@@ -1211,17 +1190,15 @@ def compute_stage_target_stats(
         progress_label=f"residual stats model_{stage}",
         progress_every=25,
     ):
-        kwargs, y_norm = task.unpack_datapoint(batch)
-        x = kwargs['x'].to(device)
-        p = kwargs['p'].to(device)
-        mean = kwargs['mean'].to(device)
-        std = kwargs['std'].to(device)
-        momentum = kwargs['momentum'].to(device)
-        y_norm = y_norm.to(device)
+        x = batch['x'].to(device)
+        mean = batch['mean'].to(device)
+        std = batch['std'].to(device)
+        momentum = batch['momentum'].to(device)
+        y_norm = batch['y'].to(device)
 
         prev_y = None
         for i, m in enumerate(prev_models):
-            pred = head_prediction(m(x, p, mean, std, momentum))
+            pred = head_prediction(m(x, mean, std, momentum))
             contrib = contribution_in_y_space(i, pred, prev_norms[i])
             prev_y = contrib if prev_y is None else prev_y + contrib
         e = y_norm - prev_y  # type: ignore[operator]
@@ -1272,7 +1249,7 @@ def load_error_ensemble_stages(
     ``(models, keys_loaded, stage_indices, stage_norms, label_norm)``.
     """
     from config import project_root_dir
-        from model_v_autoencoder import build_market_model, resolve_max_seq_len
+    from model_v_autoencoder import build_market_model, resolve_max_seq_len
     from telepred import resolve_past_window
     from INFER import find_checkpoint_by_key
 
@@ -1295,9 +1272,6 @@ def load_error_ensemble_stages(
     cfg['embed_dim'] = n_features_after_latent * cfg['patch_size']
     cfg['max_seq_len'] = resolve_max_seq_len(cfg, past_window)
     cfg['output_dim'] = int(getattr(dataset, 'output_dim', cfg.get('output_dim', 2)))
-    model_past_len = int(
-        getattr(dataset, 'model_past_len', _resolve_task(cfg).resolve_model_past_len(cfg))
-    )
 
     ckpt_root = Path(cfg.get('checkpoint_dir', 'trading_checkpoints'))
     if not ckpt_root.is_absolute():
@@ -1336,7 +1310,6 @@ def load_error_ensemble_stages(
             in_features=F,
             n_market_features=dataset.n_market_features,
             n_macro_features=dataset.n_macro_features,
-            n_max_past_horizon=model_past_len,
             max_seq_len=int(max_seq_len),
         )
         state = ckpt.get('model_state_dict', ckpt.get('model', ckpt))
@@ -1385,7 +1358,7 @@ def count_finished_error_ensemble_stages(
     sig = str(getattr(dataset, 'cache_key', '') or '')
     if not sig:
         from data import TradingDataset
-                _resolve_task(cfg).sync_output_dim(cfg)
+        _resolve_task(cfg).sync_output_dim(cfg)
         sig = TradingDataset.generate_dataset_signature(cfg, _resolve_task(cfg))
 
     ckpt_root = Path(cfg.get('checkpoint_dir', 'trading_checkpoints'))
@@ -1448,7 +1421,7 @@ def run_error_ensemble_train(
     """
     from model_v_autoencoder import build_market_model, resolve_max_seq_len, wrap_model_loss
     from trainer import train_one_run
-        from telepred import resolve_past_window
+    from telepred import resolve_past_window
 
     if task is None:
         raise TypeError(
@@ -1506,7 +1479,7 @@ def run_error_ensemble_train(
             past_window = int(resolve_past_window(stage_cfg))
             F = (
                 total_features.shape[0]
-                if hasattr(total_features, 'momentum')
+                if hasattr(total_features, 'shape')
                 else len(total_features)
             )
             n_features_after_latent = (
@@ -1521,16 +1494,12 @@ def run_error_ensemble_train(
             stage_cfg['embed_dim'] = embed_dim
             stage_cfg['max_seq_len'] = resolve_max_seq_len(stage_cfg, past_window)
             stage_cfg['output_dim'] = dataset.output_dim
-            model_past_len = int(
-                getattr(dataset, 'model_past_len', _resolve_task(stage_cfg).resolve_model_past_len(stage_cfg))
-            )
 
             active = build_market_model(
                 stage_cfg,
                 in_features=F,
                 n_market_features=dataset.n_market_features,
                 n_macro_features=dataset.n_macro_features,
-                n_max_past_horizon=model_past_len,
                 max_seq_len=stage_cfg['max_seq_len'],
             )
 
@@ -1561,7 +1530,6 @@ def run_error_ensemble_train(
                     in_features=F,
                     n_market_features=dataset.n_market_features,
                     n_macro_features=dataset.n_macro_features,
-                    n_max_past_horizon=model_past_len,
                     max_seq_len=stage_cfg['max_seq_len'],
                 )
                 _load_stage_weights(

@@ -56,7 +56,6 @@ def generate_checkpoint_key(config: dict, dataset_signature: str) -> str:
         'use_reconstruction': config.get(
             'emit_reconstruction', config.get('use_reconstruction')
         ),
-        'look_price': config.get('look_price', True),
     }
     if model_type == 'vae':
         key_params['vae_latent_dim'] = config.get('vae_latent_dim', 64)
@@ -81,8 +80,10 @@ def resolve_checkpoint_identity(config: dict) -> Tuple[str, str, Path]:
     from INFER import _resolve_task
     from data import TradingDataset
 
-    _resolve_task(config).sync_output_dim(config)
-    signature = TradingDataset.generate_dataset_signature(config, _resolve_task(config))
+    task = _resolve_task(config)
+    task.sync_output_dim(config)
+    task.apply_model_spec(config)
+    signature = TradingDataset.generate_dataset_signature(config, task)
     key = generate_checkpoint_key(config, signature)
     key_dir = Path(config['checkpoint_dir']) / key
     return signature, key, key_dir
@@ -1676,11 +1677,15 @@ class ResumableTrainer:
                 
                 from data import ThreadedDataLoader
                 batch = ThreadedDataLoader.batch_to_device(batch, self.device, non_blocking=True)
-                kwargs, y = self.task.unpack_datapoint(batch)
-                x = kwargs['x']
-                PRED = self.model(**kwargs)
+                x = batch['x']
+                PRED = self.model(
+                    batch['x'], batch['mean'], batch['std'], batch['momentum'],
+                )
                 pred = PRED[0] if isinstance(PRED, (tuple, list)) else PRED
-                LOSS = self.task.loss(x, pred, y)
+                touch = self.task.post_neural_function
+                if touch is not None:
+                    pred = touch(pred)
+                LOSS = self.task.loss(x, pred, batch['y'])
                 batch_loss = float(LOSS.item())
                 total_loss += batch_loss
                 num_batches += 1
@@ -2356,13 +2361,17 @@ class ResumableTrainer:
             
             from data import ThreadedDataLoader
             batch = ThreadedDataLoader.batch_to_device(batch, device, non_blocking=True)
-            kwargs, y = self.task.unpack_datapoint(batch)
-            x = kwargs['x']
+            x = batch['x']
 
             optimizer.zero_grad()
-            PRED = model(**kwargs)
+            PRED = model(
+                batch['x'], batch['mean'], batch['std'], batch['momentum'],
+            )
             pred = PRED[0] if isinstance(PRED, (tuple, list)) else PRED
-            LOSS = self.task.loss(x, pred, y)
+            touch = self.task.post_neural_function
+            if touch is not None:
+                pred = touch(pred)
+            LOSS = self.task.loss(x, pred, batch['y'])
             LOSS.backward()
             optimizer.step()
             batch_loss = LOSS.item()
@@ -2491,9 +2500,6 @@ class _BoundTask:
             return self._loss_callable(x, y_pred, y_truth)
         return self._base.loss(x, y_pred, y_truth, self._config)
 
-    def unpack_datapoint(self, batch):
-        return self._base.unpack_datapoint(batch)
-
     def __getattr__(self, name):
         return getattr(self._base, name)
 
@@ -2520,8 +2526,16 @@ def train_one_run(
 
     ``task`` is caller-owned. Optional ``loss_fn`` (x, pred, y) overrides
     ``task.loss`` for residual / VAE wrappers.
+
+    Neural ``model_type`` + arch hparams come from ``task.apply_model_spec``
+    (Task defaults, then config/CLI overrides).
     """
     cfg = config
+    if task is None:
+        raise TypeError(
+            "train_one_run requires task= (caller-owned Task from TRAIN/INFER)"
+        )
+    task.apply_model_spec(cfg)
     mt = str(cfg.get('model_type', 'regression')).lower().strip()
     lab = str(cfg.get('label', 'trend')).lower().strip()
     if mt == 'vae' and lab != 'none':
@@ -2579,24 +2593,12 @@ def train_one_run(
         print(f"  Train/Val/Test: {len(dataset.train_indices)}/"
               f"{len(dataset.val_indices)}/{len(dataset.test_indices)}")
 
-    if task is None:
-        raise TypeError(
-            "train_one_run requires task= (caller-owned Task from TRAIN/INFER)"
-        )
-    _model_past_len = int(
-        getattr(
-            dataset,
-            'model_past_len',
-            task.resolve_model_past_len(cfg),
-        )
-    )
     if model is None:
         model = build_market_model(
             cfg,
             in_features=F,
             n_market_features=dataset.n_market_features,
             n_macro_features=dataset.n_macro_features,
-            n_max_past_horizon=_model_past_len,
             max_seq_len=cfg['max_seq_len'],
         )
     _model_name = type(model).__name__
@@ -2609,6 +2611,7 @@ def train_one_run(
     model = model.to(_probe_device)
 
     def _label_loss(x, pred, y):
+        # Pred is already post-touched by the trainer loop (or probe wrapper).
         if isinstance(pred, (tuple, list)):
             pred = pred[0]
         return task.loss(x, pred, y, cfg)
@@ -2626,18 +2629,26 @@ def train_one_run(
 
     if probe_weights:
         _probe_T = (past_window // cfg['patch_size']) * cfg['patch_size']
+
+        def _probe_loss(x, pred, y):
+            if isinstance(pred, (tuple, list)):
+                pred = pred[0]
+            touch = task.post_neural_function
+            if touch is not None:
+                pred = touch(pred)
+            return loss_fn(x, pred, y)
+
         check_all_weights_updated(
             model,
             sample_batch=(
                 torch.randn(2, _probe_T, F, device=_probe_device),
-                torch.randn(2, _model_past_len, device=_probe_device),
                 torch.randn(2, F, device=_probe_device),
                 torch.randn(2, F, device=_probe_device).abs() + 1e-3,
                 torch.randn(
                     2, cfg.get('num_momentum', 4), F, device=_probe_device
                 ),
             ),
-            loss_fn=loss_fn,
+            loss_fn=_probe_loss,
             name=_model_name,
         )
 
@@ -2672,7 +2683,7 @@ def train_one_run(
                 'normalization_layers', 'output_dim',
                 'past_window', 'future_window', 'telepred_delay',
                 'patch_size', 'num_layers', 'num_heads', 'n_latent_macros',
-                'look_price', 'emit_reconstruction', 'use_reconstruction',
+                'emit_reconstruction', 'use_reconstruction',
                 'error_ensemble_n', 'error_ensemble_stage',
             )
             if k in cfg or cfg.get(k) is not None
@@ -2778,9 +2789,8 @@ if __name__ == "__main__":
         def __init__(self, input_dim, output_dim):
             super().__init__()
             self.fc = nn.Linear(input_dim, output_dim)
-            self.n_max_past_horizon = P_LEN
 
-        def forward(self, x, p=None, mean=None, std=None, momentum=None):
+        def forward(self, x, mean=None, std=None, momentum=None):
             # Match production contract: (predictions, patch_map, recon)
             if x.dim() == 3:
                 flat = x.reshape(x.size(0), -1)
@@ -2797,14 +2807,14 @@ if __name__ == "__main__":
             return total_samples
 
         def __getitem__(self, idx):
-            return (
-                torch.randn(T, F),
-                torch.randn(P_LEN),
-                torch.randn(F),
-                torch.randn(F),
-                torch.randn(S, F),
-                torch.randn(output_dim),
-            )
+            return {
+                'x': torch.randn(T, F),
+                'mean': torch.randn(F),
+                'std': torch.randn(F),
+                'momentum': torch.randn(S, F),
+                'y': torch.randn(output_dim),
+                'task': 'trend',
+            }
 
     class DummyLoader:
         def __init__(self, dataset):
@@ -2827,15 +2837,15 @@ if __name__ == "__main__":
                 return None, 0, 0
             remaining = self.dataset_len - self.current_batch_start * self.batch_size
             bs = min(self.batch_size, remaining)
-            # (x, p, mean, std, momentum, y) — x is (B, T, F)
-            batch = (
-                torch.randn(bs, T, F),
-                torch.randn(bs, P_LEN),
-                torch.randn(bs, F),
-                torch.randn(bs, F),
-                torch.randn(bs, S, F),
-                torch.randn(bs, output_dim),
-            )
+            # datapoint batch dict — x is (B, T, F)
+            batch = {
+                'x': torch.randn(bs, T, F),
+                'mean': torch.randn(bs, F),
+                'std': torch.randn(bs, F),
+                'momentum': torch.randn(bs, S, F),
+                'y': torch.randn(bs, output_dim),
+                'task': 'trend',
+            }
             self.current_batch_start += 1
             return batch, 0.001, 0.001
 

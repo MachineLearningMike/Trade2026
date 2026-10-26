@@ -23,6 +23,15 @@ class Task_None(Task):
     name = 'none'
 
     @classmethod
+    def model_spec_defaults(cls) -> dict:
+        spec = super().model_spec_defaults()
+        # Unsupervised slot: VAE is the natural default; config/CLI may override.
+        spec['model_type'] = 'vae'
+        spec['use_reconstruction'] = True
+        spec['emit_reconstruction'] = True
+        return spec
+
+    @classmethod
     def full_cache_dim(cls) -> int:
         return 1
 
@@ -34,9 +43,6 @@ class Task_None(Task):
     def resolve_future_window(cls, config: dict) -> int:
         return int(config.get('future_window', 50))
 
-    @classmethod
-    def resolve_model_past_len(cls, config: dict) -> int:
-        return cls.resolve_future_window(config)
 
     @classmethod
     def resolve_output_dim(cls, config: Optional[dict] = None, **_kwargs) -> int:
@@ -94,10 +100,6 @@ class Task_None(Task):
         return {}
 
     @classmethod
-    def normalize(cls, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-        return y
-
-    @classmethod
     def denormalize(cls, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
         return y
 
@@ -108,7 +110,7 @@ class Task_None(Task):
             'yield_target': 'both',
             'output_dim': forced_dim,
             'latent_dim': forced_dim,
-            'label_slice': cls.target_slice(forced_dim),
+            'label_channels': cls.target_slice(forced_dim),
         }
 
     @classmethod
@@ -138,14 +140,17 @@ class Task_None(Task):
         return dict(cls.signature_fields(config))
 
     @classmethod
-    def pack_datapoint(cls, dataset, idx):
-        from task_base import pack_datapoint as _pack
+    def build_datapoint(cls, dataset, idx):
+        from task_base import build_datapoint as _pack
         return _pack(cls, dataset, idx)
 
     @classmethod
-    def unpack_datapoint(cls, batch):
-        from task_base import unpack_datapoint as _unpack
-        return _unpack(cls, batch)
+    def get_error(cls, checkpoint_key, dataset, y, *, config, device=None):
+        from task_base import get_error as _get_error
+        return _get_error(
+            cls, checkpoint_key, dataset, y, config=config, device=device,
+        )
+
 
     @classmethod
     def print_prediction_samples(cls, preds, test_labels, *, dataset=None,

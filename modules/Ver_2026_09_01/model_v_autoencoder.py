@@ -49,7 +49,6 @@ def build_market_model(
     in_features: int,
     n_market_features: int,
     n_macro_features: int,
-    n_max_past_horizon: int,
     max_seq_len: int,
 ):
     """Construct regression or VAE from ``config['model_type']``."""
@@ -59,7 +58,6 @@ def build_market_model(
         n_market_features=n_market_features,
         n_macro_features=n_macro_features,
         n_latent_macros=config['n_latent_macros'],
-        n_max_past_horizon=n_max_past_horizon,
         patch_size=config['patch_size'],
         num_layers=config['num_layers'],
         num_heads=config['num_heads'],
@@ -74,7 +72,6 @@ def build_market_model(
             'emit_reconstruction', config.get('use_reconstruction', False)
         ),
         num_momentum=config.get('num_momentum', 4),
-        look_price=config.get('look_price', True),
     )
     if model_type == 'vae':
         return MarketVAEWithHeads(
@@ -87,13 +84,6 @@ def build_market_model(
         )
     from model_regression import MarketRegressionWithHeads
     return MarketRegressionWithHeads(**common)
-
-
-def unpack_model_input(sample_or_batch, task=None):
-    """Model forward kwargs from a datapoint via the active task."""
-    assert task is not None
-    kwargs, _y = task.unpack_datapoint(sample_or_batch)
-    return kwargs
 
 
 def wrap_loss(model: nn.Module, label_loss_fn, config: dict, objective: Optional[str] = None):
@@ -218,7 +208,7 @@ class MarketVAEWithHeads(nn.Module):
     """
     VAE on x, conditioned on mean/std.
 
-    forward(x, p, mean, std, momentum) → (predictions, patch_map, recon)
+    forward(x, mean, std, momentum) → (predictions, patch_map, recon)
       predictions: (B, output_dim)
       patch_map:   FiLM-modulated encoder tokens (B, N, D)
       recon:       x_hat (B, T, F) when use_reconstruction else None
@@ -234,7 +224,6 @@ class MarketVAEWithHeads(nn.Module):
         n_market_features: int,
         n_macro_features: int,
         n_latent_macros: int,
-        n_max_past_horizon: int,
         patch_size: int,
         num_layers: int,
         num_heads: int,
@@ -247,7 +236,6 @@ class MarketVAEWithHeads(nn.Module):
         use_reconstruction: bool = True,
         emit_reconstruction: Optional[bool] = None,
         num_momentum: int = 4,
-        look_price: bool = True,
         vae_latent_dim: int = 64,
     ):
         super().__init__()
@@ -268,8 +256,6 @@ class MarketVAEWithHeads(nn.Module):
         self.emit_reconstruction = self.use_reconstruction
         self.output_dim = output_dim
         self.num_momentum = int(num_momentum)
-        self.n_max_past_horizon = int(n_max_past_horizon)
-        self.look_price = bool(look_price)
         self.vae_latent_dim = int(vae_latent_dim)
         self.n_stat_tokens = 1 + 1 + self.num_momentum  # API parity only
         self.F = int(in_features)
@@ -337,8 +323,6 @@ class MarketVAEWithHeads(nn.Module):
         self.depatch = Depatch(self.F, self.patch_size, embed_dim)
 
         head_in = self.vae_latent_dim
-        if self.look_price:
-            head_in = head_in + self.n_max_past_horizon
         self.prediction_head = PredictionHead(
             input_dim=head_in,
             hidden_dim=head_hidden_dim_multiplier * head_in,
@@ -400,7 +384,6 @@ class MarketVAEWithHeads(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        p: torch.Tensor,
         mean: torch.Tensor,
         std: torch.Tensor,
         momentum: torch.Tensor,
@@ -408,7 +391,6 @@ class MarketVAEWithHeads(nn.Module):
         """
         Args:
             x:     (B, T, F) — primary VAE signal
-            p:     (B, n_max_past_horizon) — prediction head only
             mean:  (B, F) — conditions encoder/decoder (with std)
             std:   (B, F) — conditions encoder/decoder (with mean)
             momentum: (B, S, F) — ignored (API compatibility)
@@ -475,23 +457,7 @@ class MarketVAEWithHeads(nn.Module):
         self.last_x = x
         self.last_x_hat = x_hat
 
-        head_in = z
-        if self.look_price:
-            if p is None:
-                p = torch.zeros(
-                    B, self.n_max_past_horizon, device=z.device, dtype=z.dtype
-                )
-            else:
-                p = p.to(device=z.device, dtype=z.dtype)
-                if p.dim() == 1:
-                    p = p.unsqueeze(0)
-                if p.shape[-1] != self.n_max_past_horizon:
-                    raise ValueError(
-                        f"p last dim {p.shape[-1]} != n_max_past_horizon "
-                        f"{self.n_max_past_horizon}"
-                    )
-            head_in = torch.cat([z, p], dim=1)
-        predictions = self.prediction_head(head_in)
+        predictions = self.prediction_head(z)
 
         recon = x_hat if self.emit_reconstruction else None
         return predictions, patch_map, recon
@@ -519,14 +485,12 @@ if __name__ == "__main__":
     feat_dim = n_market + n_macro
     S = int(config.get('num_momentum', 4))
     max_seq_len = resolve_vae_max_seq_len(T, P)
-    n_max_past = int(config.get('future_window', config.get('past_window', 50)))
 
     model = MarketVAEWithHeads(
         in_features=feat_dim,
         n_market_features=n_market,
         n_macro_features=n_macro,
         n_latent_macros=L,
-        n_max_past_horizon=n_max_past,
         patch_size=P,
         num_layers=config['num_layers'],
         num_heads=n_heads,
@@ -538,7 +502,6 @@ if __name__ == "__main__":
         output_dim=config['output_dim'],
         use_reconstruction=True,
         num_momentum=S,
-        look_price=config.get('look_price', True),
         vae_latent_dim=int(config.get('vae_latent_dim', 64)),
     ).to(device)
 
@@ -546,12 +509,11 @@ if __name__ == "__main__":
 
     B = 2
     x = torch.randn(B, T, feat_dim, device=device)
-    p = torch.randn(B, n_max_past, device=device)
     mean = torch.randn(B, feat_dim, device=device)
     std = torch.randn(B, feat_dim, device=device).abs() + 1e-3
     momentum = torch.randn(B, S, feat_dim, device=device)
 
-    pred, patch_map, recon = model(x, p, mean, std, momentum)
+    pred, patch_map, recon = model(x, mean, std, momentum)
     print(f"\npredictions: {tuple(pred.shape)}")
     print(f"patch_map:   {tuple(patch_map.shape)}")
     print(f"recon:       {None if recon is None else tuple(recon.shape)}")
@@ -569,7 +531,7 @@ if __name__ == "__main__":
 
     check_all_weights_updated(
         model,
-        sample_batch=(x, p, mean, std, momentum),
+        sample_batch=(x, mean, std, momentum),
         loss_fn=_loss,
         name="MarketVAEWithHeads",
     )

@@ -43,7 +43,7 @@ CONFIG_SECTIONS: Dict[str, Sequence[str]] = {
         'model_type', 'vae_latent_dim', 'vae_kl_weight',
         'patch_size', 'embed_dim', 'num_layers', 'num_heads',
         'ff_dim_multiplier', 'dropout', 'causal', 'max_seq_len',
-        'head_hidden_dim_multiplier', 'look_price',
+        'head_hidden_dim_multiplier',
         'n_latent_macros',
         'emit_reconstruction', 'use_reconstruction',
         'reconstruction_loss_weight',
@@ -144,7 +144,7 @@ def active_label_keys(label: str) -> List[str]:
 def active_model_keys(model_type: str) -> List[str]:
     shared = [
         'model_type', 'patch_size', 'num_layers', 'num_heads',
-        'ff_dim_multiplier', 'dropout', 'causal', 'look_price',
+        'ff_dim_multiplier', 'dropout', 'causal',
         'n_latent_macros', 'head_hidden_dim_multiplier',
     ]
     priv = list(MODEL_PRIVATE_KEYS.get(str(model_type).lower(), ()))
@@ -220,8 +220,6 @@ def apply_cli_namespace(cfg: MutableMapping[str, Any], args: Any) -> MutableMapp
         emit = not bool(args.no_reconstruction)
         mapping['use_reconstruction'] = emit
         mapping['emit_reconstruction'] = emit
-    if getattr(args, 'no_look_price', None) is not None:
-        mapping['look_price'] = not bool(args.no_look_price)
     if getattr(args, 'no_validate', None) is not None:
         mapping['validate'] = not bool(args.no_validate)
     if getattr(args, 'normalization_layers', None):

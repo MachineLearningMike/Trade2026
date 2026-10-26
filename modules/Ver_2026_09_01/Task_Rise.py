@@ -43,7 +43,9 @@ class Task_Rise(Task):
     """
 
     name = 'rise_flag'
-
+    normalize_y = False
+    # Head emits logits; trainer/INFER map to P(rise) before loss/metrics.
+    post_neural_function = staticmethod(torch.sigmoid)
 
     @classmethod
     def visualize_inference(cls, *, dataset, preds, test_labels, used_indices, config, **kwargs):
@@ -66,9 +68,6 @@ class Task_Rise(Task):
     def resolve_future_window(cls, config: dict) -> int:
         return int(config.get('future_window', 50))
 
-    @classmethod
-    def resolve_model_past_len(cls, config: dict) -> int:
-        return cls.resolve_future_window(config)
 
     @classmethod
     def resolve_output_dim(cls, config: Optional[dict] = None, **_kwargs) -> int:
@@ -153,7 +152,7 @@ class Task_Rise(Task):
         y_truth: torch.Tensor,
         config: Optional[dict] = None,
     ) -> torch.Tensor:
-        """BCE-with-logits on a single rise logit. Knobs from ``config``."""
+        """BCE on P(rise) after ``post_neural_function`` (sigmoid). Knobs from ``config``."""
         del x
         cfg = config or {}
         w = float(cfg.get('rise_flag_loss_weight', 1.0))
@@ -162,16 +161,17 @@ class Task_Rise(Task):
                 f"{cls.name} loss expects pred/truth last dim 1, "
                 f"got pred={tuple(y_pred.shape)} truth={tuple(y_truth.shape)}"
             )
-        logits = y_pred[:, 0]
+        prob = y_pred[:, 0].clamp(1e-7, 1.0 - 1e-7)
         target = y_truth[:, 0].clamp(0.0, 1.0)
-        return w * F.binary_cross_entropy_with_logits(logits, target)
+        return w * F.binary_cross_entropy(prob, target)
 
     @classmethod
     def metric_slots(cls) -> Tuple[str, ...]:
         """
         Binary-classifier metric slots.
 
-        Confusion counts use decision P(rise)=sigmoid(logit) >= 0.5.
+        ``y_pred`` is P(rise) after ``post_neural_function`` (sigmoid).
+        Decision: P(rise) >= threshold (default 0.5).
         """
         return (
             'bce_with_logits',
@@ -198,8 +198,8 @@ class Task_Rise(Task):
         """
         Binary classification metrics including TP/TN/FP/FN.
 
-        Positive class = rise (y=1). Decision: sigmoid(logit) >= threshold
-        (default 0.5).
+        Positive class = rise (y=1). ``y_pred`` is P(rise) (after post_neural).
+        Decision: P(rise) >= threshold (default 0.5).
         """
         del dataset
         if y_pred.shape[-1] != 1 or y_truth.shape[-1] != 1:
@@ -210,9 +210,8 @@ class Task_Rise(Task):
         cfg = config or {}
         thr = float(cfg.get('rise_flag_decision_threshold', decision_threshold))
 
-        logits = y_pred[:, 0]
+        prob = y_pred[:, 0].clamp(1e-7, 1.0 - 1e-7)
         target = y_truth[:, 0].clamp(0.0, 1.0)
-        prob = torch.sigmoid(logits)
         pred_pos = prob >= thr
         true_pos = target >= 0.5
 
@@ -228,8 +227,9 @@ class Task_Rise(Task):
         precision = tp / (tp + fp + eps)
 
         metrics = {
+            # Slot name kept for report compat; value is BCE on probabilities.
             'bce_with_logits': float(
-                F.binary_cross_entropy_with_logits(logits, target).item()
+                F.binary_cross_entropy(prob, target).item()
             ),
             'accuracy': float((pred_pos == true_pos).float().mean().item()),
             'true_positive': tp,
@@ -275,11 +275,6 @@ class Task_Rise(Task):
         return {k: metrics[k] for k in slots if k in metrics}
 
     @classmethod
-    def normalize(cls, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-        """Binary {0,1} stays raw for BCE-with-logits."""
-        return y
-
-    @classmethod
     def denormalize(cls, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
         return y
 
@@ -296,7 +291,7 @@ class Task_Rise(Task):
             'yield_target': 'both',
             'output_dim': forced_dim,
             'latent_dim': forced_dim,
-            'label_slice': cls.target_slice(forced_dim),
+            'label_channels': cls.target_slice(forced_dim),
         }
 
     @classmethod
@@ -331,14 +326,17 @@ class Task_Rise(Task):
         return dict(cls.signature_fields(config))
 
     @classmethod
-    def pack_datapoint(cls, dataset, idx):
-        from task_base import pack_datapoint as _pack
+    def build_datapoint(cls, dataset, idx):
+        from task_base import build_datapoint as _pack
         return _pack(cls, dataset, idx)
 
     @classmethod
-    def unpack_datapoint(cls, batch):
-        from task_base import unpack_datapoint as _unpack
-        return _unpack(cls, batch)
+    def get_error(cls, checkpoint_key, dataset, y, *, config, device=None):
+        from task_base import get_error as _get_error
+        return _get_error(
+            cls, checkpoint_key, dataset, y, config=config, device=device,
+        )
+
 
     @classmethod
     def print_prediction_samples(cls, preds, test_labels, *, dataset=None,

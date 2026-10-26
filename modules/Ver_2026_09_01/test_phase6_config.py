@@ -70,7 +70,6 @@ def main() -> int:
         symbol = 'BTCUSDT'
         no_causal = True
         no_reconstruction = True
-        no_look_price = True
         no_validate = True
         normalization_layers = None
         checkpoint_key = None
@@ -81,7 +80,6 @@ def main() -> int:
     assert local2['label'] == 'trend'
     assert local2['causal'] is False
     assert local2['emit_reconstruction'] is False
-    assert local2['look_price'] is False
     assert local2['validate'] is False
 
     active = filter_active_knobs({'label': 'rise_flag', 'model_type': 'regression',

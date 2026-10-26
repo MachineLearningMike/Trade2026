@@ -87,9 +87,6 @@ class Task_Trend(Task):
         min_h = int(config.get('min_trend_horizon', 3))
         return max(fw, min_h)
 
-    @classmethod
-    def resolve_model_past_len(cls, config: dict) -> int:
-        return cls.resolve_future_window(config)
 
     @classmethod
     def target_slice(cls, output_dim: int, **_kwargs) -> slice:
@@ -314,16 +311,6 @@ class Task_Trend(Task):
         return {k: metrics[k] for k in slots if k in metrics}
 
     @classmethod
-    def normalize(cls, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-        mean = mean.to(device=y.device, dtype=y.dtype)
-        std = std.to(device=y.device, dtype=y.dtype)
-        if y.shape[-1] != mean.shape[-1]:
-            raise ValueError(
-                f"y last dim {tuple(y.shape)} incompatible with mean {tuple(mean.shape)}"
-            )
-        return (y - mean) / (std + 1e-8)
-
-    @classmethod
     def denormalize(cls, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
         mean = mean.to(device=y.device, dtype=y.dtype)
         std = std.to(device=y.device, dtype=y.dtype)
@@ -342,7 +329,7 @@ class Task_Trend(Task):
             'yield_target': 'both',
             'output_dim': output_dim,
             'latent_dim': output_dim,
-            'label_slice': cls.target_slice(output_dim),
+            'label_channels': cls.target_slice(output_dim),
         }
 
     @classmethod
@@ -397,14 +384,17 @@ class Task_Trend(Task):
         return dict(cls.signature_fields(config))
 
     @classmethod
-    def pack_datapoint(cls, dataset, idx):
-        from task_base import pack_datapoint as _pack
+    def build_datapoint(cls, dataset, idx):
+        from task_base import build_datapoint as _pack
         return _pack(cls, dataset, idx)
 
     @classmethod
-    def unpack_datapoint(cls, batch):
-        from task_base import unpack_datapoint as _unpack
-        return _unpack(cls, batch)
+    def get_error(cls, checkpoint_key, dataset, y, *, config, device=None):
+        from task_base import get_error as _get_error
+        return _get_error(
+            cls, checkpoint_key, dataset, y, config=config, device=device,
+        )
+
 
     @classmethod
     def print_prediction_samples(cls, preds, test_labels, *, dataset=None,

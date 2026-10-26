@@ -196,9 +196,14 @@ def load_model(
     """
     Load a trained model from a checkpoint.
 
-    Architecture dims are taken from `dataset` + `config` so they match training.
+    Architecture dims come from ``dataset.task.apply_model_spec(config)``
+    plus ``dataset`` feature counts so they match training.
     """
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+    task = getattr(dataset, 'task', None)
+    if task is not None:
+        task.apply_model_spec(config)
 
     past_window = int(resolve_past_window(config))
     max_seq_len = checkpoint.get('max_seq_len')
@@ -206,16 +211,11 @@ def load_model(
         max_seq_len = resolve_max_seq_len(config, past_window)
 
     F = dataset.F
-    n_max_past = int(
-        getattr(dataset, 'model_past_len', None)
-        or dataset.task.resolve_model_past_len(config)
-    )
     model = build_market_model(
         config,
         in_features=F,
         n_market_features=dataset.n_market_features,
         n_macro_features=dataset.n_macro_features,
-        n_max_past_horizon=n_max_past,
         max_seq_len=max_seq_len,
     )
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -230,19 +230,17 @@ def _collate_batch(dataset, indices: List[int]):
     Load a small batch from the dataset (CPU tensors).
 
     Collates dataset dict samples, then returns
-    (x, p, y, mean, std, momentum) for existing INFER call sites.
+    (x, y, mean, std, momentum) for existing INFER call sites.
     """
     from data import ThreadedDataLoader
     datapoints = [dataset[idx] for idx in indices]
     batch = ThreadedDataLoader.collate_datapoints(datapoints)
-    kwargs, y = dataset.task.unpack_datapoint(batch)
     return (
-        kwargs['x'],
-        kwargs['p'],
-        y,
-        kwargs['mean'],
-        kwargs['std'],
-        kwargs['momentum'],
+        batch['x'],
+        batch['y'],
+        batch['mean'],
+        batch['std'],
+        batch['momentum'],
     )
 
 
@@ -377,20 +375,22 @@ def run_inference_on_indices(
             end = min(start + batch_size, n)
             batch_idx = used_indices[start:end]
 
-            x, p, y, mean, std, momentum = _collate_batch(dataset, batch_idx)
+            x, y, mean, std, momentum = _collate_batch(dataset, batch_idx)
             x = x.to(device, non_blocking=True)
-            p = p.to(device, non_blocking=True)
             mean = mean.to(device, non_blocking=True)
             std = std.to(device, non_blocking=True)
             momentum = momentum.to(device, non_blocking=True)
 
-            pred_norm, _, _ = model(x, p, mean, std, momentum)  # (B, output_dim)
+            pred_norm, _, _ = model(x, mean, std, momentum)  # (B, output_dim)
 
             if task is None:
                 raise TypeError(
                     "run_inference_on_indices requires task= "
                     "(caller-owned Task; do not borrow dataset.task)"
                 )
+            touch = task.post_neural_function
+            if touch is not None:
+                pred_norm = touch(pred_norm)
             pred_cpu = pred_norm.detach().cpu()
             if not getattr(task, 'denormalize_inference_outputs', True):
                 pred_chunks.append(pred_cpu)
@@ -409,7 +409,7 @@ def run_inference_on_indices(
                     flush=True,
                 )
 
-            del x, p, mean, std, momentum, pred_norm
+            del x, mean, std, momentum, pred_norm
 
     preds = torch.cat(pred_chunks, dim=0).to(device)
     labels = torch.cat(label_chunks, dim=0).to(device)
@@ -491,22 +491,16 @@ def _item_at_observation_bar(dataset, t_obs: int, task):
         momentum = torch.zeros(dataset.num_momentum, dataset.F)
         x_n = x
         obs_win = dataset.Total[t_obs, price_idx]
-    n_p = int(
-        getattr(dataset, 'model_past_len', None)
-        or getattr(dataset, 'max_past_horizon', 0)
-        or 0
-    )
-    p = x_n[-n_p:, price_idx] if n_p else x_n.new_zeros(0)
-    y = task.normalize(
-        obs_win.reshape(1).float(),
-        dataset.label_stat_mean,
-        dataset.label_stat_std,
-    )
+    y = obs_win.reshape(1).float().clone()
+    if task.normalize_y:
+        y_mean = dataset.label_stat_mean.to(device=y.device, dtype=y.dtype)
+        y_std = dataset.label_stat_std.to(device=y.device, dtype=y.dtype)
+        y.sub_(y_mean).div_(y_std + 1e-8)
     st = dataset.stats
     mean_n = (mean - st['mean']['mean']) / (st['mean']['std'] + 1e-8)
     std_n = (std - st['std']['mean']) / (st['std']['std'] + 1e-8)
     momentum_n = (momentum - st['momentum']['mean']) / (st['momentum']['std'] + 1e-8)
-    return x_n, p, mean_n, std_n, momentum_n, y, mean, std
+    return x_n, mean_n, std_n, momentum_n, y, mean, std
 
 def collect_latent_price_series(
     model,
@@ -562,16 +556,15 @@ def collect_latent_price_series(
             sig_raw_parts = []
             for b0 in range(0, len(times), batch_size):
                 bars = times[b0:b0 + batch_size]
-                xs, ps, ys, means, stds, momentums = [], [], [], [], [], []
+                xs, ys, means, stds, momentums = [], [], [], [], []
                 raw_means, raw_stds = [], []
                 good_bars = []
                 for to in bars:
                     item = _item_at_observation_bar(dataset, to, task)
                     if item is None:
                         continue
-                    x, p, mean_n, std_n, momentum_n, y, mean_r, std_r = item
+                    x, mean_n, std_n, momentum_n, y, mean_r, std_r = item
                     xs.append(x)
-                    ps.append(p)
                     ys.append(y)
                     means.append(mean_n)
                     stds.append(std_n)
@@ -582,12 +575,11 @@ def collect_latent_price_series(
                 if not xs:
                     continue
                 x = torch.stack(xs).to(device, non_blocking=True)
-                p = torch.stack(ps).to(device, non_blocking=True)
                 y = torch.stack(ys)
                 mean = torch.stack(means).to(device, non_blocking=True)
                 std = torch.stack(stds).to(device, non_blocking=True)
                 momentum = torch.stack(momentums).to(device, non_blocking=True)
-                pred, _, _ = model(x, p, mean, std, momentum)
+                pred, _, _ = model(x, mean, std, momentum)
                 loc_n, scale_n, _df = task.decode_prediction_params(
                     pred.detach(), latent_distribution=latent_distribution
                 )
@@ -625,7 +617,7 @@ def collect_latent_price_series(
                     t_pred.append(to - t0)
                     # P at observation bar = future[0] target
                     price_at.append(float(dataset.Total[to, price_idx].item()))
-                del x, p, y, mean, std, momentum, pred
+                del x, y, mean, std, momentum, pred
 
             ctx_start = max(0, t_lo)
             ctx_end = min(T, t_hi + 1)
@@ -985,6 +977,9 @@ def run_validate(
     def _label_loss(x, pred, y):
         if isinstance(pred, (tuple, list)):
             pred = pred[0]
+        touch = task.post_neural_function
+        if touch is not None:
+            pred = touch(pred)
         return task.loss(x, pred, y, config)
 
     loss_fn = wrap_model_loss(model, _label_loss, config)
@@ -1022,15 +1017,14 @@ def run_validate(
             batch_idx = used_indices[batch_start:batch_end]
             bs = batch_end - batch_start
 
-            x, p, y, mean, std, momentum = _collate_batch(dataset, batch_idx)
+            x, y, mean, std, momentum = _collate_batch(dataset, batch_idx)
             x = x.to(device, non_blocking=True)
-            p = p.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             mean = mean.to(device, non_blocking=True)
             std = std.to(device, non_blocking=True)
             momentum = momentum.to(device, non_blocking=True)
 
-            pred = model(x, p, mean, std, momentum)
+            pred = model(x, mean, std, momentum)
             loss = loss_fn(x, pred, y)
             batch_loss = float(loss.item())
             weighted_loss_sum += batch_loss * bs
@@ -1041,7 +1035,7 @@ def run_validate(
             pbar.update(1)
             pbar.set_postfix_str(f'loss={avg_so_far:.4f}', refresh=False)
 
-            del x, p, y, mean, std, momentum, pred, loss
+            del x, y, mean, std, momentum, pred, loss
 
         pbar.close()
 
@@ -1214,16 +1208,15 @@ def run_vae_compare(
             batch_end = min(batch_start + batch_size, n_take)
             batch_idx = used_indices[batch_start:batch_end]
 
-            x, p, y, mean, std, momentum = _collate_batch(dataset, batch_idx)
+            x, y, mean, std, momentum = _collate_batch(dataset, batch_idx)
             x = x.to(device, non_blocking=True)
-            p = p.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             mean = mean.to(device, non_blocking=True)
             std = std.to(device, non_blocking=True)
             momentum = momentum.to(device, non_blocking=True)
 
             # ---- VAE per-sample loss ----
-            _ = model_vae(x, p, mean, std, momentum)
+            _ = model_vae(x, mean, std, momentum)
             x_hat = model_vae.last_x_hat
             recon_per = ((x_hat - x) ** 2).reshape(x.shape[0], -1).mean(dim=1)
             kl_per = model_vae.last_kl_per
@@ -1232,7 +1225,7 @@ def run_vae_compare(
             vae_per = recon_w * recon_per + kl_w * kl_per
 
             # ---- Yield per-sample loss ----
-            y_pred_t = model_yield(x, p, mean, std, momentum)
+            y_pred_t = model_yield(x, mean, std, momentum)
             if isinstance(y_pred_t, (tuple, list)):
                 y_pred = y_pred_t[0]
             else:
@@ -1254,7 +1247,7 @@ def run_vae_compare(
                     ts = series_origin + timedelta(minutes=bar0 + past_window - 1)
                     dow_ids.append(int(ts.weekday()))  # Mon=0 … Sun=6
             pbar.update(1)
-            del x, p, y, mean, std, momentum, y_pred_t, y_pred, vae_per, yield_per
+            del x, y, mean, std, momentum, y_pred_t, y_pred, vae_per, yield_per
         pbar.close()
 
     vae_arr = np.asarray(vae_losses, dtype=np.float64)

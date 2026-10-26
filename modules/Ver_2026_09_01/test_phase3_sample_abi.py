@@ -39,20 +39,18 @@ def main() -> int:
     # Synthetic datapoint dict matching default Task schema.
     sample = {
         'x': torch.zeros(8, 3),
-        'p': torch.zeros(4),
         'mean': torch.zeros(3),
         'std': torch.ones(3),
         'momentum': torch.zeros(4, 3),
         'y': y,
-        'label': task.name,
+        'task': task.name,
     }
-    assert set(sample) >= {'x', 'p', 'mean', 'std', 'momentum', 'y', 'label'}
+    assert set(sample) >= {'x', 'mean', 'std', 'momentum', 'y', 'task'}
     batch = ThreadedDataLoader.collate_datapoints([sample, sample])
     assert batch['x'].shape[0] == 2
-    kwargs, y_b = task.unpack_datapoint(batch)
-    assert kwargs['x'].shape[0] == 2
-    assert y_b.shape[0] == 2
-    assert set(kwargs) == set(task.MODEL_INPUT_KEYS)
+    assert set(task.MODEL_INPUT_KEYS).issubset(batch.keys())
+    assert 'y' in batch
+    assert batch['y'].shape[0] == 2
 
     from test_phase1_smoke import _build_dataset, _smoke_config
     from pathlib import Path
@@ -61,9 +59,8 @@ def main() -> int:
     item = ds[0]
     assert isinstance(item, dict)
     assert 'y' in item and item['y'].shape[-1] == 1
-    kwargs0, y0 = ds.task.unpack_datapoint(item)
-    assert set(kwargs0) == set(ds.task.MODEL_INPUT_KEYS)
-    assert y0.shape[-1] == 1
+    assert set(ds.task.MODEL_INPUT_KEYS).issubset(item.keys())
+    assert item['y'].shape[-1] == 1
 
     print('phase3 sample ABI smoke ok')
     return 0

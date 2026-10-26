@@ -136,9 +136,6 @@ def run_hparam_sweep(
     n_macro = int(dataset.n_macro_features)
     n_latent = int(cfg['n_latent_macros'])
     n_heads = int(cfg['num_heads'])
-    _model_past_len = int(
-        getattr(dataset, 'model_past_len', _resolve_task(cfg).resolve_model_past_len(cfg))
-    )
     cfg['output_dim'] = int(dataset.output_dim)
     extend_epochs = float(extend_epochs)
 
@@ -242,7 +239,6 @@ def run_hparam_sweep(
                     in_features=F,
                     n_market_features=n_market,
                     n_macro_features=n_macro,
-                    n_max_past_horizon=_model_past_len,
                     max_seq_len=trial_cfg['max_seq_len'],
                 )
                 device = (

@@ -552,7 +552,7 @@ def main(config):
         parser.add_argument(
             '--no-look-price',
             action='store_true',
-            default=not config.get('look_price', True),
+            default=not config.get(True),
             help='Do not concat recent past prices p into the prediction head',
         )
         parser.add_argument('--symbol', type=str, default=config.get('binance_primary_symbol', 'BTCUSDT'),
@@ -1531,8 +1531,9 @@ def main(config):
         from error_ensemble import (
             clean_error_ensemble_checkpoints,
             count_finished_error_ensemble_stages,
-            run_error_ensemble_train,
         )
+        from error_ensemble_tasks import run_error_task_ensemble
+
         if config.get('clean'):
             clean_error_ensemble_checkpoints(config)
             # Fresh bank: do not resume wiped stages.
@@ -1558,7 +1559,7 @@ def main(config):
                 f"start_stage={start_stage}"
             )
 
-        run_error_ensemble_train(
+        outcome = run_error_task_ensemble(
             config,
             dataset,
             total_features,
@@ -1571,7 +1572,14 @@ def main(config):
             extend_epochs=args.extend if args.extend is not None else 0.0,
             probe_weights=True,
         )
-        print("\n✅ ErrorEnsemble training completed!")
+        vm = outcome.get('val_metrics') or {}
+        if vm:
+            print(
+                f"\n✅ ErrorEnsemble (Task_Error chain) done  "
+                f"val_mse={vm.get('mse')}  val_mae={vm.get('mae')}"
+            )
+        else:
+            print("\n✅ ErrorEnsemble (Task_Error chain) training completed!")
         return
 
     train_one_run(

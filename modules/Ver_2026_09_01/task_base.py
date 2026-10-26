@@ -12,6 +12,27 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import torch
 
 
+# Neural stack knobs owned by Task.resolve_model_spec (TRAIN/CLI may override
+# via config before apply_model_spec writes them back).
+MODEL_SPEC_KEYS: Tuple[str, ...] = (
+    'model_type',
+    'patch_size',
+    'num_layers',
+    'num_heads',
+    'n_latent_macros',
+    'ff_dim_multiplier',
+    'dropout',
+    'causal',
+    'head_hidden_dim_multiplier',
+    'num_momentum',
+    'use_reconstruction',
+    'emit_reconstruction',
+    'vae_latent_dim',
+    'vae_kl_weight',
+    'reconstruction_loss_weight',
+)
+
+
 class Task:
     """
     Polymorphic task interface.
@@ -20,15 +41,88 @@ class Task:
     """
 
     name: str = ''
-    MODEL_INPUT_KEYS: Tuple[str, ...] = ('x', 'p', 'mean', 'std', 'momentum')
+    MODEL_INPUT_KEYS: Tuple[str, ...] = ('x', 'mean', 'std', 'momentum')
     SAMPLE_TENSOR_KEYS: Tuple[str, ...] = MODEL_INPUT_KEYS + ('y',)
     denormalize_inference_outputs: bool = True
+    # If True, raw labels are normalized in-place into the label cache
+    # (train mean/std); build_datapoint then just slices that y.
+    normalize_y: bool = True
+    # Optional map applied to model head output before loss / metrics.
+    # None → identity. Example: torch.sigmoid for Rise.
+    post_neural_function = None
 
     @classmethod
-    def normalize(
-        cls, y: torch.Tensor, mean: torch.Tensor, std: torch.Tensor
-    ) -> torch.Tensor:
-        raise NotImplementedError(f"{cls.__name__}.normalize")
+    def model_spec_defaults(cls) -> Dict[str, Any]:
+        """Task-owned default neural model_type + hyperparameters."""
+        return {
+            'model_type': 'regression',
+            'patch_size': 10,
+            'num_layers': 1,
+            'num_heads': 5,
+            'n_latent_macros': 30,
+            'ff_dim_multiplier': 4,
+            'dropout': 0.1,
+            'causal': False,
+            'head_hidden_dim_multiplier': 4,
+            'num_momentum': 4,
+            'use_reconstruction': False,
+            'emit_reconstruction': False,
+            'vae_latent_dim': 64,
+            'vae_kl_weight': 0.1,
+            'reconstruction_loss_weight': 1.0,
+        }
+
+    @classmethod
+    def refine_model_spec(
+        cls, spec: Dict[str, Any], config: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        """Subclass hook to force policy (e.g. Task_Error arch, VAE↔none)."""
+        del config
+        return spec
+
+    @classmethod
+    def resolve_model_spec(cls, config: Optional[dict] = None) -> Dict[str, Any]:
+        """
+        Neural model_type + hyperparameters for this Task.
+
+        Starts from ``model_spec_defaults``, then applies non-``None`` values
+        from ``config`` (CLI / sweep overrides), then ``refine_model_spec``.
+        """
+        cfg = dict(config or {})
+        spec = dict(cls.model_spec_defaults())
+        for key in MODEL_SPEC_KEYS:
+            if key in cfg and cfg[key] is not None:
+                spec[key] = cfg[key]
+        return cls.refine_model_spec(spec, cfg)
+
+    @classmethod
+    def apply_model_spec(cls, config: dict) -> dict:
+        """Write ``resolve_model_spec`` into ``config`` (in place) and return it."""
+        config.update(cls.resolve_model_spec(config))
+        return config
+
+
+def merge_error_stage_model_spec(config: dict, stage: int) -> dict:
+    """
+    Copy ``config`` and overlay ``error_ensemble_model_specs[stage]``.
+
+    Specs may be a list (index = stage) or a dict keyed by int/str stage.
+    Only ``MODEL_SPEC_KEYS`` entries are copied. Missing stage → no overlay.
+    """
+    cfg = dict(config)
+    specs = cfg.get('error_ensemble_model_specs')
+    stage_spec = None
+    if isinstance(specs, (list, tuple)):
+        if 0 <= int(stage) < len(specs):
+            stage_spec = specs[int(stage)]
+    elif isinstance(specs, Mapping):
+        stage_spec = specs.get(int(stage), specs.get(str(int(stage))))
+    if stage_spec:
+        for key in MODEL_SPEC_KEYS:
+            if key in stage_spec and stage_spec[key] is not None:
+                cfg[key] = stage_spec[key]
+    cfg['error_ensemble_stage'] = int(stage)
+    return cfg
 
     @classmethod
     def denormalize(
@@ -39,10 +133,6 @@ class Task:
     @classmethod
     def resolve_future_window(cls, config: dict) -> int:
         raise NotImplementedError(f"{cls.__name__}.resolve_future_window")
-
-    @classmethod
-    def resolve_model_past_len(cls, config: dict) -> int:
-        raise NotImplementedError(f"{cls.__name__}.resolve_model_past_len")
 
     @classmethod
     def sync_output_dim(cls, config: dict) -> int:
@@ -74,14 +164,20 @@ class Task:
         raise NotImplementedError(f"{cls.__name__}.cache_intra_fields")
 
     @classmethod
-    def pack_datapoint(cls, dataset: Any, idx: int) -> dict:
-        raise NotImplementedError(f"{cls.__name__}.pack_datapoint")
+    def build_datapoint(cls, dataset: Any, idx: int) -> dict:
+        raise NotImplementedError(f"{cls.__name__}.build_datapoint")
 
     @classmethod
-    def unpack_datapoint(
-        cls, batch: Mapping[str, Any]
-    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        raise NotImplementedError(f"{cls.__name__}.unpack_datapoint")
+    def get_error(
+        cls,
+        checkpoint_key: str,
+        dataset: Any,
+        y: torch.Tensor,
+        *,
+        config: dict,
+        device: Optional[Any] = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError(f"{cls.__name__}.get_error")
 
     @classmethod
     def loss(
@@ -243,8 +339,8 @@ def regime_segment(
     return torch.cat(parts_y, dim=0), torch.cat(parts_t, dim=0)
 
 
-def pack_datapoint(task, dataset: Any, idx: int) -> dict:
-    """Default datapoint pack (x, p, mean, std, momentum, y, label)."""
+def build_datapoint(task, dataset: Any, idx: int) -> dict:
+    """Build one sample dict (x, mean, std, momentum, y, task)."""
     from telepred import windows_for_sample
 
     t = dataset.valid_t[idx]
@@ -271,39 +367,93 @@ def pack_datapoint(task, dataset: Any, idx: int) -> dict:
             / (stats['momentum']['std'] + 1e-8)
         )
     else:
-        x_normalized = x_raw
+        # one-layer: single train-set global affine (no per-window z-score).
+        x_mean = dataset.x_stat_mean
+        x_std = dataset.x_stat_std.clone()
+        x_std[x_std == 0] = 1
+        x_normalized = (x_raw - x_mean) / (x_std + 1e-8)
         mean_normalized = torch.zeros(dataset.F)
         std_normalized = torch.ones(dataset.F)
         momentum_normalized = torch.zeros(dataset.num_momentum, dataset.F)
 
-    y = dataset.label_tensor[idx][dataset.label_slice]
-    y_normalized = task.normalize(
-        y, dataset.label_stat_mean, dataset.label_stat_std
-    )
-    recent_prices = x_normalized[
-        -dataset.model_past_len:, dataset.price_feature_idx
-    ]
+    # y is already in the right space (raw or train-normalized) from the cache.
+    y = dataset.label_tensor[idx][dataset.label_channels]
     return {
         'x': x_normalized,
-        'p': recent_prices,
         'mean': mean_normalized,
         'std': std_normalized,
         'momentum': momentum_normalized,
-        'y': y_normalized,
-        'label': task.name,
+        'y': y,
+        'task': task.name,
     }
 
 
-def unpack_datapoint(
-    task, batch: Mapping[str, Any]
-) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-    """Default unpack → (model_kwargs, y)."""
-    assert isinstance(batch, Mapping)
-    keys = task.MODEL_INPUT_KEYS
-    missing = [k for k in keys if k not in batch or batch[k] is None]
-    assert not missing, f"{task.__name__}: model input missing {missing}"
-    assert 'y' in batch, f"{task.__name__}: datapoint missing 'y'"
-    return {k: batch[k] for k in keys}, batch['y']
+def get_error(
+    task,
+    checkpoint_key: str,
+    dataset: Any,
+    y: torch.Tensor,
+    *,
+    config: dict,
+    device: Optional[Any] = None,
+) -> torch.Tensor:
+    """
+    Default residual ``y - pred`` for a stored checkpoint.
+
+    Steps through ``dataset`` (e.g. ``train_dataset``) with
+    ``validate_batch_size``; applies ``task.post_neural_function`` when set.
+    Returns ``(N,)`` when ``output_dim == 1``, else ``(N, output_dim)``.
+    """
+    from data import ThreadedDataLoader
+    from INFER import find_checkpoint_by_key, load_model
+
+    cfg = dict(config)
+    task.apply_model_spec(cfg)
+    if device is None:
+        device = cfg.get('device') or 'cpu'
+    ckpt_dir = cfg.get('checkpoint_dir', 'trading_checkpoints')
+    found = find_checkpoint_by_key(str(ckpt_dir), key=str(checkpoint_key))
+    if found is None:
+        raise FileNotFoundError(
+            f"{getattr(task, '__name__', type(task).__name__)}.get_error: "
+            f"no checkpoint for key {checkpoint_key!r} under {ckpt_dir}"
+        )
+    checkpoint_path, _ = found
+    # Subset → underlying TradingDataset for architecture dims.
+    full_ds = getattr(dataset, 'dataset', dataset)
+    model = load_model(checkpoint_path, cfg, full_ds, device=device)
+    model.eval()
+
+    n = len(dataset)
+    if int(y.shape[0]) != n:
+        raise ValueError(
+            f"{getattr(task, '__name__', type(task).__name__)}.get_error: "
+            f"dataset length {n} != y length {int(y.shape[0])}"
+        )
+    step = int(cfg.get('validate_batch_size', 32) or 32)
+    touch = task.post_neural_function
+    chunks: List[torch.Tensor] = []
+
+    with torch.no_grad():
+        for start in range(0, n, step):
+            end = min(start + step, n)
+            datapoints = [dataset[i] for i in range(start, end)]
+            batch = ThreadedDataLoader.collate_datapoints(datapoints)
+            x = batch['x'].to(device, non_blocking=True)
+            mean = batch['mean'].to(device, non_blocking=True)
+            std = batch['std'].to(device, non_blocking=True)
+            momentum = batch['momentum'].to(device, non_blocking=True)
+            y_b = y[start:end].to(device, non_blocking=True)
+            out = model(x, mean, std, momentum)
+            pred = out[0] if isinstance(out, (tuple, list)) else out
+            if touch is not None:
+                pred = touch(pred)
+            err = y_b - pred
+            if err.dim() > 1 and err.shape[-1] == 1:
+                err = err.squeeze(-1)
+            chunks.append(err.detach().cpu())
+
+    return torch.cat(chunks, dim=0)
 
 
 def postprocess_predictions(task, preds, dataset):

@@ -80,7 +80,7 @@ def _blank_args() -> SimpleNamespace:
         ff_dim_multiplier=None, dropout=None,
         head_hidden_dim_multiplier=None,
         # None = leave config.py unchanged (do not re-stamp every run)
-        no_causal=None, no_reconstruction=None, no_look_price=None,
+        no_causal=None, no_reconstruction=None,
         symbol=None,
         train_ratio=None, val_ratio=None,
         no_validate=None, validate_every=None, val_batch_size=None,

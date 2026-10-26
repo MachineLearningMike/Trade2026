@@ -139,7 +139,7 @@ def check_all_weights_updated(
 
     Args:
         model:        module under test
-        sample_batch: (x, p, mean, std, momentum) matching model.forward
+        sample_batch: (x, mean, std, momentum) matching model.forward
         loss_fn:      optional callable(x, y_pred, y_truth) -> scalar; if None,
                       uses predictions.sum() (+ recon.sum() if present)
         name:         label for log lines
@@ -154,26 +154,19 @@ def check_all_weights_updated(
     snapped = {n: p.detach().clone() for n, p in model.named_parameters()}
 
     model.zero_grad(set_to_none=True)
-    if len(sample_batch) == 5:
-        x, p, mean, std, momentum = sample_batch
-    elif len(sample_batch) == 4:
-        # Legacy (x, mean, std, momentum) — synthesize zero past vector
-        x, mean, std, momentum = sample_batch
-        n_p = int(getattr(model, 'n_max_past_horizon', 0) or 0)
-        p = torch.zeros(x.shape[0], n_p, device=x.device, dtype=x.dtype)
-    else:
+    if len(sample_batch) != 4:
         raise ValueError(
-            f"sample_batch must be (x,p,mean,std,momentum) or (x,mean,std,momentum); "
+            f"sample_batch must be (x, mean, std, momentum); "
             f"got {len(sample_batch)} tensors"
         )
+    x, mean, std, momentum = sample_batch
     device = next(model.parameters()).device
     x = x.to(device)
-    p = p.to(device)
     mean = mean.to(device)
     std = std.to(device)
     momentum = momentum.to(device)
 
-    P = model(x, p, mean, std, momentum)
+    P = model(x, mean, std, momentum)
     predictions, patch_map, recon = P
 
     if loss_fn is not None:
@@ -282,8 +275,7 @@ class MarketRegressionWithHeads(nn.Module):
       latent: 2 → normal (mu, var_raw);  3 → student (loc, scale_raw, df_raw)
 
     Window statistics (mean / std / momentum moments) condition the decoder via
-    x_stat tokens. Recent past prices ``p`` are concatenated onto the
-    flattened decoder tokens when ``look_price`` is True (config).
+    x_stat tokens.
     """
 
     def __init__(
@@ -292,7 +284,6 @@ class MarketRegressionWithHeads(nn.Module):
         n_market_features: int,
         n_macro_features: int,
         n_latent_macros: int,
-        n_max_past_horizon: int,
         patch_size: int,
         num_layers: int,
         num_heads: int,
@@ -305,7 +296,6 @@ class MarketRegressionWithHeads(nn.Module):
         use_reconstruction: bool = True,
         emit_reconstruction: Optional[bool] = None,
         num_momentum: int = 4,
-        look_price: bool = True,
     ):
         super().__init__()
         output_dim = int(output_dim)
@@ -326,8 +316,6 @@ class MarketRegressionWithHeads(nn.Module):
         self.emit_reconstruction = self.use_reconstruction
         self.output_dim = output_dim
         self.num_momentum = num_momentum
-        self.n_max_past_horizon = int(n_max_past_horizon)
-        self.look_price = bool(look_price)
         # x_stat tokens: mean (1) + std (1) + momentum moments (num_momentum)
         self.n_stat_tokens = 1 + 1 + num_momentum
 
@@ -406,10 +394,7 @@ class MarketRegressionWithHeads(nn.Module):
 
         # ---- Prediction Head ----
         # Flatten decoder tokens (B, N_stat, D) → (B, N_stat * D).
-        # When look_price: concat recent past prices p (B, n_max_past_horizon).
         input_dim = self.n_stat_tokens * embed_dim
-        if self.look_price:
-            input_dim = input_dim + self.n_max_past_horizon
         self.prediction_head = PredictionHead(
             input_dim=input_dim,
             hidden_dim=head_hidden_dim_multiplier * input_dim,
@@ -534,7 +519,6 @@ class MarketRegressionWithHeads(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        p: torch.Tensor,
         mean: torch.Tensor,
         std: torch.Tensor,
         momentum: torch.Tensor,
@@ -550,13 +534,11 @@ class MarketRegressionWithHeads(nn.Module):
               - TransformerDecoder(tgt=x_stat, memory=encoder(x))
               - LayerNorm → (B, N_stat, D)
         4. Flatten (B, N_stat, D) → (B, N_stat * D)
-           [if look_price: concat p (B, n_max_past_horizon)]
            FFN → (B, output_dim)
 
         Args:
             x:     (B, T, F) — window features. T must be divisible by patch_size.
                     x = normalize(feature_window, stat(feature_window))
-            p:      (B, max_past_horizon). Normalized recent past prices
             mean:  (B, F) — normalize(mean_feature_window, train-set mean/std of means)
             std:   (B, F) — normalize(std_feature_window, train-set mean/std of stds)
                     NOTE: Do NOT multiply x with std or mean; some channels are ~0.
@@ -584,24 +566,9 @@ class MarketRegressionWithHeads(nn.Module):
         )                                                          # (B, N_stat, D)
         dec_out = self.decoder_norm(dec_out)
 
-        # ---- 3. Flatten decoder tokens [, concat p], FFN → (B, out) ----
+        # ---- 3. Flatten decoder tokens, FFN → (B, out) ----
         B = dec_out.shape[0]
         flat = dec_out.reshape(B, n_stat * self.embed_dim)         # (B, N_stat * D)
-        if self.look_price:
-            if p is None:
-                p = torch.zeros(
-                    B, self.n_max_past_horizon, device=flat.device, dtype=flat.dtype
-                )
-            else:
-                p = p.to(device=flat.device, dtype=flat.dtype)
-                if p.dim() == 1:
-                    p = p.unsqueeze(0)
-                if p.shape[-1] != self.n_max_past_horizon:
-                    raise ValueError(
-                        f"p last dim {p.shape[-1]} != n_max_past_horizon "
-                        f"{self.n_max_past_horizon}"
-                    )
-            flat = torch.cat([flat, p], dim=1)
         predictions = self.prediction_head(flat)                   # (B, output_dim)
 
         # ---- 4. Reconstruction tensor (optional emit; loss is separate) ----
@@ -648,13 +615,11 @@ if __name__ == "__main__":
     print(f"  num_heads: {config['num_heads']}")
     print(f"  output_dim: {config['output_dim']}")
 
-    n_max_past = int(config.get('future_window', config.get('past_window', 50)))
     model = MarketRegressionWithHeads(
         in_features=F,
         n_market_features=n_market,
         n_macro_features=n_macro,
         n_latent_macros=n_latent,
-        n_max_past_horizon=n_max_past,
         patch_size=config['patch_size'],
         num_layers=config['num_layers'],
         num_heads=config['num_heads'],
@@ -666,7 +631,6 @@ if __name__ == "__main__":
         output_dim=config['output_dim'],
         use_reconstruction=config['use_reconstruction'],
         num_momentum=num_momentum,
-        look_price=config.get('look_price', True),
     ).to(device)
 
     # ---- Size + weight-update diagnostics at start ----
@@ -675,7 +639,6 @@ if __name__ == "__main__":
     B = 4
     T = (past_window // config['patch_size']) * config['patch_size']
     x = torch.randn(B, T, F, device=device)
-    p = torch.randn(B, n_max_past, device=device)
     mean = torch.randn(B, F, device=device)
     std = torch.randn(B, F, device=device).abs() + 1e-3
     momentum = torch.randn(B, num_momentum, F, device=device)
@@ -683,7 +646,7 @@ if __name__ == "__main__":
     _trend_cfg = {'slope_loss_weight': 0.1, 'intercept_loss_weight': 0.01}
     check_all_weights_updated(
         model,
-        sample_batch=(x, p, mean, std, momentum),
+        sample_batch=(x, mean, std, momentum),
         loss_fn=lambda x_, y_pred, y_truth: Task_Trend.loss(
             x_, y_pred, y_truth, _trend_cfg
         ),
@@ -691,7 +654,7 @@ if __name__ == "__main__":
     )
 
     print(f"\nTesting forward() with input shape: {x.shape}")
-    predictions, patch_map, recon = model(x, p, mean, std, momentum)
+    predictions, patch_map, recon = model(x, mean, std, momentum)
     print(f"  predictions: {tuple(predictions.shape)}")
     print(f"  patch_map:   {tuple(patch_map.shape)}")
     if recon is not None:
@@ -699,9 +662,6 @@ if __name__ == "__main__":
 
     x_stat = model._build_x_stat(mean, std, momentum)
     print(f"  x_stat:      {tuple(x_stat.shape)}  (N_stat={model.n_stat_tokens})")
-    print(
-        f"  pred_in_dim: {model.n_stat_tokens * model.embed_dim + n_max_past}  "
-        f"(N_stat * D + max_past_horizon)"
-    )
+    print(f"  pred_in_dim: {model.n_stat_tokens * model.embed_dim}  (N_stat * D)")
 
     print("\nModel module demo complete!")

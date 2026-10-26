@@ -513,10 +513,12 @@ class Binance:
         return features_to_return, nForged, target_feature_id, feature_names
 
     def get_combined_history_3(self, datatype, interval, start, end, symbol_dict, target):
-        features_to_return, nForged, target_feature_id, feature_names = self.get_combined_history_2(datatype, interval, start, end, symbol_dict, target)
-        features_to_return = np.stack(features_to_return, axis=0)  # Stack features along the second axis
-        
-        return features_to_return, nForged, target_feature_id, feature_names
+        # Keep a list of 1-D series (one array per feature). Callers (data.py)
+        # stack themselves; returning an (F, T) ndarray makes `if features`
+        # raise "truth value of an array is ambiguous".
+        return self.get_combined_history_2(
+            datatype, interval, start, end, symbol_dict, target
+        )
 
 # ==================== Main Entry Point ====================
 

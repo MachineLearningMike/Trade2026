@@ -23,15 +23,18 @@ def main() -> int:
     assert _resolve_task({'label': 'rise_flag'}) is Task_Rise
     assert _resolve_task({'label': 'none'}) is Task_None
 
-    import torch
-    y = torch.tensor([[10.0, 20.0]])
-    mean = torch.tensor([[0.0, 10.0]])
-    std = torch.tensor([[5.0, 5.0]])
-    # Rise leaves labels alone; Trend standardizes.
-    assert torch.equal(Task_Rise.normalize(y, mean, std), y)
-    assert torch.allclose(
-        Task_Trend.normalize(y, mean, std),
-        torch.tensor([[2.0, 2.0]]),
+    assert Task_Rise.normalize_y is False
+    assert Task_None.normalize_y is True
+    assert Task_Trend.normalize_y is True
+    assert Task_Yield.normalize_y is True
+    assert Task_Latent.normalize_y is True
+
+    assert Task_Trend.resolve_model_spec({}).get('model_type') == 'regression'
+    assert Task_None.resolve_model_spec({}).get('model_type') == 'vae'
+    # Config / CLI override wins when set.
+    assert (
+        Task_None.resolve_model_spec({'model_type': 'regression'}).get('model_type')
+        == 'regression'
     )
 
     print('task hierarchy smoke ok')

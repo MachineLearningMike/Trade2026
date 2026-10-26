@@ -40,11 +40,13 @@ from telepred import (
 # v8: Task.build_raw_y owns price windowing + label.
 # v9: flat prefixed cache keys x.* / y.* / inter.* / intra.* (task not label).
 # v10: inter.normalization_layers (config normalize_window removed).
+# v11: inter.stats['x'] = train-only global feature mean/std for one-layer.
+# v12: if Task.normalize_y, label_tensor stored train-normalized.
 
 class TradingDataset(Dataset):
     """Trading dataset. Construct with TradingDataset(config, task)."""
 
-    LABEL_CACHE_ALGO_VERSION = 10
+    LABEL_CACHE_ALGO_VERSION = 12
     BINANCE_CACHE_VERSION = 1
 
     @staticmethod
@@ -304,7 +306,8 @@ class TradingDataset(Dataset):
                     pred,
                 )
             )
-            T = features[0].shape[0] if features else 0
+            assert isinstance(features, (list, tuple)) and len(features) > 0
+            T = int(features[0].shape[0])
             for feature in features:
                 assert feature.shape[0] == T
             print(
@@ -452,9 +455,6 @@ class TradingDataset(Dataset):
         self.config["past_window"] = self.past_window
         self.future_window = int(task.resolve_future_window(self.config))
         self.config["future_window"] = self.future_window
-        self.model_past_len = int(
-            task.resolve_model_past_len(self.config)
-        )
         self.telepred_delay = int(telepred_resolve_delay(self.config))
         self.config["telepred_delay"] = self.telepred_delay
         self.price_feature_idx = int(target_feature_id)
@@ -477,7 +477,7 @@ class TradingDataset(Dataset):
         if bound.get("latent_distribution") is not None:
             self.latent_distribution = bound["latent_distribution"]
         self.output_dim = int(bound["output_dim"])
-        self.label_slice = bound["label_slice"]
+        self.label_channels = bound["label_channels"]
 
         data_dir_path = Path(self.config.get("data_dir", "dataset_cache"))
         data_dir_path.mkdir(parents=True, exist_ok=True)
@@ -521,8 +521,12 @@ class TradingDataset(Dataset):
             self.test_dataset,
         ) = self._create_splits()
 
-        self.label_stat_mean = self.stats["label"]["mean"][self.label_slice]
-        self.label_stat_std = self.stats["label"]["std"][self.label_slice]
+        self.label_stat_mean = self.stats["label"]["mean"][self.label_channels]
+        self.label_stat_std = self.stats["label"]["std"][self.label_channels]
+        # Train-only global feature affine for one-layer FeaturePrep.
+        if self.normalization_layers == "one-layer":
+            self.x_stat_mean = self.stats["x"]["mean"]
+            self.x_stat_std = self.stats["x"]["std"]
 
         print(f"\nTradingDataset initialized:")
         print(f"  Features: {self.F}, Time steps: {self.T}")
@@ -560,6 +564,22 @@ class TradingDataset(Dataset):
         total_p = self.Total[:, self.price_feature_idx]
         config = self.config
 
+        # Splits first so one-layer can accumulate train-only global x stats
+        # without holding every window in memory.
+        (
+            self.train_indices,
+            self.val_indices,
+            self.test_indices,
+            self.train_dataset,
+            self.val_dataset,
+            self.test_dataset,
+        ) = self._create_splits()
+        train_index_set = set(self.train_indices)
+        # Online moments over train windows: sum / sumsq of shape (F,).
+        x_sum = torch.zeros(self.F, dtype=torch.float64)
+        x_sumsq = torch.zeros(self.F, dtype=torch.float64)
+        x_count = 0
+
         for idx in tqdm(range(len(self)), desc="Computing labels and norm params"):
             # TelePred: feature window delayed by d; Y(t) anchored at bot time t.
             t = self.valid_t[idx]
@@ -575,6 +595,11 @@ class TradingDataset(Dataset):
                 mean = torch.zeros(self.F)
                 std = torch.ones(self.F)
                 momentum = torch.zeros(self.num_momentum, self.F)
+                if idx in train_index_set:
+                    x64 = x.double()
+                    x_sum += x64.sum(dim=0)
+                    x_sumsq += (x64 * x64).sum(dim=0)
+                    x_count += int(x64.shape[0])
             mean_list.append(mean)
             std_list.append(std)
             momentum_list.append(momentum)
@@ -589,16 +614,6 @@ class TradingDataset(Dataset):
         mean_tensor = torch.stack(mean_list)
         std_tensor = torch.stack(std_list)
         momentum_tensor = torch.stack(momentum_list)
-
-        # Create splits first (needed for train-set stats).
-        (
-            self.train_indices,
-            self.val_indices,
-            self.test_indices,
-            self.train_dataset,
-            self.val_dataset,
-            self.test_dataset,
-        ) = self._create_splits()
 
         train_indices = self.train_indices
         label_train = label_tensor[train_indices]
@@ -624,6 +639,28 @@ class TradingDataset(Dataset):
                 'std': momentum_train.std(dim=0),
             },
         }
+        if not self.normalize_window:
+            if x_count <= 1:
+                raise RuntimeError(
+                    "one-layer FeaturePrep needs >1 train window elements "
+                    f"to compute global x mean/std (got x_count={x_count})"
+                )
+            x_mean = (x_sum / x_count).float()
+            x_var = (x_sumsq / x_count).float() - x_mean * x_mean
+            x_std = x_var.clamp_min(0.0).sqrt().clamp_min(1e-8)
+            stats['x'] = {'mean': x_mean, 'std': x_std}
+
+        # Normalize raw_y in-place into the cache when the Task asks for
+        # train-normalized datapoint y (stats above stay in raw units).
+        if self.task.normalize_y:
+            y_mean = stats['label']['mean']
+            y_std = stats['label']['std'].clamp_min(1e-8)
+            if label_tensor.shape[-1] != y_mean.shape[-1]:
+                raise ValueError(
+                    f"label_tensor last dim {tuple(label_tensor.shape)} "
+                    f"incompatible with label mean {tuple(y_mean.shape)}"
+                )
+            label_tensor.sub_(y_mean).div_(y_std + 1e-8)
 
         return (
             label_tensor, mean_tensor, std_tensor, momentum_tensor, stats,
@@ -741,7 +778,7 @@ class TradingDataset(Dataset):
         return len(self.valid_starts)
     def __getitem__(self, idx: int) -> dict:
         """Opaque datapoint dict — schema owned by ``self.task``."""
-        return self.task.pack_datapoint(self, idx)
+        return self.task.build_datapoint(self, idx)
 
 
 class ThreadedDataLoader:
